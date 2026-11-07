@@ -2,22 +2,22 @@
 
 **Give your AI the ability to act in your environment.**
 
-Syntoria Reach は、ChatGPT・Claude・Codex などの AI が、ユーザーの Linux 環境にあるファイル・コマンド・ジョブなどを安全に利用するための独立した MCP サービスです。
+Syntoria Reach is an independent MCP service that lets AIs such as ChatGPT, Claude, and Codex safely use the files, commands, and jobs in a user's Linux environment.
 
-AI が判断・計画し、Reach が認証・権限確認・操作実行・結果取得を担当します。Reach 自体に LLM を内蔵する必要はありません。
+The AI decides and plans; Reach handles authentication, permission checks, execution, and result retrieval. Reach itself does not need to embed an LLM.
 
-**DaVinci は Reach の初期の本格的な利用サービスです。** DaVinci が開発の計画、Agent セッション、Issue/PR、検証・成果受入れを担当し、Reach が Linux のプロセス、Sandbox、対話型入出力、非同期 Job を実行・管理します。Reach 単体でも利用でき、DaVinci の稼働は必須ではありません。
+**DaVinci is the first full-scale service built on Reach.** DaVinci owns development planning, agent sessions, issues/PRs, and verification and acceptance of results, while Reach runs and manages Linux processes, sandboxes, interactive I/O, and asynchronous jobs. Reach can be used on its own; DaVinci does not have to be running.
 
-## ユーザーができること
+## What users can do
 
-- 外出先の AI から、自分の Linux PC や開発サーバーの許可された Workspace にアクセスする
-- ファイルを読み書きし、コマンドやビルド・テストを実行する
-- 長時間処理を Job として開始し、AI との接続が切れても進行状況や結果を後から確認する
-- DaVinci などの利用サービスから、継続的な stdin/stdout を必要とする対話型プロセスを管理する
-- 複数の AI クライアントから同じ環境の操作能力を利用する
-- アクセス元、Workspace、操作の種類ごとに実行権限を制御する
+- Access permitted workspaces on their own Linux PC or development server from an AI while away from it
+- Read and write files, and run commands, builds, and tests
+- Start long-running work as a job and check its progress and results later, even if the connection to the AI drops
+- Manage interactive processes that need continuous stdin/stdout from client services such as DaVinci
+- Use the same environment's capabilities from multiple AI clients
+- Control execution permissions per caller, workspace, and operation type
 
-## 採用構成
+## Adopted architecture
 
 ~~~mermaid
 flowchart TB
@@ -36,25 +36,64 @@ flowchart TB
     DV <-->|"Local Reach API (Unix socket)"| L
 ~~~
 
-**Cloudflare 側に常時起動する VM・コンテナは不要**です。Workers は MCP の受付、Durable Objects は接続仲介を担当します。Linux 側では軽量な Reach プロセスが WebSocket を維持し、操作と Job の状態をローカルに保持します。
+**No always-on VM or container is needed on the Cloudflare side.** Workers accept MCP requests and Durable Objects broker connections. On Linux, a lightweight Reach process keeps the WebSocket open and holds operation and job state locally.
 
-Cloudflare への通信が切れても、受理済み Job の実行と状態の正本は Linux 側に残ります。Node がオフラインなら、初期版では依頼をキューにためず利用不可を明示します。
+If the connection to Cloudflare drops, accepted jobs keep running and the source of truth for their state stays on Linux. If the node is offline, the initial version reports it as unavailable instead of queueing requests.
 
-## Syntoria の中での位置づけ
+## Place within Syntoria
 
-- **Lore**：長期記憶・知識
-- **Weave**：人間と AI の共有状態、依頼・承認・結果
-- **Trace**：活動・会話の記録
-- **Reach**：AI に実行環境の能力を提供する
+- **Lore**: long-term memory and knowledge
+- **Weave**: shared state between humans and AI; requests, approvals, and results
+- **Trace**: records of activity and conversations
+- **Reach**: gives AI the capabilities of an execution environment
 
-各サービスは独立して利用できます。Weave の MCP Event を受けて Reach の操作を呼び出す場合は、AI または外部の連携コンポーネントが両者を組み合わせます。
+Each service can be used independently. When a Weave MCP event should trigger a Reach operation, the AI or an external integration component combines the two.
 
-## 初期スコープ
+## Initial scope
 
-Linux 1ユーザー・1 Node、ファイル操作、許可されたコマンド実行、非同期 Job、**対話型プロセスセッション**、権限管理、操作履歴、リモート MCP 接続を対象とします。DaVinci から Reach を実行基盤として使用するローカル E2E を初期の受入条件に加えます。ブラウザ・GUI 操作、複数 Node、ローカル Agent の起動管理、WebRTC P2P は後続の拡張候補です。
+Linux, one user, one node: file operations, permitted command execution, asynchronous jobs, **interactive process sessions**, permission management, operation history, and remote MCP connections. A local end-to-end run in which DaVinci uses Reach as its execution runtime is part of the initial acceptance criteria. Browser/GUI operation, multiple nodes, managing local agent launches, and WebRTC P2P are candidates for later extensions.
 
-現時点は**プロダクト・技術概要の設計段階**です。ここに記述した機能が実装済みであることを示すものではありません。
+Only **Stage 1 (Local Core) of ARCHITECTURE.md §11 is implemented** so far. Everything else described here is design and does not indicate implemented functionality.
 
-- [PRODUCT.md](PRODUCT.md) — プロダクト定義、ユーザー価値、MVP
-- [ARCHITECTURE.md](ARCHITECTURE.md) — 技術概要設計、境界、実行・接続・復旧の契約
-- [docs/davinci-execution-integration.md](docs/davinci-execution-integration.md) — DaVinci と Reach の責務分離、既存実装の参照、段階的移行と検証
+## Stage 1: Local Core
+
+A single Go daemon, `reach`. It serves the local API as HTTP/JSON over a Unix socket and stores operations and audit records in SQLite.
+
+The implementation lives in `src/` (Go module `github.com/takezoh/syntoria-reach/src`).
+
+~~~sh
+cd src && go build -o ~/.local/bin/reach ./cmd/reach
+chmod 600 ~/.config/reach/config.json          # contains tokens; must not be readable by group/other
+reach -config ~/.config/reach/config.json      # systemd user unit: deploy/systemd/reach.service
+~~~
+
+~~~json
+{
+  "workspaces": [{"id": "app", "root": "/home/me/src/app", "commands": ["/usr/bin/make", "/usr/bin/go"]}],
+  "clients": [{"id": "davinci", "token": "<random string of at least 32 characters>",
+               "grants": [{"workspace": "app", "allow": ["file.read", "file.write", "command.run"]}]}]
+}
+~~~
+
+`socket` defaults to `$XDG_RUNTIME_DIR/reach/reach.sock` and `database` defaults to `$XDG_STATE_HOME/reach/reach.db`.
+
+Requests are JSON sent to `POST /v1/<method>` with `Authorization: Bearer <token>`. The caller must run as the same UID as the daemon (checked with SO_PEERCRED).
+
+| method | Description |
+| --- | --- |
+| `list_workspaces` | Permitted workspaces and their permissions |
+| `list_files` | Directory listing for `workspace`, `path` |
+| `read_file` | `workspace`, `path`, `offset`, `limit`. Returns `data` (base64) and `version` |
+| `write_file` | `operation_id`, `workspace`, `path`, `content` (base64), `expected_version` (empty means create only). Replaces the file by atomic rename |
+| `run_command` | `operation_id`, `workspace`, `executable` (absolute path from the allowlist), `args`, `timeout_seconds`. Runs synchronously in the workspace root without a shell |
+| `get_operation` | Looks up an operation's state and result by `operation_id` |
+
+- Requests with side effects are recorded as operations. Resending the same `operation_id` with the same arguments returns the existing result; different arguments return `operation_conflict`.
+- Operations that were running when the daemon stopped become `unknown` at the next start. They are never re-executed automatically.
+- Stage 1 limitation: commands run without a sandbox, as the same user as the daemon. The only restrictions are the allowlist and a minimal environment; isolation is added in Stage 2. Asynchronous jobs, process sessions, and remote MCP are not implemented yet.
+
+## Documents
+
+- [PRODUCT.md](PRODUCT.md) — product definition, user value, MVP
+- [ARCHITECTURE.md](ARCHITECTURE.md) — technical overview, boundaries, execution/connection/recovery contracts
+- [docs/davinci-execution-integration.md](docs/davinci-execution-integration.md) — separation of responsibilities between DaVinci and Reach, references to the existing implementation, staged migration and verification

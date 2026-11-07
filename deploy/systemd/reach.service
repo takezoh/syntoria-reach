@@ -1,0 +1,9 @@
+[Unit]
+Description=Syntoria Reach daemon
+
+[Service]
+ExecStart=%h/.local/bin/reach -config %h/.config/reach/config.json
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
