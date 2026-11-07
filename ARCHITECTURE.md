@@ -1,19 +1,19 @@
 # Syntoria Reach — Technical Architecture
 
-- Status: **Technical overview / pre-implementation**
+- Status: **Technical overview / Stages 1–2 implemented**
 - Updated: 2026-11-01
 - Initial runtime: **Linux / Go**
 - Adopted remote access: **Cloudflare Workers + Durable Objects + outbound Linux WebSocket (Option B)**
 
 ## 1. Goals and structural principles
 
-Reach is an independent execution service through which remote AIs and other local services use Linux capabilities via standard MCP or a local API. It places no always-on VM or container in the cloud; the Linux side owns the execution and state of operations, jobs, and interactive process sessions.
+Reach is an independent execution service through which remote AIs and other local services use Linux capabilities via standard MCP or a local API. It places no always-on VM or container in the cloud; the Linux side owns the execution and state of operations, jobs, and agent sessions.
 
-**DaVinci is the first real client service.** DaVinci's development decisions, agent protocols, and GitHub workflow stay in DaVinci; Linux process / sandbox / streaming I/O / job execution are consolidated in Reach. Reach works without DaVinci.
+**DaVinci is the first real client service.** DaVinci's development decisions, prompts, judgment of agent output, and GitHub workflow stay in DaVinci; Linux processes, jobs, and agent sessions over Codex App Server / Claude Code stream-json / ACP are consolidated in Reach. Reach works without DaVinci.
 
 **Architectural invariants**
 
-1. Reach starts and works without depending on Weave, Lore, Trace, DaVinci, or a local LLM.
+1. Reach starts and works without depending on Weave, Lore, Trace, DaVinci, or a local LLM. Workspaces are provided by the Orca server on the same host (§7); callers reach them only through Reach.
 2. MCP is an operation contract, separated from the communication path and from the Linux execution implementation.
 3. The cloud handles connectivity, authentication, and forwarding; the source of truth for jobs is on Linux.
 4. Even on an approved connection, the Reach runtime authorizes every operation.
@@ -21,15 +21,15 @@ Reach is an independent execution service through which remote AIs and other loc
 6. A communication failure or timeout is never treated as proof that execution failed.
 7. In the MVP, requests made while a node is offline are not stored in a pending-execution queue.
 8. What is installed on the target Linux machine is a lightweight connector / runtime; an LLM is not required.
-9. Process liveness, I/O, sandbox, and jobs are Reach's responsibility; Reach does not take on the meaning of DaVinci runs, agent turns, or GitHub issues.
-10. When a client attached to an interactive process disconnects, the lifecycle of the already accepted execution does not change implicitly.
+9. Process liveness, jobs, and agent sessions (launching the harness and speaking its protocol: Codex App Server / Claude Code stream-json / ACP) are Reach's responsibility; sandboxing an agent's tools is the harness's responsibility. Reach does not take on the meaning of DaVinci runs or GitHub issues, and does not judge what an agent produces.
+10. When a client disconnects, the lifecycle of an already accepted command, job, or agent turn does not change implicitly.
 
 ## 2. Overall structure
 
 ~~~mermaid
 flowchart TB
     Clients["ChatGPT / Claude / Codex / other MCP hosts"]
-    DaVinci["DaVinci Controller + Agent protocol adapters"]
+    DaVinci["DaVinci Controller"]
     subgraph CF["Cloudflare — serverless"]
         GW["Workers: Stateless MCP Gateway / Auth / Routing"]
         BR["Durable Objects: Per-node Connection Broker"]
@@ -39,14 +39,16 @@ flowchart TB
         REACH["Reach Daemon (Go): Connector + Operation Service"]
         LOCAL["Local API (Unix socket)"]
         CAP["Capability adapters: File / Command"]
-        PROC["Process Session Manager: stdin / stdout / stderr"]
+        PROC["Agent Session Manager: Codex / Claude / ACP"]
         JOB["Job Manager + OS process supervisor"]
-        ST[("SQLite: Operations / Jobs / Sessions / Policy / Audit")]
+        ST[("SQLite: Operations / Workspaces / Jobs / Sessions / Audit")]
+        ORCA["Orca server: workspaces (Git worktrees)"]
         LOCAL <--> REACH
         REACH --> CAP
         REACH --> JOB
         REACH --> PROC
         REACH <--> ST
+        REACH -->|"Orca CLI"| ORCA
         PROC --> JOB
         JOB --> CAP
     end
@@ -65,10 +67,11 @@ The standard deployment on Linux is a single Go daemon. The cloud has no residen
 | Durable Object / Node Broker | Accepting and mapping the WSS connection for a node, message delivery, short-lived response correlation | User files, persistent job results |
 | Reach Connector (Go) | Outbound WSS to the cloud, receiving authenticated requests, reconnection, transport separation | LLM inference |
 | Local API (Unix socket) | Provides local services such as DaVinci with the same execution operations as the core | Meaning of issues/PRs |
-| Process Session Manager | stdin / stdout / stderr of long-lived processes, I/O ordering, single writer, reconnection and stop reconciliation | Agent-specific conversation protocols |
+| Agent Session Manager | Launching agent harnesses, Codex App Server / Claude Code stream-json / ACP sessions, one turn at a time, normalized events, interrupt and stop | Prompts, judging agent output, run semantics; sandboxing the agent's tools (the harness does that) |
 | Operation Service | Re-validating arguments and permissions, idempotency decisions, accepting synchronous and asynchronous work | Business state of other Syntoria services |
 | Capability Registry | Public contracts of File / Command / Job, required permissions, choice of OS adapter | External AI decisions |
 | Linux Runtime | File operations in workspaces, process start/stop/isolation | MCP protocol details |
+| Orca adapter | Creating and deleting workspaces (Orca worktrees) through the Orca CLI | Agents and commands in those workspaces (Reach runs them) |
 | Job Manager | Job state, logs and artifacts, stop, reconciliation after restart | Dependence on MCP connection liveness |
 | SQLite | Local source of truth for operations, jobs, policy, and audit | Data of other Syntoria services |
 
@@ -84,11 +87,11 @@ WebSocket disconnects and Cloudflare-side restarts are normal failure cases; the
 
 ### 4.0 Local connection for DaVinci
 
-A DaVinci Controller on the same Linux node calls Reach's local API over a Unix domain socket. The request DTOs and the operation / job / process session contracts are shared with the remote MCP adapter, and the call does not go through Cloudflare.
+A DaVinci Controller on the same Linux node calls Reach's local API over a Unix domain socket. The request DTOs and the operation / job / agent session contracts are shared with the remote MCP adapter, and the call does not go through Cloudflare.
 
-Local connections also verify the caller's identity and permissions. Unix socket OS permissions are not used as a substitute for global operation permissions; a permission profile for DaVinci limits the workspaces, processes, sandbox, and required credential paths.
+Local connections also verify the caller's identity and permissions. Unix socket OS permissions are not used as a substitute for global operation permissions; a permission profile for DaVinci limits the workspaces, commands, and agents it may use.
 
-DaVinci's agent adapters interpret the Codex app-server, Claude stream-json, and DSH/ACP protocols. Reach provides continuous process I/O and lifecycle, and does not infer the success of an LLM turn or the validity of development results.
+Reach speaks Codex App Server, Claude Code stream-json, and ACP to the harness. DaVinci builds prompts and interprets the agent's output; Reach records turns and events as facts and does not infer the success of an LLM turn or the validity of development results.
 
 ## 4.1 Remote communication and authentication
 
@@ -142,24 +145,27 @@ The initial MCP tools are the following candidates. Formal names and JSON Schema
 | --- | --- | --- |
 | list_nodes | Query authorized nodes | node_id, online / offline |
 | list_capabilities | Query a node's capabilities | node_id, capabilities |
-| list_workspaces | Permitted workspaces | workspace_id, permission |
+| list_projects | Projects the caller may create workspaces from | project_id, permissions |
+| create_workspace | Create an Orca workspace (worktree) from a project | operation_id, project_id, name → workspace_id, path |
+| list_workspaces | The caller's workspaces | workspace_id, project_id, path |
+| delete_workspace | Delete one of the caller's workspaces through Orca | operation_id, workspace_id |
 | list_files | File listing within a permitted area | workspace_id, relative_path |
 | read_file | Read a file | workspace_id, relative_path, bounded data |
 | write_file | Conditional file write | operation_id, workspace_id, path, expected_version |
 | start_job | Start an asynchronous command | operation_id, workspace_id, executable, argv, limits |
-| start_process_session | Start an interactive process as a job | operation_id, workspace_id, executable, argv, sandbox_profile |
-| get_process_session | Query process and I/O state by session ID | process_session_id, lifecycle, output cursors |
-| send_process_input | Send continuous input to stdin | process_session_id, input_id, expected_sequence, bytes |
-| read_process_output | Re-fetch / incrementally fetch stdout / stderr | process_session_id, stream, cursor, limit |
-| stop_process_session | Request a process stop and confirm termination | operation_id, process_session_id |
+| start_agent_session | Start an agent harness and open a protocol session | operation_id, workspace_id, agent, resume_session_id |
+| send_agent_prompt | Start one turn without waiting for it | operation_id, session_id, text → turn |
+| read_agent_events | Read normalized events by sequence | session_id, after, limit |
+| get_agent_session | Query a session | session_id → state, turns, protocol_session_id |
+| stop_agent_session | Interrupt any turn and end the harness | operation_id, session_id |
 | get_operation | Reconcile an unknown acceptance result | operation_id, admission / final state |
 | get_job | Current state of a job | job_id, status, timestamps |
 | read_job_output | Paged output retrieval | job_id, stream, cursor, limit |
 | cancel_job | Request a job stop | operation_id, job_id |
 
-IDs of long-running jobs and process sessions are generated on Linux. Start, execution state, and output retrieval are separated so results can be looked up later. A future adapter can serve hosts that support MCP Tasks, but the internal job contract does not depend on it.
+IDs of jobs and agent sessions are generated on Linux. Start, execution state, and output retrieval are separated so results can be looked up later. A future adapter can serve hosts that support MCP Tasks, but the internal job contract does not depend on it.
 
-The interactive process tools are also provided to the DaVinci local client, which uses the same execution API. How fine-grained tools are exposed to AI hosts and how streaming is supported are concerns of the connection adapter; the core defines the meaning of processes and I/O.
+The agent session tools are also provided to the DaVinci local client, which uses the same execution API. How tools are exposed to AI hosts and how streaming is supported are concerns of the connection adapter; the core defines the meaning of sessions, turns, and events.
 
 ## 6. Operations / jobs / idempotency
 
@@ -181,33 +187,31 @@ running → cancelling → cancelled / failed / unknown
 
 unknown is used when the result or the OS-side state cannot be confirmed. State transitions, reasons, and the last observation time are stored. Acceptance of a stop request is kept distinct from the fact that the process has stopped.
 
-For the OS execution unit of a job, systemd transient units / cgroups v2 and the like are considered, and existing processes are reconciled when the daemon restarts. **There is no guarantee that jobs continue across a reboot of Linux itself.** If the result is unknown after a reboot, it is explicitly unknown, and it is not re-executed automatically.
+Commands, jobs, and agent harnesses run as children of the daemon, each in its own process group, and are killed when the daemon dies; under the systemd user unit, the unit's cgroup also removes their descendants. **Work does not survive a daemon restart or a reboot.** Operations, jobs, and agent sessions left running by a previous daemon become unknown at the next start, and they are never re-executed automatically.
 
-### Interactive process sessions (required for DaVinci's initial use)
+### Agent sessions (required for DaVinci's initial use)
 
-- One process session corresponds to one execution process and job owned by Reach. Its ID is separate from DaVinci's run / agent session / turn.
-- At start, the resolved executable / argv, workspace, sandbox profile, permitted environment, and the minimum required credential references are specified.
-- stdin has a single write owner. A per-input `input_id` and an ordering condition reject duplicates and out-of-order input. When another writer connects, an explicit transfer of ownership / fencing is required.
-- stdout and stderr are recorded locally and separately. They can be re-fetched, with limits, from monotonic offsets / cursors, so transport disconnects cause neither lost output nor implicit re-execution.
-- Disconnects of WSS / MCP / DaVinci are treated as detach, separate from an explicit stop request via `stop_process_session`.
-- When the DaVinci Controller restarts, it queries and reattaches to existing process sessions, and confirms the definitive result of input delivery before sending the next turn.
-- That real processes survive an abnormal exit of the Reach daemon is guaranteed only once an independent OS-managed unit / supervisor is implemented and verified. Executions whose liveness cannot be confirmed are never resumed automatically.
-- The MVP's base candidate is streaming I/O over pipes; PTY, FD passing, bidirectional backpressure, and per-agent handshakes are decided in detailed design and real-provider testing. Parsing agent-specific protocols is DaVinci's job.
+- One agent session corresponds to one harness process owned by Reach and one protocol session (Codex thread / ACP session). Its ID is separate from DaVinci's run.
+- Supported protocols, ported from DaVinci's agent adapters: Codex App Server and ACP v1 (newline-delimited JSON-RPC over stdio), and Claude Code's stream-json interface. For Claude, Reach appends the stream-json flags and `--session-id` / `--resume`. Agents (command, environment) are configured per node and allowed per project.
+- A session runs one turn at a time. A prompt is an operation: resending it never starts a second turn, and a prompt while a turn is running is rejected.
+- Agent messages, errors, and turn completion are recorded as events with a monotonic sequence and read back by cursor, so a transport disconnect loses no output.
+- Disconnects of WSS / MCP / DaVinci are detach; only `stop_agent_session` interrupts the turn and ends the harness.
+- Sandboxing belongs to the harness. Codex runs with its sandbox mode (default `workspace-write`) and approvals disabled. Claude Code runs with the permission mode and sandbox settings of its configured command and settings. ACP agents get no file system or terminal capabilities from Reach, and their permission requests are denied unless the agent's configuration allows them.
+- After a daemon restart, sessions are unknown. A caller can start a new session that continues the conversation of one of its own ended sessions (`resume_session_id`, same workspace and agent); Reach never resumes on its own. Protocol session IDs are never accepted from callers, so no client can attach to another client's conversation.
 
-## 7. Linux execution and sandbox
+## 7. Linux execution
 
 Initial target: Linux with systemd, single user, single node.
 
 - Daemon: a non-root systemd user service. Linger is set explicitly when needed.
 - Storage: local SQLite (WAL) and managed log / artifact directories.
+- Workspaces: a caller creates a workspace from a project (a repository registered in the Orca server of the same host). Reach creates it as an Orca worktree with its own branch through the Orca CLI and records it; only that caller can use and delete it. Deletion goes through Orca, deletes the branch only if Orca can prove it is merged, and is refused while jobs or agent sessions run or when the worktree has uncommitted changes. Workspaces that Reach did not create are never deleted.
 - Files: take a workspace ID and a relative path, and enforce the boundary with safe path resolution such as openat2. Escapes via symlinks or mounts are also checked.
 - Writes: conditional updates, with temporary files / atomic rename as needed.
-- Commands: executable and argv are structured; no implicit shell expansion.
-- Isolation: combinations of Linux namespaces, bubblewrap, systemd / cgroups v2, etc. are verified.
-- Defaults: no extra mounts, secrets, network, or privileged devices. Only when DaVinci needs model APIs or dependency fetching is network access and a limited credential path allowed, in an explicit sandbox profile.
-- Resources: limit CPU, memory, number of processes, execution time, and log size.
+- Commands and jobs: an executable from the project's allowlist plus argv; no implicit shell expansion; a minimal environment (the daemon's environment is not inherited); execution time and output size limits.
+- Agents: sandboxing of the agent's tools is delegated to the agent harness (see §6).
 
-**Note:** the mere presence of bubblewrap or user namespaces does not mean sufficient isolation. Effectiveness is verified on the target distribution, configuration, and kernel features. If the required protection is unavailable, fail closed. Privileged operations are never substituted with unrestricted command execution.
+**Note:** Reach does not isolate commands and jobs itself. Only allowlisted executables run, as the daemon's user, so allowlists should not include executables that can run arbitrary code unless that is intended.
 
 ## 8. Authentication, authorization, audit
 
@@ -229,8 +233,9 @@ Record the operation ID, authenticated principal, node, workspace, operation typ
 
 | Store | Contents | Authority |
 | --- | --- | --- |
-| Linux SQLite | Indexes of operations, jobs, process_sessions, input_receipts, permissions, audit_records, artifacts | **Source of truth for operations / jobs / process sessions** |
-| Linux files | Job stdout / stderr, artifacts | **Source of truth for the actual data** |
+| Linux SQLite | operations, workspaces, jobs, agent_sessions, agent_events, audit_records | **Source of truth for operations / workspace ownership / jobs / agent sessions** |
+| Orca server | Worktrees, branches, and their files | **Source of truth for workspace contents** |
+| Linux files | Job stdout / stderr, harness stderr logs | **Source of truth for the actual data** |
 | Durable Object | WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
 | Workers | Transient processing and forwarding of authenticated requests | Holds no persistent job state |
 
@@ -245,21 +250,22 @@ If a requirement arises to copy data to the Cloudflare side, a separate contract
 | Temporary Cloudflare outage | New operations may be unavailable. Linux jobs and results are kept |
 | DO hibernation / recreation | Reconstruct connection metadata and request connector re-registration if needed |
 | HTTP response lost | Return outcome_unknown; query or resend the same operation ID |
-| Daemon crash | Reconcile OS job / process session state with SQLite. Unknown when unconfirmed. Continued execution depends on verifying independent process management |
-| DaVinci restart | Reattach from the Reach job / process session IDs saved in the DaVinci run, and reconcile unconfirmed input and exits first |
-| Interactive stdin delivery unknown | Reconcile receipts by input_id / sequence. Never unconditionally resend the same input under a new ID |
+| Daemon crash | Children die with the daemon. Running operations, jobs, and agent sessions become unknown at the next start and are never resumed |
+| DaVinci restart | Look up the Reach job / agent session IDs saved in the DaVinci run, and read events from the last sequence it saw |
+| Prompt delivery unknown | Reconcile by the prompt's operation ID (get_operation). Never resend the same prompt under a new ID |
 | Duplicate requests | Prevent double side effects with SQLite unique constraints and argument comparison |
 | Permission revoked | Reject new requests. Running jobs follow an explicit stop policy |
+| Orca unavailable or refusing | create / delete fail with orca_failed; existing workspaces stay usable. A daemon crash during create / delete leaves the workspace unknown |
 
-Standard error classes (draft): node_offline / unauthorized / permission_denied / invalid_request / operation_conflict / result_unknown / sandbox_unavailable / timeout.
+Error classes: unauthorized / permission_denied / invalid_request / not_found / operation_conflict / version_conflict / invalid_state / harness_unavailable / orca_failed / internal; the remote path adds node_offline. An outcome that cannot be confirmed is the `unknown` state with `result_unknown`.
 
 The availability goal is not "the WebSocket never drops" but **"even when it drops, the truth about accepted operations is never lost, and reconnection reconciles it correctly."**
 
 ## 11. MVP build order
 
-1. **Local Core**: Go daemon, SQLite, workspaces, File / Command API, operation IDs / audit.
-2. **Linux Execution**: sandbox, asynchronous jobs, **interactive process sessions and continuous I/O**, stop and ownership, reconciliation after restart.
-3. **DaVinci local integration**: local API / adapter for DaVinci. Keep the existing agent protocols and development workflow, and delegate execution to Reach. Verify a local E2E.
+1. **Local Core**: Go daemon, SQLite, workspaces (Orca), File / Command API, operation IDs / audit.
+2. **Linux Execution**: asynchronous jobs, **agent sessions over Codex App Server / Claude Code stream-json / ACP** (sandboxing delegated to the harness), stop and ownership, reconciliation after restart.
+3. **DaVinci local integration**: move DaVinci's agent execution onto Reach agent sessions while keeping its prompts and development workflow. Verify a local E2E.
 4. **Remote MCP**: Workers MCP Gateway, OAuth, node registration, DO WebSocket broker, connector WSS.
 5. **Acceptance / rollout**: verification on real Linux / hosted Cloudflare / multiple MCP hosts, plus staged cutover and recovery tests for the existing DaVinci.
 
@@ -274,10 +280,10 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 - Jobs can be queried after DO hibernation / recreation or connector reconnection.
 - Work that was not accepted while the node was offline is not executed on its own after recovery.
 - Production OAuth, node credential revocation, and permission changes take effect.
-- DaVinci launches Codex etc. through Reach, sends input to the same process multiple times, and re-fetches stdout/stderr in order.
+- DaVinci starts Codex / ACP agents through Reach, sends multiple turns to the same session, and re-reads the events in order.
 - The meaning and state of DaVinci runs / agent turns / GitHub issues / draft PRs are not confused with Reach jobs.
-- DaVinci Controller restarts, duplicate stdin, session stop, and provider credential separation are verified with real processes.
-- The mapping between Reach job / process session IDs and DaVinci run IDs is stored in DaVinci and can be reconciled after recovery.
+- DaVinci Controller restarts, duplicate prompts, session stop, and provider credential separation are verified with real processes.
+- The mapping between Reach job / agent session IDs and DaVinci run IDs is stored in DaVinci and can be reconciled after recovery.
 
 ## 12. Items requiring design verification
 
@@ -286,21 +292,21 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 | Remote MCP | Compatibility of target MCP hosts and the chosen SDK with 2026-07-28 / 2025-11-25 |
 | Authentication | Connection registration, revocation, and permission mapping when using an OAuth issuer / Gate |
 | Node credential | Issuance, secret storage, expiry, revocation, re-registration |
-| Linux sandbox | Support boundaries and fail-closed behavior of bubblewrap, namespaces, cgroups |
-| Job | Recovery and stop of systemd user transient units / independent processes |
+| Harness sandbox | What Codex sandbox modes, Claude Code permission and sandbox settings, and ACP agents' permission handling actually confine on the target Linux |
 | Broker | WebSocket restoration after DO hibernation, concurrent requests, correlation on disconnect |
 | MCP responses | Tool timeouts, job acceptance ACKs, reconciliation on unknown results |
-| Data | Operation / job / process session schema, input receipts, retention and deletion of logs / artifacts |
-| DaVinci integration | An adapter and migration plan that keep the existing run / agent session / sandbox / credential contracts |
-| Interactive I/O | stdin write leases, redelivery, stdout/stderr cursors, backpressure, need for PTY |
+| Data | Retention and deletion of operations, events, job output, and logs |
+| Orca | Stability of the Orca CLI's JSON results across versions; which base ref new workspaces should start from |
+| DaVinci integration | A migration plan that keeps the existing run / prompt / credential contracts on Reach agent sessions |
+| Agent events | Which harness events (tool calls, usage, plans) to record beyond messages, errors, and turn completion |
 
 These are decided in detailed design and verification on real environments. Design documents do not indicate running functionality or completed production acceptance.
 
 ## 13. DaVinci execution environment integration
 
-As Reach's first client service, DaVinci uses the local API to delegate execution of agent processes, builds, tests, and verification. DaVinci's issues/PRs, agent provider protocols, runs / attempts, and judgment and acceptance of results are not moved into Reach.
+As Reach's first client service, DaVinci uses the local API to delegate execution of agent processes, builds, tests, and verification. DaVinci's issues/PRs, prompts and output contracts, runs / attempts, and judgment and acceptance of results are not moved into Reach.
 
-DaVinci's existing Go implementation (process / sandbox / command delivery / recovery) serves as the reference implementation for design and tests and is generalized into Reach one responsibility at a time. Because the existing code has DaVinci-specific dependencies and termination conditions, wholesale copying or stopping the old controller first is not done.
+DaVinci's existing Go implementation (process / agent adapters / command delivery / recovery) serves as the reference implementation for design and tests and is generalized into Reach one responsibility at a time. Because the existing code has DaVinci-specific dependencies and termination conditions, wholesale copying or stopping the old controller first is not done.
 
 DaVinci's current Cloud Run / Firestore issue projection, dashboard, and command delivery are business contracts of a separate product. What Reach's Cloudflare broker replaces is only the generic execution connection; DaVinci's business cloud features are not replaced unconditionally.
 

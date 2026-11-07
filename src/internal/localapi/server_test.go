@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/takezoh/syntoria-reach/src/internal/config"
+	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 	"github.com/takezoh/syntoria-reach/src/internal/store"
 )
@@ -25,17 +26,17 @@ func start(t *testing.T) *http.Client {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	root := filepath.Join(dir, "ws")
-	os.Mkdir(root, 0o755)
 	st, err := store.Open(filepath.Join(dir, "reach.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
 	svc, err := service.New(&config.Config{
-		Workspaces: []config.Workspace{{ID: "ws", Root: root}},
+		Database: filepath.Join(dir, "reach.db"),
+		Orca:     orcatest.Command(t, "TestFakeOrca", dir),
+		Projects: []config.Project{{ID: "proj", Repo: "/repo"}},
 		Clients: []config.Client{{ID: "a", Token: token, Grants: []config.Grant{
-			{Workspace: "ws", Allow: []string{config.PermFileRead, config.PermFileWrite}},
+			{Project: "proj", Allow: []string{config.PermWorkspaceCreate, config.PermFileRead, config.PermFileWrite}},
 		}}},
 	}, st)
 	if err != nil {
@@ -78,26 +79,37 @@ func post(t *testing.T, c *http.Client, method, tok string, body any) (int, map[
 	return resp.StatusCode, out
 }
 
+// TestFakeOrca is not a test: it turns the test binary into a fake Orca CLI.
+func TestFakeOrca(t *testing.T) {
+	orcatest.MaybeRun()
+	t.Skip("helper process")
+}
+
 func TestLocalAPI(t *testing.T) {
 	c := start(t)
+	status, created := post(t, c, "create_workspace", token, map[string]any{"operation_id": "cw", "project": "proj", "name": "ws"})
+	if status != 200 || created["state"] != "succeeded" {
+		t.Fatalf("create_workspace: %d %v", status, created)
+	}
+	ws := created["result"].(map[string]any)["workspace"]
 
-	if status, out := post(t, c, "list_files", "", map[string]any{"workspace": "ws"}); status != 401 {
+	if status, out := post(t, c, "list_files", "", map[string]any{"workspace": ws}); status != 401 {
 		t.Fatalf("no token: %d %v", status, out)
 	}
-	if status, _ := post(t, c, "list_files", "wrong-token", map[string]any{"workspace": "ws"}); status != 401 {
+	if status, _ := post(t, c, "list_files", "wrong-token", map[string]any{"workspace": ws}); status != 401 {
 		t.Fatalf("wrong token: %d", status)
 	}
-	if status, _ := post(t, c, "read_file", token, map[string]any{"workspace": "ws", "path": "x", "bogus": 1}); status != 400 {
+	if status, _ := post(t, c, "read_file", token, map[string]any{"workspace": ws, "path": "x", "bogus": 1}); status != 400 {
 		t.Fatalf("unknown field: %d", status)
 	}
 
 	status, op := post(t, c, "write_file", token, map[string]any{
-		"operation_id": "w1", "workspace": "ws", "path": "hello.txt", "content": []byte("hi"),
+		"operation_id": "w1", "workspace": ws, "path": "hello.txt", "content": []byte("hi"),
 	})
 	if status != 200 || op["state"] != "succeeded" {
 		t.Fatalf("write: %d %v", status, op)
 	}
-	status, res := post(t, c, "read_file", token, map[string]any{"workspace": "ws", "path": "hello.txt"})
+	status, res := post(t, c, "read_file", token, map[string]any{"workspace": ws, "path": "hello.txt"})
 	if status != 200 || res["data"] != "aGk=" || res["version"] != op["result"].(map[string]any)["version"] {
 		t.Fatalf("read: %d %v", status, res)
 	}
@@ -105,7 +117,7 @@ func TestLocalAPI(t *testing.T) {
 	if status != 200 || got["state"] != "succeeded" {
 		t.Fatalf("get_operation: %d %v", status, got)
 	}
-	if status, out := post(t, c, "run_command", token, map[string]any{"operation_id": "c1", "workspace": "ws", "executable": "/bin/sh"}); status != 403 {
+	if status, out := post(t, c, "run_command", token, map[string]any{"operation_id": "c1", "workspace": ws, "executable": "/bin/sh"}); status != 403 {
 		t.Fatalf("run_command without permission: %d %v", status, out)
 	}
 }

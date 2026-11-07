@@ -9,28 +9,59 @@ import (
 	"path/filepath"
 )
 
-// Permissions a client can be granted on a workspace.
+// Permissions a client can be granted on a project. workspace.create lets
+// the client create (and delete) its own workspaces from the project; the
+// other permissions apply to those workspaces.
 const (
-	PermFileRead   = "file.read"
-	PermFileWrite  = "file.write"
-	PermCommandRun = "command.run"
+	PermWorkspaceCreate = "workspace.create"
+	PermFileRead        = "file.read"
+	PermFileWrite       = "file.write"
+	PermCommandRun      = "command.run" // run_command and jobs
+	PermAgentRun        = "agent.run"
+)
+
+// Agent harness protocols.
+const (
+	ProtocolCodex  = "codex"  // Codex app-server
+	ProtocolClaude = "claude" // Claude Code stream-json
+	ProtocolACP    = "acp"    // Agent Client Protocol v1 (e.g. DSH)
 )
 
 // Config is the on-disk daemon configuration. It contains client tokens, so the
 // file must not be readable by group or others.
 type Config struct {
-	Socket     string      `json:"socket"`
-	Database   string      `json:"database"`
-	Workspaces []Workspace `json:"workspaces"`
-	Clients    []Client    `json:"clients"`
+	Socket   string    `json:"socket"`
+	Database string    `json:"database"`
+	Orca     []string  `json:"orca"` // Orca CLI command; Command[0] is absolute
+	Agents   []Agent   `json:"agents"`
+	Projects []Project `json:"projects"`
+	Clients  []Client  `json:"clients"`
 }
 
-// Workspace is a directory the daemon exposes. Commands lists the absolute
-// paths of executables that may be run in it.
-type Workspace struct {
+// Agent is an agent harness Reach can start. Command[0] is an absolute path;
+// Env is added to the minimal child environment. For Claude, Reach appends
+// the stream-json and session flags; permission mode and sandbox flags belong
+// in Command. The harness sandboxes its own tools: Sandbox is the Codex
+// sandbox mode (default "workspace-write"), and AllowPermissions lets Reach
+// approve ACP permission requests (default deny).
+type Agent struct {
+	ID               string            `json:"id"`
+	Protocol         string            `json:"protocol"`
+	Command          []string          `json:"command"`
+	Env              map[string]string `json:"env"`
+	Sandbox          string            `json:"sandbox"`
+	AllowPermissions bool              `json:"allow_permissions"`
+}
+
+// Project is a repository registered in the Orca server from which clients
+// create workspaces (Orca worktrees). Repo is its absolute path. Commands
+// lists the absolute paths of executables and Agents the agent IDs allowed in
+// its workspaces.
+type Project struct {
 	ID       string   `json:"id"`
-	Root     string   `json:"root"`
+	Repo     string   `json:"repo"`
 	Commands []string `json:"commands"`
+	Agents   []string `json:"agents"`
 }
 
 // Client is a caller identified by a bearer token.
@@ -40,10 +71,10 @@ type Client struct {
 	Grants []Grant `json:"grants"`
 }
 
-// Grant gives a client permissions on one workspace.
+// Grant gives a client permissions on one project.
 type Grant struct {
-	Workspace string   `json:"workspace"`
-	Allow     []string `json:"allow"`
+	Project string   `json:"project"`
+	Allow   []string `json:"allow"`
 }
 
 // Load reads and validates the configuration at path.
@@ -98,18 +129,51 @@ func (c *Config) validate() error {
 	if !filepath.IsAbs(c.Socket) || !filepath.IsAbs(c.Database) {
 		return errors.New("socket and database must be absolute paths")
 	}
-	workspaces := map[string]bool{}
-	for _, w := range c.Workspaces {
-		if w.ID == "" || workspaces[w.ID] {
-			return fmt.Errorf("workspace id %q is empty or duplicated", w.ID)
+	if len(c.Projects) > 0 && (len(c.Orca) == 0 || !filepath.IsAbs(c.Orca[0])) {
+		return errors.New("orca must be set to the Orca CLI command, starting with an absolute path")
+	}
+	agents := map[string]bool{}
+	for i := range c.Agents {
+		a := &c.Agents[i]
+		if a.ID == "" || agents[a.ID] {
+			return fmt.Errorf("agent id %q is empty or duplicated", a.ID)
 		}
-		workspaces[w.ID] = true
-		if !filepath.IsAbs(w.Root) {
-			return fmt.Errorf("workspace %s: root must be an absolute path", w.ID)
+		agents[a.ID] = true
+		if a.Protocol != ProtocolCodex && a.Protocol != ProtocolClaude && a.Protocol != ProtocolACP {
+			return fmt.Errorf("agent %s: protocol must be %q, %q or %q", a.ID, ProtocolCodex, ProtocolClaude, ProtocolACP)
 		}
-		for _, cmd := range w.Commands {
+		if len(a.Command) == 0 || !filepath.IsAbs(a.Command[0]) {
+			return fmt.Errorf("agent %s: command must start with an absolute path", a.ID)
+		}
+		if a.Protocol == ProtocolCodex && a.Sandbox == "" {
+			a.Sandbox = "workspace-write"
+		}
+		switch {
+		case a.Protocol != ProtocolCodex && a.Sandbox != "":
+			return fmt.Errorf("agent %s: sandbox applies to codex agents only", a.ID)
+		case a.Protocol != ProtocolACP && a.AllowPermissions:
+			return fmt.Errorf("agent %s: allow_permissions applies to acp agents only", a.ID)
+		case a.Protocol == ProtocolCodex && a.Sandbox != "read-only" && a.Sandbox != "workspace-write" && a.Sandbox != "danger-full-access":
+			return fmt.Errorf("agent %s: unknown codex sandbox %q", a.ID, a.Sandbox)
+		}
+	}
+	projects := map[string]bool{}
+	for _, p := range c.Projects {
+		if p.ID == "" || projects[p.ID] {
+			return fmt.Errorf("project id %q is empty or duplicated", p.ID)
+		}
+		projects[p.ID] = true
+		if !filepath.IsAbs(p.Repo) {
+			return fmt.Errorf("project %s: repo must be an absolute path", p.ID)
+		}
+		for _, cmd := range p.Commands {
 			if !filepath.IsAbs(cmd) {
-				return fmt.Errorf("workspace %s: command %q must be an absolute path", w.ID, cmd)
+				return fmt.Errorf("project %s: command %q must be an absolute path", p.ID, cmd)
+			}
+		}
+		for _, a := range p.Agents {
+			if !agents[a] {
+				return fmt.Errorf("project %s: unknown agent %q", p.ID, a)
 			}
 		}
 	}
@@ -128,12 +192,12 @@ func (c *Config) validate() error {
 		}
 		tokens[cl.Token] = true
 		for _, g := range cl.Grants {
-			if !workspaces[g.Workspace] {
-				return fmt.Errorf("client %s: unknown workspace %q", cl.ID, g.Workspace)
+			if !projects[g.Project] {
+				return fmt.Errorf("client %s: unknown project %q", cl.ID, g.Project)
 			}
 			for _, p := range g.Allow {
 				switch p {
-				case PermFileRead, PermFileWrite, PermCommandRun:
+				case PermWorkspaceCreate, PermFileRead, PermFileWrite, PermCommandRun, PermAgentRun:
 				default:
 					return fmt.Errorf("client %s: unknown permission %q", cl.ID, p)
 				}

@@ -5,7 +5,6 @@
 package service
 
 import (
-	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -14,12 +13,17 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"regexp"
 	"slices"
+	"sync"
 	"time"
 
+	"github.com/takezoh/syntoria-reach/src/internal/agent"
 	"github.com/takezoh/syntoria-reach/src/internal/command"
 	"github.com/takezoh/syntoria-reach/src/internal/config"
+	"github.com/takezoh/syntoria-reach/src/internal/job"
+	"github.com/takezoh/syntoria-reach/src/internal/orca"
 	"github.com/takezoh/syntoria-reach/src/internal/store"
 	"github.com/takezoh/syntoria-reach/src/internal/workspace"
 )
@@ -32,6 +36,9 @@ const (
 	CodeNotFound          = "not_found"
 	CodeOperationConflict = "operation_conflict"
 	CodeVersionConflict   = "version_conflict"
+	CodeInvalidState      = "invalid_state" // e.g. a turn is already running
+	CodeHarnessFailed     = "harness_unavailable"
+	CodeOrcaFailed        = "orca_failed"
 	CodeInternal          = "internal"
 )
 
@@ -64,46 +71,68 @@ var operationIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 type Client struct {
 	ID    string
 	token string
-	perms map[string][]string // workspace ID -> permissions
+	perms map[string][]string // project ID -> permissions
 }
 
+// ws is a resolved, ready workspace the caller may use.
 type ws struct {
-	cfg config.Workspace
-	fs  *workspace.FS
+	id       string
+	root     string
+	commands []string
+	agents   []string
+	fs       *workspace.FS
 }
 
 // Service is the Reach application service.
 type Service struct {
-	store      *store.Store
-	workspaces map[string]*ws
-	clients    []*Client
+	store    *store.Store
+	orca     *orca.CLI
+	projects map[string]config.Project
+	agents   map[string]config.Agent
+	clients  []*Client
+	jobs     *job.Manager
+	sessions *agent.Manager
+
+	fsMu sync.Mutex
+	fs   map[string]*workspace.FS // open roots of ready workspaces
 }
 
-// New opens every configured workspace root.
+// New returns the service. Job output and harness logs are kept next to the
+// database.
 func New(cfg *config.Config, st *store.Store) (*Service, error) {
-	s := &Service{store: st, workspaces: map[string]*ws{}}
-	for _, w := range cfg.Workspaces {
-		f, err := workspace.Open(w.Root)
-		if err != nil {
-			s.Close()
-			return nil, fmt.Errorf("workspace %s: %w", w.ID, err)
-		}
-		s.workspaces[w.ID] = &ws{cfg: w, fs: f}
+	stateDir := filepath.Dir(cfg.Database)
+	s := &Service{
+		store:    st,
+		orca:     &orca.CLI{Command: cfg.Orca},
+		projects: map[string]config.Project{},
+		agents:   map[string]config.Agent{},
+		jobs:     job.New(st, filepath.Join(stateDir, "jobs")),
+		sessions: agent.New(st, filepath.Join(stateDir, "agents")),
+		fs:       map[string]*workspace.FS{},
+	}
+	for _, a := range cfg.Agents {
+		s.agents[a.ID] = a
+	}
+	for _, p := range cfg.Projects {
+		s.projects[p.ID] = p
 	}
 	for _, c := range cfg.Clients {
 		cl := &Client{ID: c.ID, token: c.Token, perms: map[string][]string{}}
 		for _, g := range c.Grants {
-			cl.perms[g.Workspace] = append(cl.perms[g.Workspace], g.Allow...)
+			cl.perms[g.Project] = append(cl.perms[g.Project], g.Allow...)
 		}
 		s.clients = append(s.clients, cl)
 	}
 	return s, nil
 }
 
-// Close releases workspace roots.
+// Close releases open workspace roots.
 func (s *Service) Close() {
-	for _, w := range s.workspaces {
-		w.fs.Close()
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+	for id, f := range s.fs {
+		f.Close()
+		delete(s.fs, id)
 	}
 }
 
@@ -121,39 +150,50 @@ func (s *Service) Authenticate(token string) (*Client, error) {
 	return found, nil
 }
 
+// authorize resolves one of the client's ready workspaces on which the
+// client holds perm (through the workspace's project).
 func (s *Service) authorize(c *Client, workspaceID, perm string) (*ws, error) {
-	w, ok := s.workspaces[workspaceID]
-	if !ok || !slices.Contains(c.perms[workspaceID], perm) {
-		// Unknown and forbidden workspaces are indistinguishable to the caller.
-		return nil, errorf(CodePermissionDenied, "%s is not allowed on workspace %q", perm, workspaceID)
+	// Unknown, foreign and forbidden workspaces are indistinguishable.
+	denied := errorf(CodePermissionDenied, "%s is not allowed on workspace %q", perm, workspaceID)
+	rec, err := s.store.GetWorkspace(c.ID, workspaceID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, denied
 	}
-	return w, nil
+	if err != nil {
+		return nil, internal(err)
+	}
+	p, ok := s.projects[rec.ProjectID]
+	if !ok || rec.State != store.WorkspaceReady || !slices.Contains(c.perms[rec.ProjectID], perm) {
+		return nil, denied
+	}
+	f, err := s.openFS(rec)
+	if err != nil {
+		return nil, internal(err)
+	}
+	return &ws{id: rec.ID, root: rec.Path, commands: p.Commands, agents: p.Agents, fs: f}, nil
 }
 
-// WorkspaceInfo describes a workspace visible to the client.
-type WorkspaceInfo struct {
-	ID          string   `json:"id"`
-	Permissions []string `json:"permissions"`
-	Commands    []string `json:"commands,omitempty"`
+func (s *Service) openFS(rec *store.Workspace) (*workspace.FS, error) {
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+	if f, ok := s.fs[rec.ID]; ok {
+		return f, nil
+	}
+	f, err := workspace.Open(rec.Path)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace %s: %w", rec.ID, err)
+	}
+	s.fs[rec.ID] = f
+	return f, nil
 }
 
-// ListWorkspaces returns the workspaces the client has any permission on.
-func (s *Service) ListWorkspaces(c *Client) []WorkspaceInfo {
-	out := []WorkspaceInfo{}
-	for id, perms := range c.perms {
-		w, ok := s.workspaces[id]
-		if !ok {
-			continue
-		}
-		info := WorkspaceInfo{ID: id, Permissions: perms}
-		if slices.Contains(perms, config.PermCommandRun) {
-			info.Commands = w.cfg.Commands
-		}
-		out = append(out, info)
+func (s *Service) closeFS(id string) {
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+	if f, ok := s.fs[id]; ok {
+		f.Close()
+		delete(s.fs, id)
 	}
-	slices.SortFunc(out, func(a, b WorkspaceInfo) int { return cmp.Compare(a.ID, b.ID) })
-	s.audit(store.AuditRecord{ClientID: c.ID, Action: "list_workspaces"}, nil)
-	return out
 }
 
 // ListFilesRequest lists one directory.
@@ -265,7 +305,7 @@ type RunCommandRequest struct {
 func (s *Service) RunCommand(ctx context.Context, c *Client, req RunCommandRequest) (*store.Operation, error) {
 	rec := store.AuditRecord{ClientID: c.ID, Action: "run_command", WorkspaceID: req.Workspace, Target: req.Executable, OperationID: req.OperationID}
 	w, err := s.authorize(c, req.Workspace, config.PermCommandRun)
-	if err == nil && !slices.Contains(w.cfg.Commands, req.Executable) {
+	if err == nil && !slices.Contains(w.commands, req.Executable) {
 		err = errorf(CodePermissionDenied, "executable %q is not allowed on workspace %q", req.Executable, req.Workspace)
 	}
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
@@ -284,7 +324,7 @@ func (s *Service) RunCommand(ctx context.Context, c *Client, req RunCommandReque
 		res, err := command.Run(ctx, command.Spec{
 			Executable:  req.Executable,
 			Args:        req.Args,
-			Dir:         w.cfg.Root,
+			Dir:         w.root,
 			Timeout:     timeout,
 			OutputLimit: outputLimit,
 		})
@@ -365,16 +405,16 @@ func (s *Service) operation(c *Client, kind, opID string, req any, rec store.Aud
 
 // argsHash identifies the request arguments, excluding the operation ID.
 func argsHash(req any) (string, error) {
-	switch r := req.(type) {
-	case WriteFileRequest:
-		r.OperationID = ""
-		req = r
-	case RunCommandRequest:
-		r.OperationID = ""
-		req = r
-	}
 	b, err := json.Marshal(req)
 	if err != nil {
+		return "", err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return "", err
+	}
+	delete(fields, "operation_id")
+	if b, err = json.Marshal(fields); err != nil { // map keys are sorted
 		return "", err
 	}
 	sum := sha256.Sum256(b)

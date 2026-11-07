@@ -81,6 +81,53 @@ var migrations = []string{
 		outcome      TEXT NOT NULL,
 		error_code   TEXT NOT NULL DEFAULT ''
 	);`,
+	`CREATE TABLE jobs (
+		id            TEXT PRIMARY KEY,
+		client_id     TEXT NOT NULL,
+		workspace_id  TEXT NOT NULL,
+		executable    TEXT NOT NULL,
+		state         TEXT NOT NULL,
+		exit_code     INTEGER,
+		timed_out     INTEGER NOT NULL DEFAULT 0,
+		truncated     INTEGER NOT NULL DEFAULT 0,
+		error_message TEXT NOT NULL DEFAULT '',
+		created_at    INTEGER NOT NULL,
+		updated_at    INTEGER NOT NULL
+	);
+	CREATE TABLE agent_sessions (
+		id                  TEXT PRIMARY KEY,
+		client_id           TEXT NOT NULL,
+		workspace_id        TEXT NOT NULL,
+		agent_id            TEXT NOT NULL,
+		protocol_session_id TEXT NOT NULL DEFAULT '',
+		state               TEXT NOT NULL,
+		turns               INTEGER NOT NULL DEFAULT 0,
+		error_message       TEXT NOT NULL DEFAULT '',
+		created_at          INTEGER NOT NULL,
+		updated_at          INTEGER NOT NULL
+	);
+	CREATE TABLE agent_events (
+		session_id TEXT NOT NULL,
+		seq        INTEGER NOT NULL,
+		turn       INTEGER NOT NULL,
+		type       TEXT NOT NULL,
+		text       TEXT NOT NULL,
+		at         INTEGER NOT NULL,
+		PRIMARY KEY (session_id, seq)
+	);`,
+	`CREATE TABLE workspaces (
+		id            TEXT PRIMARY KEY,
+		client_id     TEXT NOT NULL,
+		project_id    TEXT NOT NULL,
+		name          TEXT NOT NULL,
+		state         TEXT NOT NULL,
+		orca_id       TEXT NOT NULL DEFAULT '',
+		path          TEXT NOT NULL DEFAULT '',
+		branch        TEXT NOT NULL DEFAULT '',
+		error_message TEXT NOT NULL DEFAULT '',
+		created_at    INTEGER NOT NULL,
+		updated_at    INTEGER NOT NULL
+	);`,
 }
 
 // Open opens (creating if needed) the database at path and applies migrations.
@@ -199,17 +246,28 @@ func (s *Store) GetOperation(clientID, operationID string) (*Operation, error) {
 	return op, nil
 }
 
-// MarkRunningUnknown marks operations left running by a previous daemon
-// process as unknown. It must be called before serving requests.
+// MarkRunningUnknown marks operations, jobs, agent sessions and workspace
+// changes left active by a previous daemon process as unknown. Their processes died with that daemon
+// (or their fate cannot be confirmed), and they are never resumed. It must be
+// called before serving requests and returns the number of records changed.
 func (s *Store) MarkRunningUnknown() (int64, error) {
-	res, err := s.db.Exec(`UPDATE operations
-		SET state = ?, error_code = 'result_unknown',
-		    error_message = 'daemon stopped before the outcome was recorded', updated_at = ?
-		WHERE state = ?`, StateUnknown, s.now().UnixMilli(), StateRunning)
-	if err != nil {
-		return 0, err
+	const msg = "daemon stopped before the outcome was recorded"
+	now := s.now().UnixMilli()
+	var total int64
+	for _, q := range []string{
+		`UPDATE operations SET state = 'unknown', error_code = 'result_unknown', error_message = ?, updated_at = ? WHERE state = 'running'`,
+		`UPDATE jobs SET state = 'unknown', error_message = ?, updated_at = ? WHERE state = 'running'`,
+		`UPDATE agent_sessions SET state = 'unknown', error_message = ?, updated_at = ? WHERE state IN ('starting', 'idle', 'running')`,
+		`UPDATE workspaces SET state = 'unknown', error_message = ?, updated_at = ? WHERE state IN ('creating', 'deleting')`,
+	} {
+		res, err := s.db.Exec(q, msg, now)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
 	}
-	return res.RowsAffected()
+	return total, nil
 }
 
 // Audit appends an audit record.

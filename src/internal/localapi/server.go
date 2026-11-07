@@ -108,8 +108,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var result any
 	switch strings.TrimPrefix(r.URL.Path, "/v1/") {
+	case "list_projects":
+		result = h.svc.ListProjects(client)
 	case "list_workspaces":
-		result = h.svc.ListWorkspaces(client)
+		result, err = h.svc.ListWorkspaces(client)
+	case "create_workspace":
+		result, err = call(r, func(req service.CreateWorkspaceRequest) (any, error) {
+			return h.svc.CreateWorkspace(r.Context(), client, req)
+		})
+	case "delete_workspace":
+		result, err = call(r, func(req service.WorkspaceRequest) (any, error) {
+			return h.svc.DeleteWorkspace(r.Context(), client, req)
+		})
 	case "list_files":
 		result, err = call(r, func(req service.ListFilesRequest) (any, error) { return h.svc.ListFiles(client, req) })
 	case "read_file":
@@ -122,6 +132,26 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	case "get_operation":
 		result, err = call(r, func(req service.GetOperationRequest) (any, error) { return h.svc.GetOperation(client, req) })
+	case "start_job":
+		result, err = call(r, func(req service.StartJobRequest) (any, error) { return h.svc.StartJob(client, req) })
+	case "get_job":
+		result, err = call(r, func(req service.JobRequest) (any, error) { return h.svc.GetJob(client, req) })
+	case "read_job_output":
+		result, err = call(r, func(req service.ReadJobOutputRequest) (any, error) { return h.svc.ReadJobOutput(client, req) })
+	case "cancel_job":
+		result, err = call(r, func(req service.CancelJobRequest) (any, error) { return h.svc.CancelJob(client, req) })
+	case "start_agent_session":
+		result, err = call(r, func(req service.StartAgentSessionRequest) (any, error) {
+			return h.svc.StartAgentSession(r.Context(), client, req)
+		})
+	case "send_agent_prompt":
+		result, err = call(r, func(req service.SendAgentPromptRequest) (any, error) { return h.svc.SendAgentPrompt(client, req) })
+	case "get_agent_session":
+		result, err = call(r, func(req service.AgentSessionRequest) (any, error) { return h.svc.GetAgentSession(client, req) })
+	case "read_agent_events":
+		result, err = call(r, func(req service.ReadAgentEventsRequest) (any, error) { return h.svc.ReadAgentEvents(client, req) })
+	case "stop_agent_session":
+		result, err = call(r, func(req service.StopAgentSessionRequest) (any, error) { return h.svc.StopAgentSession(client, req) })
 	default:
 		err = &service.Error{Code: service.CodeNotFound, Message: "unknown method " + r.URL.Path}
 	}
@@ -155,6 +185,7 @@ func writeError(w http.ResponseWriter, err error) {
 		service.CodeNotFound:          http.StatusNotFound,
 		service.CodeOperationConflict: http.StatusConflict,
 		service.CodeVersionConflict:   http.StatusConflict,
+		service.CodeInvalidState:      http.StatusConflict,
 	}[e.Code]
 	if status == 0 {
 		status = http.StatusInternalServerError
