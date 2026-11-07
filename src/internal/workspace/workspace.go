@@ -209,9 +209,11 @@ func (w *FS) Write(rel string, data []byte, expectedVersion string) (string, err
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-// open opens rel inside the root and rejects results on another filesystem.
+// open opens rel inside the root. It accepts only regular files and
+// directories on the root's filesystem. O_NONBLOCK keeps a FIFO or device in
+// the workspace from blocking the open.
 func (w *FS) open(rel string) (*os.File, error) {
-	f, err := w.root.Open(rel)
+	f, err := w.root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -219,6 +221,10 @@ func (w *FS) open(rel string) (*os.File, error) {
 	if err != nil {
 		f.Close()
 		return nil, mapErr(err)
+	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		f.Close()
+		return nil, ErrNotRegular
 	}
 	if deviceOf(info) != w.dev {
 		f.Close()

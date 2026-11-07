@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func setup(t *testing.T) (*FS, string, string) {
@@ -131,5 +133,27 @@ func TestList(t *testing.T) {
 	}
 	if _, _, err := w.List("a.txt", 10); !errors.Is(err, ErrNotRegular) {
 		t.Fatalf("list file: %v", err)
+	}
+}
+
+func TestFIFODoesNotBlock(t *testing.T) {
+	w, root, _ := setup(t)
+	if err := syscall.Mkfifo(filepath.Join(root, "fifo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := w.Read("fifo", 0, 10); !errors.Is(err, ErrNotRegular) {
+			t.Errorf("Read(fifo) err = %v", err)
+		}
+		if _, err := w.Write("fifo", []byte("x"), "sha256:x"); !errors.Is(err, ErrNotRegular) {
+			t.Errorf("Write(fifo) err = %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("opening a FIFO blocked")
 	}
 }
