@@ -1,155 +1,155 @@
 # Syntoria Reach — Product Definition
 
-- Status: **設計方針確定 / 実装前**
+- Status: **Direction decided / pre-implementation**
 - Updated: 2026-11-01
 - Initial OS: **Linux**
-- Connection architecture: **B 案 — Cloudflare Workers + Durable Objects + Linux Connector**
+- Connection architecture: **Option B — Cloudflare Workers + Durable Objects + Linux Connector**
 
-## 1. プロダクトの定義
+## 1. Product definition
 
 **Give your AI the ability to act in your environment.**
 
-Syntoria Reach は、ChatGPT、Claude、Codex、その他の AI が、ユーザーの所有・管理する Linux PC / サーバーの機能を安全に利用するための独立したサービスである。AI は標準 MCP を通じてファイルを操作し、コマンドを実行し、長時間の処理を Job として管理できる。
+Syntoria Reach is an independent service that lets ChatGPT, Claude, Codex, and other AIs safely use the capabilities of Linux PCs and servers that the user owns or manages. Through standard MCP, an AI can operate on files, run commands, and manage long-running work as jobs.
 
-AI が判断・計画する。Reach は接続、アクセス制御、操作、実行状態、結果と監査情報を提供する。Reach に LLM を内蔵することは基本要件としない。
+The AI decides and plans. Reach provides connectivity, access control, operations, execution state, results, and audit information. Embedding an LLM in Reach is not a base requirement.
 
-**初期の本格利用サービスは DaVinci とする。** DaVinci が開発工程や Agent を指揮し、Reach がその Linux 実行基盤を担う。Reach は DaVinci の内部コンポーネントではなく、他の AI も単体利用できる独立サービスである。
+**The first full-scale client service is DaVinci.** DaVinci directs the development process and agents, and Reach serves as its Linux execution runtime. Reach is not an internal component of DaVinci; it is an independent service that other AIs can use on their own.
 
-## 2. 人間に提供する価値
+## 2. Value for people
 
-| 利用場面 | ユーザーが得られること |
+| Situation | What the user gets |
 | --- | --- |
-| 外出先からの依頼 | スマートフォンの AI に依頼し、自分の Linux 開発環境で調査・ビルド・テストを行える |
-| 既存環境の活用 | リポジトリ、ファイル、ツール、プライベート環境を移設せず AI に使わせられる |
-| AI の交換 | AI を ChatGPT から別の MCP クライアントへ変えても実行環境を再利用できる |
-| 長時間作業 | 接続が切れても実行済みの Job を失わず、後から状態・ログ・結果を照会できる |
-| 自律開発 | DaVinci が複数の Agent・ビルド・検証を Reach の実行環境上で安全に進め、開発工程は DaVinci のまま管理できる |
-| 安全な委譲 | AI ごとに操作対象・作業領域・権限を設定し、操作内容を追跡できる |
+| Requests while away | Ask an AI on a smartphone and have it investigate, build, and test in their own Linux development environment |
+| Using the existing environment | Let AI use repositories, files, tools, and private environments without relocating them |
+| Switching AIs | Reuse the execution environment when moving from ChatGPT to another MCP client |
+| Long-running work | Keep already-running jobs when the connection drops, and query their state, logs, and results later |
+| Autonomous development | DaVinci safely runs multiple agents, builds, and verifications on Reach's execution environment, while the development process stays managed by DaVinci |
+| Safe delegation | Configure targets, workspaces, and permissions per AI, and trace what was done |
 
-目標は、ユーザーが自分の環境をリモート操作する手間と、AI に作業させるための環境移設・再設定の手間を減らすことである。
+The goal is to reduce the effort of remotely operating one's own environment and the effort of relocating or reconfiguring environments so that AI can work in them.
 
-## 3. 利用体験
+## 3. User experience
 
-### ケース A：ファイルとコマンド
+### Case A: Files and commands
 
-1. ユーザーが Linux 上で Reach を設定し、Workspace と許可する操作を選択する。
-2. AI が Reach の MCP Tool から対象 Node・Workspace・利用可能な Capability を確認する。
-3. AI は許可されたファイルを読み、必要なコマンドを実行する。
-4. Reach は操作結果を返し、実行元・対象・結果を記録する。
-5. 必要に応じて AI が次の判断・操作を行う。
+1. The user sets up Reach on Linux and selects workspaces and the operations to allow.
+2. The AI uses Reach's MCP tools to check the target node, workspaces, and available capabilities.
+3. The AI reads permitted files and runs the commands it needs.
+4. Reach returns operation results and records the caller, target, and result.
+5. The AI makes its next decision or operation as needed.
 
-### ケース B：非同期 Job
+### Case B: Asynchronous jobs
 
-1. AI がビルドやテストを Job として開始する。
-2. Reach が要求の一意性を確認し、受理した Job をローカルに記録する。
-3. AI が終了・切断しても、Linux 側で受理済み Job の処理を継続する。
-4. AI は再接続後に Job ID から状態、ログ、結果を取得する。
-5. 停止要求の受付と、実際に停止できたことを区別して表示する。
+1. The AI starts a build or test as a job.
+2. Reach checks the request's uniqueness and records the accepted job locally.
+3. Even if the AI ends or disconnects, the accepted job keeps running on Linux.
+4. After reconnecting, the AI gets the state, logs, and results by job ID.
+5. Acceptance of a stop request is shown separately from the fact that the job actually stopped.
 
-### ケース C：Node オフライン
+### Case C: Node offline
 
-対象 Node がオフラインの場合は利用不可を明示する。MVP では自動的に要求を保留・蓄積し、後から勝手に実行することはしない。
+If the target node is offline, Reach reports it as unavailable. In the MVP, requests are not automatically held or accumulated and later executed on their own.
 
-### ケース D：DaVinci の実行基盤
+### Case D: DaVinci's execution runtime
 
-1. DaVinci は Issue の目的から作業を判断し、Workspace の用途と実行する Codex / Claude Code / DSH 等を選ぶ。
-2. DaVinci が Reach のローカル API に実行を依頼し、Reach が隔離された Linux プロセスと対話型入出力を用意する。
-3. DaVinci の Agent Adapter は元の Agent プロトコルと会話・turn の意味を解釈する。Reach はバイト列、プロセスの生存、出力、Job 状態を扱う。
-4. DaVinci は Reach の Process Session / Job ID を自分の Run に結びつけ、進捗を監督し、検証結果を受け取る。
-5. DaVinci が再起動した場合も Reach の現状を再取得し、終了不明や入力配送不明を確認してから続行する。元の Issue の完了・PR 提出は DaVinci が判断する。
+1. DaVinci decides the work from the issue's goal and chooses the workspace purpose and which Codex / Claude Code / DSH etc. to run.
+2. DaVinci asks Reach's local API to execute, and Reach provides an isolated Linux process and interactive I/O.
+3. DaVinci's agent adapter interprets the original agent protocol and the meaning of conversations and turns. Reach handles byte streams, process liveness, output, and job state.
+4. DaVinci binds Reach's process session / job IDs to its own run, supervises progress, and receives verification results.
+5. When DaVinci restarts, it re-fetches Reach's current state and checks for unknown exits and unknown input delivery before continuing. DaVinci decides completion of the original issue and PR submission.
 
-## 4. 提供する能力
+## 4. Capabilities
 
-| Capability | MVP | 説明 |
+| Capability | MVP | Description |
 | --- | --- | --- |
-| Node discovery | Yes | 利用可能な Node と接続状態 |
-| Workspace management | Yes | 許可された操作領域の定義・参照 |
-| File access | Yes | 一覧、読み取り、条件付き書き込み |
-| Command execution | Yes | 許可された Linux コマンドの隔離実行 |
-| Asynchronous jobs | Yes | 開始、状態・出力取得、停止 |
-| Interactive process sessions | Yes | 継続的な stdin、stdout/stderr、プロセス状態、再接続・入力所有権管理 |
-| Authentication and permissions | Yes | AI クライアント、Node、Workspace、操作単位の許可 |
-| Audit | Yes | 操作主体、対象、時刻、結果の記録 |
-| Browser / Desktop GUI | Later | ブラウザ・画面の操作 |
-| Multi-node | Later | 複数の Linux / 他 OS への拡張 |
-| Agent-specific orchestration | Later | Agent ごとの計画や会話管理。インストール済み CLI の汎用プロセス起動は MVP で対応 |
-| P2P / WebRTC | Later | 対応クライアント向けの直接通信経路 |
-| MCP Events | Later | Job 完了・Node 状態などの非同期通知 |
+| Node discovery | Yes | Available nodes and their connection state |
+| Workspace management | Yes | Definition and lookup of permitted operation areas |
+| File access | Yes | List, read, conditional write |
+| Command execution | Yes | Isolated execution of permitted Linux commands |
+| Asynchronous jobs | Yes | Start, get state/output, stop |
+| Interactive process sessions | Yes | Continuous stdin, stdout/stderr, process state, reconnection and input ownership |
+| Authentication and permissions | Yes | Permission per AI client, node, workspace, and operation |
+| Audit | Yes | Records of actor, target, time, and result |
+| Browser / Desktop GUI | Later | Browser and screen operation |
+| Multi-node | Later | Extension to multiple Linux machines and other OSes |
+| Agent-specific orchestration | Later | Per-agent planning and conversation management. Generic process launch of installed CLIs is supported in the MVP |
+| P2P / WebRTC | Later | Direct communication paths for clients that support them |
+| MCP Events | Later | Asynchronous notifications such as job completion and node state |
 
-## 5. コア概念
+## 5. Core concepts
 
-- **Node**：操作対象のコンピューター。初期は 1 Linux Node。
-- **Workspace**：ユーザーが AI に開放するファイル・操作の範囲。
-- **Capability**：File、Command、Job など Reach が提供する能力。
-- **Client / Connection**：認証済みの AI クライアントと接続。
-- **Operation**：個別の操作要求。一意の識別子を持ち、再送・重複を判別する。
-- **Job**：通信セッションから独立した非同期実行とその状態。
-- **Process Session**：実プロセスに紐づく継続的な stdin/stdout/stderr の操作と再接続の識別子。MCP セッションや LLM の会話セッションとは異なる。
-- **Artifact**：出力ログや生成物への参照。
-- **Permission**：主体・対象・操作に対する許可の定義。
+- **Node**: the computer being operated. Initially one Linux node.
+- **Workspace**: the scope of files and operations the user opens to AI.
+- **Capability**: an ability Reach provides, such as File, Command, or Job.
+- **Client / Connection**: an authenticated AI client and its connection.
+- **Operation**: an individual operation request. It has a unique identifier used to detect resends and duplicates.
+- **Job**: an asynchronous execution and its state, independent of the communication session.
+- **Process Session**: the identifier for continuous stdin/stdout/stderr operation and reconnection, bound to a real process. Distinct from MCP sessions and LLM conversation sessions.
+- **Artifact**: a reference to output logs or generated files.
+- **Permission**: a definition of what is allowed for an actor, target, and operation.
 
-## 6. サービス境界と独立性
+## 6. Service boundaries and independence
 
-Reach は独立サービスであり、Weave、Lore、Trace、特定の LLM の稼働を必要としない。
+Reach is an independent service and does not require Weave, Lore, Trace, or any particular LLM to be running.
 
-| サービス | 責務 |
+| Service | Responsibility |
 | --- | --- |
-| Lore | 知識・長期記憶 |
-| Weave | Action・Collaboration・人間と AI の共有状態・承認 |
-| Trace | 活動・会話などの記録 |
-| Reach | 実行環境へのアクセスと操作・Job 管理 |
+| Lore | Knowledge and long-term memory |
+| Weave | Actions, collaboration, shared human/AI state, approvals |
+| Trace | Records of activity, conversations, etc. |
+| Reach | Access to and operation of execution environments, job management |
 
-Weave で承認された Action に基づいて Reach を利用する場合は、AI / Orchestrator / Adapter が両サービスを組み合わせる。Reach は Weave の Action ID や承認状態を内部の必須モデルとしない。
+When Reach is used based on an action approved in Weave, the AI / orchestrator / adapter combines the two services. Reach does not make Weave action IDs or approval states a required part of its internal model.
 
-Reach の Job が完了したことは、Weave の Action が完了したことと同義ではない。両者の判断・反映は利用元が担当する。
+A Reach job completing does not mean a Weave action has completed. The calling side owns that judgment and its reflection.
 
-### DaVinci との責務分担
+### Division of responsibilities with DaVinci
 
-| 項目 | Reach | DaVinci |
+| Item | Reach | DaVinci |
 | --- | --- | --- |
-| Linux の Process / Job | 起動、隔離、状態、停止・再接続・ログ | 指示、結果の解釈 |
-| 対話型プロセス | 入出力・実行ライフサイクル・所有権 | Agent 固有の protocol、session・turn |
-| Workspace | 許可領域と実行時 mount / パスの制限 | 作業対象、clone・branch・成果の意味と管理 |
-| 認可 | Node / Workspace / Capability / Operation の最終強制 | 開発要求・実行目的・担当者の管理 |
-| 開発 Run | Job / Process Session の実行事実のみ | Run / Attempt、Issue、Sub Issue、PR、検証・受入れ |
-| Cloud 接続 | 汎用 MCP / Node transport | DaVinci 固有の Dashboard、Issue 投影・報告 |
+| Linux processes / jobs | Launch, isolation, state, stop / reconnect / logs | Instructions, interpretation of results |
+| Interactive processes | I/O, execution lifecycle, ownership | Agent-specific protocol, sessions and turns |
+| Workspace | Permitted areas and runtime mount / path restrictions | Work targets; meaning and management of clones, branches, and results |
+| Authorization | Final enforcement for node / workspace / capability / operation | Managing development requests, execution purposes, and assignees |
+| Development runs | Only the execution facts of jobs / process sessions | Runs / attempts, issues, sub-issues, PRs, verification and acceptance |
+| Cloud connection | Generic MCP / node transport | DaVinci-specific dashboard, issue projection, reporting |
 
-DaVinci の Run と Reach の Job は別の実体であり、1 Run から複数の Reach Job / Process Session を利用できる。DaVinci は Linux の実行を Reach に委譲する利用サービスとなるが、Reach 自体は DaVinci を知らずに動作する。既存 DaVinci の動作環境は検証・移行の完了まで保持する。
+A DaVinci run and a Reach job are separate entities; one run can use multiple Reach jobs / process sessions. DaVinci becomes a client service that delegates Linux execution to Reach, but Reach itself works without knowing about DaVinci. The existing DaVinci runtime environment is kept until verification and migration are complete.
 
-[DaVinci 統合方針](docs/davinci-execution-integration.md)
+[DaVinci integration](docs/davinci-execution-integration.md)
 
-## 7. リモート提供方式（採用決定：B 案）
+## 7. Remote delivery (adopted: Option B)
 
-- **Cloudflare Workers**：Remote MCP の安定した入口、認証・要求検証・ルーティング。
-- **Cloudflare Durable Objects**：Node 単位の接続 Broker。Linux Connector との WebSocket を仲介する。
-- **Linux Connector / Runtime**：Go 製の単一常駐サービス。外向き WSS で接続し、操作と Job を管理する。
-- **Linux SQLite**：Operation、Job、権限、監査、結果参照を永続化する。
+- **Cloudflare Workers**: stable entry point for remote MCP; authentication, request validation, routing.
+- **Cloudflare Durable Objects**: per-node connection broker that relays the WebSocket with the Linux connector.
+- **Linux Connector / Runtime**: a single resident Go service. It connects over outbound WSS and manages operations and jobs.
+- **Linux SQLite**: persists operations, jobs, permissions, audit, and result references.
 
-クラウド側に常時起動の VM / コンテナを用意しない。Durable Objects は WebSocket Hibernation を利用可能な設計とする。リモートからの接続性を維持するため、Linux の Connector は常駐する。
+No always-on VM or container is provisioned in the cloud. Durable Objects are designed so that WebSocket Hibernation can be used. To stay reachable remotely, the Linux connector stays resident.
 
-P2P 接続を作成する MCP Tool は初期仕様に含めない。AI が任意の P2P 接続を直接利用できることを前提とせず、通常の MCP Tools を Gateway から中継する。直接通信は後続の Transport Adapter 候補とする。
+The initial specification does not include an MCP tool that creates P2P connections. It does not assume that AIs can use arbitrary P2P connections directly; regular MCP tools are relayed through the gateway. Direct communication is a candidate for a later transport adapter.
 
-## 8. 安全性と利用者の制御
+## 8. Safety and user control
 
-- Node、Workspace、Capability、操作ごとに許可を評価する。
-- コマンドは隔離された環境で実行し、ホスト権限・秘密情報・ネットワークへのアクセスを最小化する。
-- 認証や操作許可は Reach の実行側で検証する。AI の入力や外部文書は権限の根拠にならない。
-- 重要な操作はユーザーによる追加承認を求められるようにする。
-- 接続が切れてもコマンドを無制限に再試行しない。
-- 操作履歴と結果の確認手段を用意する。
+- Evaluate permissions per node, workspace, capability, and operation.
+- Run commands in an isolated environment and minimize access to host privileges, secrets, and the network.
+- Authentication and operation permissions are verified on Reach's execution side. AI input and external documents are never grounds for permission.
+- Allow requiring additional user approval for important operations.
+- Do not retry commands without limit when the connection drops.
+- Provide ways to review operation history and results.
 
-## 9. MVP の対象と完成条件
+## 9. MVP scope and completion criteria
 
-対象は **systemd を利用できる Linux、1 ユーザー、1 Node**。Linux ディストリビューション・カーネル下限は検証して確定する。
+Target: **Linux with systemd, one user, one node.** The minimum Linux distributions and kernel versions are decided by verification.
 
-MVP では、クラウドから接続した MCP クライアントが許可された Linux Workspace でファイル操作とコマンド実行を行える。長時間処理は Job 化され、MCP 接続切断後も Linux 側で管理される。Operation ID による二重実行防止、権限外アクセスの拒否、オフライン状態の明示、履歴と結果の再取得ができることを完成条件とする。
+In the MVP, an MCP client connecting from the cloud can perform file operations and run commands in permitted Linux workspaces. Long-running work becomes jobs and is still managed on Linux after the MCP connection drops. Completion criteria: duplicate execution is prevented by operation ID, access outside permissions is denied, offline state is reported explicitly, and history and results can be retrieved again.
 
-**追加の MVP 受入条件：対話型プロセスセッションと DaVinci 実利用。** ローカル接続の DaVinci が Reach 経由で Codex 等の Agent プロセスを起動し、継続的に入力・出力を処理し、停止・再接続・ログを扱えること。既存 DaVinci の Run / 検証 / PR 契約を維持した E2E 検証を行うこと。DaVinci 本番環境の移管完了そのものは、別の段階的な切替検収とする。
+**Additional MVP acceptance criteria: interactive process sessions and real use by DaVinci.** DaVinci, connected locally, can launch agent processes such as Codex through Reach, handle input and output continuously, and handle stop, reconnection, and logs. An E2E verification is performed that keeps DaVinci's existing run / verification / PR contracts. Completing the migration of DaVinci's production environment itself is a separate, staged cutover acceptance.
 
-## 10. 非目標と評価
+## 10. Non-goals and evaluation
 
-初期リリースでは、汎用 AI Agent のオーケストレーション、LLM のホスティング、Weave のワークフロー処理、WebRTC P2P、デスクトップ GUI、オフライン Job の自動実行予約は扱わない。Codex 等の実行プロセスを管理することと、Agent の会話・判断プロトコルを Reach が所有することは区別する。
+The initial release does not cover general-purpose AI agent orchestration, LLM hosting, Weave workflow processing, WebRTC P2P, desktop GUI, or automatic scheduling of offline jobs. Managing execution processes such as Codex is kept distinct from Reach owning an agent's conversation or decision protocol.
 
-評価指標は、実行成功率、結果不明率、切断後の Job 照合成功率、重複実行の防止、権限拒否の正確性、ユーザーの手動操作負担、異なる AI クライアント間の互換性とする。
+Metrics: execution success rate, unknown-result rate, job reconciliation success rate after disconnects, prevention of duplicate execution, accuracy of permission denials, manual effort required from the user, and compatibility across different AI clients.
 
-関連資料：[README](README.md) / [Technical Architecture](ARCHITECTURE.md) / [DaVinci Integration](docs/davinci-execution-integration.md)
+Related: [README](README.md) / [Technical Architecture](ARCHITECTURE.md) / [DaVinci Integration](docs/davinci-execution-integration.md)

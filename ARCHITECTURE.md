@@ -1,30 +1,30 @@
 # Syntoria Reach — Technical Architecture
 
-- Status: **技術概要設計 / 実装前**
+- Status: **Technical overview / pre-implementation**
 - Updated: 2026-11-01
 - Initial runtime: **Linux / Go**
-- Adopted remote access: **Cloudflare Workers + Durable Objects + outbound Linux WebSocket (B 案)**
+- Adopted remote access: **Cloudflare Workers + Durable Objects + outbound Linux WebSocket (Option B)**
 
-## 1. ゴール・構造原則
+## 1. Goals and structural principles
 
-Reach は、リモート AI や他のローカルサービスが Linux の能力を標準 MCP またはローカル API で利用する独立した実行サービスである。クラウドに常時起動 VM / コンテナを置かず、Linux 側で Operation / Job / 対話型 Process Session の実行と状態を所有する。
+Reach is an independent execution service through which remote AIs and other local services use Linux capabilities via standard MCP or a local API. It places no always-on VM or container in the cloud; the Linux side owns the execution and state of operations, jobs, and interactive process sessions.
 
-**DaVinci を初期の実利用サービスとする。** DaVinci の開発判断・Agent protocol・GitHub workflow は DaVinci に残し、Linux の process / sandbox / streaming I/O / job execution を Reach に集約する。Reach は DaVinci がなくても動作する。
+**DaVinci is the first real client service.** DaVinci's development decisions, agent protocols, and GitHub workflow stay in DaVinci; Linux process / sandbox / streaming I/O / job execution are consolidated in Reach. Reach works without DaVinci.
 
-**アーキテクチャ上の不変条件**
+**Architectural invariants**
 
-1. Reach は Weave、Lore、Trace、DaVinci、ローカル LLM に依存せず起動・動作できる。
-2. MCP は操作契約であり、通信経路と Linux 実行の実装から分離する。
-3. クラウドは接続・認証・転送を担い、Job の正本は Linux に置く。
-4. 承認済み接続であっても、各操作を Reach Runtime が認可する。
-5. リクエストの再送は副作用の二重実行を引き起こさない。
-6. 通信断・タイムアウトを実行失敗と断定しない。
-7. Node オフライン時の要求は MVP では実行待ちキューに保存しない。
-8. 接続先 Linux にインストールするのは軽量 Connector / Runtime であり、LLM を必須としない。
-9. プロセスの生存・I/O・Sandbox・Job は Reach の責務とし、DaVinci Run / Agent turn / GitHub Issue の意味判断を取り込まない。
-10. 対話型プロセスに接続したクライアントが切断しても、既に受理された実行のライフサイクルを暗黙に変更しない。
+1. Reach starts and works without depending on Weave, Lore, Trace, DaVinci, or a local LLM.
+2. MCP is an operation contract, separated from the communication path and from the Linux execution implementation.
+3. The cloud handles connectivity, authentication, and forwarding; the source of truth for jobs is on Linux.
+4. Even on an approved connection, the Reach runtime authorizes every operation.
+5. Resending a request never causes a side effect to execute twice.
+6. A communication failure or timeout is never treated as proof that execution failed.
+7. In the MVP, requests made while a node is offline are not stored in a pending-execution queue.
+8. What is installed on the target Linux machine is a lightweight connector / runtime; an LLM is not required.
+9. Process liveness, I/O, sandbox, and jobs are Reach's responsibility; Reach does not take on the meaning of DaVinci runs, agent turns, or GitHub issues.
+10. When a client attached to an interactive process disconnects, the lifecycle of the already accepted execution does not change implicitly.
 
-## 2. 全体構成
+## 2. Overall structure
 
 ~~~mermaid
 flowchart TB
@@ -55,54 +55,54 @@ flowchart TB
     DaVinci <-->|"Local execution API"| LOCAL
 ~~~
 
-Linux 側は Go の単一 Daemon を標準配置とする。クラウドは常駐コンテナを持たないが、リモートからの無人アクセスには Linux Connector 自体の常駐が必要である。
+The standard deployment on Linux is a single Go daemon. The cloud has no resident containers, but unattended remote access requires the Linux connector itself to stay resident.
 
-## 3. コンポーネント・責務
+## 3. Components and responsibilities
 
-| コンポーネント | 責務 | 保有しないもの |
+| Component | Responsibility | Does not hold |
 | --- | --- | --- |
-| Workers MCP Gateway | MCP リクエスト、クライアント認証・認可、Node 解決、入力検証、Broker 呼び出し | Linux Job の正本 |
-| Durable Object / Node Broker | Node に対する WSS 接続の受付・対応付け、メッセージ配送、短時間の応答相関 | ユーザーのファイル、永続 Job 結果 |
-| Reach Connector (Go) | クラウドへのアウトバウンド WSS、認証済み要求受信、再接続、Transport 分離 | LLM の推論 |
-| Local API (Unix socket) | DaVinci 等のローカルサービスへ Core と共通の実行操作を提供 | Issue/PR の意味判断 |
-| Process Session Manager | 長寿命プロセスの stdin / stdout / stderr、I/O 順序、単一 writer、再接続・停止照合 | Agent 固有の会話 protocol |
-| Operation Service | 引数・権限の再検証、冪等性判定、同期・非同期処理の受付 | Syntoria 他サービスの業務状態 |
-| Capability Registry | File / Command / Job の公開契約、必要な許可、OS Adapter の選択 | 外部 AI の意思決定 |
-| Linux Runtime | Workspace のファイル操作、プロセス起動・停止・隔離 | MCP プロトコル詳細 |
-| Job Manager | ジョブの状態、ログ・成果物、停止、再起動後の照合 | MCP 接続の生存状態への依存 |
-| SQLite | Operation、Job、Policy、Audit のローカル正本 | 他 Syntoria サービスのデータ |
+| Workers MCP Gateway | MCP requests, client authentication/authorization, node resolution, input validation, broker calls | Source of truth for Linux jobs |
+| Durable Object / Node Broker | Accepting and mapping the WSS connection for a node, message delivery, short-lived response correlation | User files, persistent job results |
+| Reach Connector (Go) | Outbound WSS to the cloud, receiving authenticated requests, reconnection, transport separation | LLM inference |
+| Local API (Unix socket) | Provides local services such as DaVinci with the same execution operations as the core | Meaning of issues/PRs |
+| Process Session Manager | stdin / stdout / stderr of long-lived processes, I/O ordering, single writer, reconnection and stop reconciliation | Agent-specific conversation protocols |
+| Operation Service | Re-validating arguments and permissions, idempotency decisions, accepting synchronous and asynchronous work | Business state of other Syntoria services |
+| Capability Registry | Public contracts of File / Command / Job, required permissions, choice of OS adapter | External AI decisions |
+| Linux Runtime | File operations in workspaces, process start/stop/isolation | MCP protocol details |
+| Job Manager | Job state, logs and artifacts, stop, reconciliation after restart | Dependence on MCP connection liveness |
+| SQLite | Local source of truth for operations, jobs, policy, and audit | Data of other Syntoria services |
 
-設計上、MCP Gateway と Transport Broker は別コンポーネントだが、同一 Cloudflare アカウントの Worker / Durable Object binding で一体運用できる。
+By design, the MCP Gateway and the Transport Broker are separate components, but they can be operated together as Worker / Durable Object bindings in the same Cloudflare account.
 
-### Durable Objects / Hibernation の注意点
+### Notes on Durable Objects / Hibernation
 
-Durable Object は Node を識別できる安定した ID に対応付ける。Hibernation 中の WebSocket は Cloudflare 側で維持できるが、オブジェクトのメモリは失われる。復帰時は WebSocket attachment 等から接続識別子を再構成する。**メモリ内の map や待機中 Promise を永続状態として扱わない。**
+A Durable Object maps to a stable ID that identifies the node. A WebSocket can be kept by Cloudflare during hibernation, but the object's memory is lost. On wake-up, connection identifiers are reconstructed from WebSocket attachments and the like. **In-memory maps and pending Promises are never treated as persistent state.**
 
-WebSocket の切断や Cloudflare 側の再起動は通常の障害ケースとし、Linux 側が再接続・再登録する。接続先 Node が不在なら Gateway は明示的にオフライン応答を返す。
+WebSocket disconnects and Cloudflare-side restarts are normal failure cases; the Linux side reconnects and re-registers. If the target node is absent, the gateway returns an explicit offline response.
 
-## 4. ローカル・リモート通信
+## 4. Local and remote communication
 
-### 4.0 DaVinci のローカル接続
+### 4.0 Local connection for DaVinci
 
-同じ Linux Node 上の DaVinci Controller は Reach のローカル API を Unix Domain Socket 経由で呼ぶ。要求の DTO と Operation / Job / Process Session の契約はリモート MCP Adapter と共通とし、Cloudflare を経由しない。
+A DaVinci Controller on the same Linux node calls Reach's local API over a Unix domain socket. The request DTOs and the operation / job / process session contracts are shared with the remote MCP adapter, and the call does not go through Cloudflare.
 
-ローカル接続も接続元 identity と許可を検証する。Unix Socket の OS 権限だけをグローバルな操作許可の代用にせず、DaVinci 用の権限プロファイルで Workspace、プロセス、Sandbox、必要な credential 経路を限定する。
+Local connections also verify the caller's identity and permissions. Unix socket OS permissions are not used as a substitute for global operation permissions; a permission profile for DaVinci limits the workspaces, processes, sandbox, and required credential paths.
 
-DaVinci の Agent Adapter は Codex app-server、Claude stream-json、DSH/ACP の protocol を解釈する。Reach は継続的なプロセス I/O とライフサイクルを提供し、LLM の turn 成功や開発成果の妥当性を推定しない。
+DaVinci's agent adapters interpret the Codex app-server, Claude stream-json, and DSH/ACP protocols. Reach provides continuous process I/O and lifecycle, and does not infer the success of an LLM turn or the validity of development results.
 
-## 4.1 リモート通信・認証
+## 4.1 Remote communication and authentication
 
-### 4.2 Node 登録と常時接続
+### 4.2 Node registration and persistent connection
 
-1. Linux 利用者が Node を登録し、明示的に Connection Credential を発行する。
-2. Daemon が外向き WSS で Cloudflare に接続する（受信ポートの一般公開は不要）。
-3. Gateway / Broker が Credential と Node ID、接続の有効性を検証する。
-4. Broker が接続を管理し、接続切断時はオンライン状態を無効にする。
-5. Daemon は指数バックオフで再接続し、接続回復後に必要な状態を再登録する。
+1. The Linux user registers the node and explicitly issues a connection credential.
+2. The daemon connects to Cloudflare over outbound WSS (no publicly exposed inbound port is needed).
+3. The gateway / broker verifies the credential, the node ID, and the connection's validity.
+4. The broker manages the connection and marks the node offline when the connection drops.
+5. The daemon reconnects with exponential backoff and re-registers the necessary state once the connection is restored.
 
-Credential は保存先の権限を制限し、期限・失効・ローテーションを設計する。Node への WSS 接続だけで任意クライアントのコマンド実行を認めない。
+The credential's storage location has restricted permissions, and expiry, revocation, and rotation are designed in. A WSS connection to the node alone never authorizes arbitrary clients to run commands.
 
-### 4.3 AI からの要求
+### 4.3 Requests from AI
 
 ~~~mermaid
 sequenceDiagram
@@ -123,193 +123,193 @@ sequenceDiagram
     Note over L,DB: Long-running work continues independently
 ~~~
 
-Gateway は安定した Remote MCP URL を公開する。外部クライアントが WebSocket や WebRTC を直接扱うことを要求しない。MCP のプロトコルライフサイクルと、Reach の明示的な Job / Operation ID は別物とする。
+The gateway exposes a stable remote MCP URL. External clients are not required to handle WebSocket or WebRTC directly. The MCP protocol lifecycle and Reach's explicit job / operation IDs are separate things.
 
-### 4.4 通信の境界
+### 4.4 Communication boundaries
 
-- MCP は HTTP 経由で利用する。Linux Connector の WSS は内部の要求・応答転送路である。
-- 接続の生存確認は Job の成功・失敗や処理済み状態の証拠にならない。
-- クラウド側の待ち時間は短く制限し、長時間の処理は Linux Job として返す。
-- リモート障害時に Gateway が副作用操作を別 ID で再送しない。
-- 中継の Message ID / Correlation ID と Operation ID を区別する。
-- P2P / WebRTC、専用 Tunnel、VPN は将来の Transport Adapter。MVP は Cloudflare 経由のみで成立する。
+- MCP is used over HTTP. The Linux connector's WSS is an internal request/response forwarding path.
+- Connection liveness checks are not evidence of a job's success, failure, or completion.
+- Waiting on the cloud side is kept short; long-running work is returned as a Linux job.
+- On remote failures, the gateway does not resend side-effecting operations under a different ID.
+- Relay message IDs / correlation IDs are distinct from operation IDs.
+- P2P / WebRTC, dedicated tunnels, and VPNs are future transport adapters. The MVP works through Cloudflare alone.
 
-## 5. MCP 公開契約（初期案）
+## 5. Public MCP contract (initial draft)
 
-初期の MCP Tools は次を候補とする。正式名称と JSON Schema は実装設計で確定する。
+The initial MCP tools are the following candidates. Formal names and JSON Schemas are decided in the implementation design.
 
-| Tool | 目的 | 主な入力 / 結果 |
+| Tool | Purpose | Main inputs / results |
 | --- | --- | --- |
-| list_nodes | 認可された Node の照会 | node_id, online / offline |
-| list_capabilities | Node の能力の照会 | node_id, capabilities |
-| list_workspaces | 許可された Workspace | workspace_id, permission |
-| list_files | 許可領域のファイル一覧 | workspace_id, relative_path |
-| read_file | ファイル読み取り | workspace_id, relative_path, bounded data |
-| write_file | ファイル条件付き書き込み | operation_id, workspace_id, path, expected_version |
-| start_job | 非同期コマンド開始 | operation_id, workspace_id, executable, argv, limits |
-| start_process_session | 対話型プロセスを Job として開始 | operation_id, workspace_id, executable, argv, sandbox_profile |
-| get_process_session | セッション識別子からプロセス・I/O の状態を照会 | process_session_id, lifecycle, output cursors |
-| send_process_input | stdin へ継続的に入力を送る | process_session_id, input_id, expected_sequence, bytes |
-| read_process_output | stdout / stderr の再取得・増分取得 | process_session_id, stream, cursor, limit |
-| stop_process_session | プロセスの停止を要求し終了確認する | operation_id, process_session_id |
-| get_operation | 不明な受付結果の照合 | operation_id, admission / final state |
-| get_job | Job の現在状態 | job_id, status, timestamps |
-| read_job_output | 出力のページ取得 | job_id, stream, cursor, limit |
-| cancel_job | Job の停止要求 | operation_id, job_id |
+| list_nodes | Query authorized nodes | node_id, online / offline |
+| list_capabilities | Query a node's capabilities | node_id, capabilities |
+| list_workspaces | Permitted workspaces | workspace_id, permission |
+| list_files | File listing within a permitted area | workspace_id, relative_path |
+| read_file | Read a file | workspace_id, relative_path, bounded data |
+| write_file | Conditional file write | operation_id, workspace_id, path, expected_version |
+| start_job | Start an asynchronous command | operation_id, workspace_id, executable, argv, limits |
+| start_process_session | Start an interactive process as a job | operation_id, workspace_id, executable, argv, sandbox_profile |
+| get_process_session | Query process and I/O state by session ID | process_session_id, lifecycle, output cursors |
+| send_process_input | Send continuous input to stdin | process_session_id, input_id, expected_sequence, bytes |
+| read_process_output | Re-fetch / incrementally fetch stdout / stderr | process_session_id, stream, cursor, limit |
+| stop_process_session | Request a process stop and confirm termination | operation_id, process_session_id |
+| get_operation | Reconcile an unknown acceptance result | operation_id, admission / final state |
+| get_job | Current state of a job | job_id, status, timestamps |
+| read_job_output | Paged output retrieval | job_id, stream, cursor, limit |
+| cancel_job | Request a job stop | operation_id, job_id |
 
-長時間 Job と Process Session の識別子は Linux で生成する。結果を後から参照できるよう、開始・実行状態・出力取得を分離する。MCP Tasks に対応する Host には将来 Adapter を提供可能とし、内部 Job 契約はそれに依存させない。
+IDs of long-running jobs and process sessions are generated on Linux. Start, execution state, and output retrieval are separated so results can be looked up later. A future adapter can serve hosts that support MCP Tasks, but the internal job contract does not depend on it.
 
-対話型プロセスツールは、同じ実行 API を使う DaVinci ローカル Client にも提供する。AI Host への細かな Tool の公開方法やストリーム対応は接続 Adapter の問題とし、プロセス・I/O の意味は Core が定義する。
+The interactive process tools are also provided to the DaVinci local client, which uses the same execution API. How fine-grained tools are exposed to AI hosts and how streaming is supported are concerns of the connection adapter; the core defines the meaning of processes and I/O.
 
-## 6. Operation / Job / 冪等性
+## 6. Operations / jobs / idempotency
 
-**Operation と Job を分ける。** Operation はリクエストの受付・副作用の一意性、Job は継続的な実行の状態である。
+**Operations and jobs are separate.** An operation is the acceptance of a request and the uniqueness of its side effect; a job is the state of an ongoing execution.
 
-副作用要求は Operation ID を必要とする。受信後、認証主体と正規化した引数のハッシュ、受付状態を SQLite にトランザクションで記録してから操作を実行する。
+Side-effecting requests require an operation ID. On receipt, the authenticated principal, a hash of the normalized arguments, and the acceptance state are recorded in SQLite in a transaction before the operation is executed.
 
-- 同じ主体・Operation ID・引数の再送は既存結果を参照する。
-- 同じ Operation ID で引数が異なる場合は conflict を返す。
-- 応答が失われた場合は get_operation / get_job で照合する。
-- 正体不明の既存操作を新しい ID で再実行しない。
-- gateway / DO のメモリ消失は Linux 内の正本を変更しない。
+- A resend with the same principal, operation ID, and arguments returns the existing result.
+- The same operation ID with different arguments returns a conflict.
+- If a response is lost, reconcile with get_operation / get_job.
+- An existing operation of unknown outcome is never re-executed under a new ID.
+- Loss of gateway / DO memory does not change the source of truth on Linux.
 
-### Job 状態（案）
+### Job states (draft)
 
 queued → running → succeeded / failed
 
 running → cancelling → cancelled / failed / unknown
 
-unknown は結果や OS 側状態を確証できない場合に使用する。状態遷移・理由・最終観測時刻を保存する。Stop の要求受付と、プロセス停止済みの事実を区別する。
+unknown is used when the result or the OS-side state cannot be confirmed. State transitions, reasons, and the last observation time are stored. Acceptance of a stop request is kept distinct from the fact that the process has stopped.
 
-Job の OS 実行単位は systemd transient unit / cgroups v2 などを検討し、Daemon 再起動時に既存プロセスと照合する。**Linux 自体の再起動で Job が継続する保証は設けない**。再起動後に結果が分からない場合は明示的な unknown とし、自動再実行はしない。
+For the OS execution unit of a job, systemd transient units / cgroups v2 and the like are considered, and existing processes are reconciled when the daemon restarts. **There is no guarantee that jobs continue across a reboot of Linux itself.** If the result is unknown after a reboot, it is explicitly unknown, and it is not re-executed automatically.
 
-### 対話型 Process Session（DaVinci の初期利用に必須）
+### Interactive process sessions (required for DaVinci's initial use)
 
-- 1 Process Session は Reach が所有する 1 実行プロセスと Job に対応する。DaVinci の Run / Agent session / turn とは別 ID とする。
-- 実行開始時は確定した executable / argv、Workspace、Sandbox profile、許可済み環境と必要最小限の credential 参照を指定する。
-- stdin は単一の書込み owner を持つ。入力ごとの `input_id` と順序条件により重複や順序違いを拒否する。別の writer が接続する際には所有権の明示的な移譲・fencing を要求する。
-- stdout と stderr は分けてローカルに記録する。単調な offset / cursor から上限付きで再取得可能とし、transport の切断により出力欠落・暗黙の再実行が起きないようにする。
-- WSS / MCP / DaVinci 側の接続断は detach として扱い、`stop_process_session` による明示的な停止要求とは分離する。
-- DaVinci Controller の再起動時は既存 Process Session を照会して再接続し、入力配送の確定結果を確認してから次の turn を送る。
-- Reach Daemon が異常終了しても実プロセスが生存することは、OS 管理下の独立 unit / supervisor を実装・検証して初めて保証する。生存が確認できない実行を自動再開しない。
-- MVP はパイプ経由のストリーミング I/O を基本候補とし、PTY、FD 受渡し、双方向 backpressure、Agent ごとの handshake は詳細設計・実プロバイダー試験で決める。Agent 固有プロトコルの解析は DaVinci が担う。
+- One process session corresponds to one execution process and job owned by Reach. Its ID is separate from DaVinci's run / agent session / turn.
+- At start, the resolved executable / argv, workspace, sandbox profile, permitted environment, and the minimum required credential references are specified.
+- stdin has a single write owner. A per-input `input_id` and an ordering condition reject duplicates and out-of-order input. When another writer connects, an explicit transfer of ownership / fencing is required.
+- stdout and stderr are recorded locally and separately. They can be re-fetched, with limits, from monotonic offsets / cursors, so transport disconnects cause neither lost output nor implicit re-execution.
+- Disconnects of WSS / MCP / DaVinci are treated as detach, separate from an explicit stop request via `stop_process_session`.
+- When the DaVinci Controller restarts, it queries and reattaches to existing process sessions, and confirms the definitive result of input delivery before sending the next turn.
+- That real processes survive an abnormal exit of the Reach daemon is guaranteed only once an independent OS-managed unit / supervisor is implemented and verified. Executions whose liveness cannot be confirmed are never resumed automatically.
+- The MVP's base candidate is streaming I/O over pipes; PTY, FD passing, bidirectional backpressure, and per-agent handshakes are decided in detailed design and real-provider testing. Parsing agent-specific protocols is DaVinci's job.
 
-## 7. Linux 実行・サンドボックス
+## 7. Linux execution and sandbox
 
-初期対象は systemd を利用できる Linux、単一ユーザー・単一 Node。
+Initial target: Linux with systemd, single user, single node.
 
-- Daemon：非 root の systemd user service。必要に応じて linger を明示設定。
-- 保存先：ローカル SQLite（WAL）、管理されたログ・成果物ディレクトリ。
-- ファイル：Workspace ID と相対パスを受け取り、openat2 などの安全なパス解決で境界を強制する。symlink や mount による逸脱も検査する。
-- 書き込み：条件付き更新、必要に応じた一時ファイル / atomic rename。
-- コマンド：executable と argv を構造化し、暗黙の shell 展開を行わない。
-- 隔離：Linux namespace、bubblewrap、systemd / cgroups v2 等の組み合わせを検証する。
-- デフォルト：追加 mount・秘密情報・ネットワーク・特権デバイスへのアクセスなし。DaVinci がモデル API や依存取得を必要とする場合だけ、明示的な Sandbox profile にネットワーク・限定 credential 経路を許可する。
-- リソース：CPU、メモリ、プロセス数、実行時間、ログサイズを制限する。
+- Daemon: a non-root systemd user service. Linger is set explicitly when needed.
+- Storage: local SQLite (WAL) and managed log / artifact directories.
+- Files: take a workspace ID and a relative path, and enforce the boundary with safe path resolution such as openat2. Escapes via symlinks or mounts are also checked.
+- Writes: conditional updates, with temporary files / atomic rename as needed.
+- Commands: executable and argv are structured; no implicit shell expansion.
+- Isolation: combinations of Linux namespaces, bubblewrap, systemd / cgroups v2, etc. are verified.
+- Defaults: no extra mounts, secrets, network, or privileged devices. Only when DaVinci needs model APIs or dependency fetching is network access and a limited credential path allowed, in an explicit sandbox profile.
+- Resources: limit CPU, memory, number of processes, execution time, and log size.
 
-**注意：** bubblewrap や user namespace が存在することだけでは十分な隔離を意味しない。対象ディストリビューション、設定、kernel 機能で有効性を検証する。必要な保護が使えない場合は fail closed とする。特権操作を無制限のコマンド実行で代替しない。
+**Note:** the mere presence of bubblewrap or user namespaces does not mean sufficient isolation. Effectiveness is verified on the target distribution, configuration, and kernel features. If the required protection is unavailable, fail closed. Privileged operations are never substituted with unrestricted command execution.
 
-## 8. 認証・認可・監査
+## 8. Authentication, authorization, audit
 
 ### Cloud MCP
 
-外部クライアントの OAuth/OIDC 認証と Reach のユーザー、クライアント、Node の結び付けを検証する。Syntoria Gate を Issuer として利用可能にするが、Reach Core の実行時必須依存にしない。トークンの issuer / audience / expiry / scopes 等を検証し、ユーザーや Node を未検証の要求パラメーターから決めない。
+Verify external clients' OAuth/OIDC authentication and the binding between Reach users, clients, and nodes. Syntoria Gate can be used as the issuer, but it is not a required runtime dependency of the Reach core. Token issuer / audience / expiry / scopes etc. are verified, and users and nodes are never determined from unverified request parameters.
 
-### Linux Runtime
+### Linux runtime
 
-DaVinci ローカル API とクラウドから来た要求の両方で、接続元の認証済み主体、Job / Session の所有者、許可された Workspace / Capability を検証する。認証情報や model token を Remote MCP の任意テキスト・ログに混入させず、必要ならホスト上の専用 FD / credential broker 等の限定経路で渡す。
+For both the DaVinci local API and requests from the cloud, verify the caller's authenticated principal, the owner of the job / session, and the permitted workspaces / capabilities. Credentials and model tokens are never mixed into arbitrary remote MCP text or logs; when needed, they are passed through limited paths such as dedicated FDs / a credential broker on the host.
 
-クラウドから来た要求も、接続元の検証済み identity とサーバーが検証できる認可コンテキストに束縛する。Node、Workspace、Capability、操作・引数に対して Linux 側でも最終認可する。外部文書や LLM 生成文字列は認証・許可にならない。
+Requests from the cloud are also bound to the caller's verified identity and an authorization context the server can verify. The Linux side also performs final authorization for node, workspace, capability, and the operation and its arguments. External documents and LLM-generated strings are never authentication or permission.
 
-### 監査
+### Audit
 
-Operation ID、認証された主体、Node、Workspace、操作種別、タイムスタンプ、結果、拒否理由を記録する。秘匿データ、API Key、ファイル内容、環境変数はログに無条件記録しない。ログの保持期間と最大サイズを設定できるようにする。
+Record the operation ID, authenticated principal, node, workspace, operation type, timestamp, result, and denial reason. Sensitive data, API keys, file contents, and environment variables are not logged unconditionally. Log retention period and maximum size are configurable.
 
-## 9. 保存データと責任境界
+## 9. Stored data and ownership boundaries
 
-| 保存先 | 内容 | 正本性 |
+| Store | Contents | Authority |
 | --- | --- | --- |
-| Linux SQLite | operations, jobs, process_sessions, input_receipts, permissions, audit_records, artifacts の索引 | **Operation / Job / Process Session の正本** |
-| Linux files | Job の stdout / stderr、成果物 | **実データの正本** |
-| Durable Object | WebSocket 接続識別子、必要最小限の Node 接続メタデータ | 通信制御用。Job の正本にしない |
-| Workers | 認証済み要求の一時処理と転送 | 永続 Job 状態は持たない |
+| Linux SQLite | Indexes of operations, jobs, process_sessions, input_receipts, permissions, audit_records, artifacts | **Source of truth for operations / jobs / process sessions** |
+| Linux files | Job stdout / stderr, artifacts | **Source of truth for the actual data** |
+| Durable Object | WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
+| Workers | Transient processing and forwarding of authenticated requests | Holds no persistent job state |
 
-データを Cloudflare 側にコピーする要件が生じた場合は、保存対象・秘匿性・保持期間・一貫性の契約を別途設計する。
+If a requirement arises to copy data to the Cloudflare side, a separate contract for what is stored, its sensitivity, retention period, and consistency is designed.
 
-## 10. 障害時の契約
+## 10. Failure contracts
 
-| 障害 | 期待する動作 |
+| Failure | Expected behavior |
 | --- | --- |
-| Linux Node オフライン | node_offline を返す。MVP は自動キューイングしない |
-| WebSocket 切断 | Connector がバックオフ再接続。受理済み Job は Linux 側で継続 |
-| Cloudflare 一時障害 | 新規操作は不可の場合あり。Linux の Job・結果は保持 |
-| DO Hibernation / 再生成 | 接続 metadata を再構成し、必要なら Connector の再登録を要求 |
-| HTTP 応答ロスト | outcome_unknown を返し、同一 Operation ID を照会・再送 |
-| Daemon クラッシュ | OS の Job / Process Session 状態と SQLite を再照合。確証がない場合 unknown。継続実行は独立プロセス管理の検証結果に依存 |
-| DaVinci 再起動 | DaVinci Run が保存した Reach Job / Process Session ID から再接続し、未確認入力・終了を先に照合 |
-| 対話型 stdin の配送不明 | input_id / sequence の receipt を照合する。新しい ID で同じ入力を無条件に再送しない |
-| 要求の重複 | SQLite の一意制約・引数比較で二重副作用を防止 |
-| 権限取り消し | 新規要求を拒否。実行中 Job の扱いは明示した停止ポリシーに従う |
+| Linux node offline | Return node_offline. The MVP does not queue automatically |
+| WebSocket disconnect | Connector reconnects with backoff. Accepted jobs continue on Linux |
+| Temporary Cloudflare outage | New operations may be unavailable. Linux jobs and results are kept |
+| DO hibernation / recreation | Reconstruct connection metadata and request connector re-registration if needed |
+| HTTP response lost | Return outcome_unknown; query or resend the same operation ID |
+| Daemon crash | Reconcile OS job / process session state with SQLite. Unknown when unconfirmed. Continued execution depends on verifying independent process management |
+| DaVinci restart | Reattach from the Reach job / process session IDs saved in the DaVinci run, and reconcile unconfirmed input and exits first |
+| Interactive stdin delivery unknown | Reconcile receipts by input_id / sequence. Never unconditionally resend the same input under a new ID |
+| Duplicate requests | Prevent double side effects with SQLite unique constraints and argument comparison |
+| Permission revoked | Reject new requests. Running jobs follow an explicit stop policy |
 
-標準エラー分類（案）：node_offline / unauthorized / permission_denied / invalid_request / operation_conflict / result_unknown / sandbox_unavailable / timeout。
+Standard error classes (draft): node_offline / unauthorized / permission_denied / invalid_request / operation_conflict / result_unknown / sandbox_unavailable / timeout.
 
-可用性の設計目標は「WebSocket が一切切れない」ではなく、**切れても受理済み操作の真実が失われず、再接続で正しく照合できること**である。
+The availability goal is not "the WebSocket never drops" but **"even when it drops, the truth about accepted operations is never lost, and reconnection reconciles it correctly."**
 
-## 11. MVP の構築順序
+## 11. MVP build order
 
-1. **Local Core**：Go Daemon、SQLite、Workspace、File / Command API、Operation ID / 監査。
-2. **Linux Execution**：Sandbox、非同期 Job、**対話型 Process Session と継続 I/O**、停止・所有権、再起動後の照合。
-3. **DaVinci local integration**：DaVinci 用 Local API / Adapter。既存の Agent protocol と開発 workflow を維持し、実行を Reach に委譲。ローカル E2E を検証。
-4. **Remote MCP**：Workers MCP Gateway、OAuth、Node 登録、DO WebSocket Broker、Connector WSS。
-5. **Acceptance / rollout**：実 Linux / ホスト済み Cloudflare / 複数 MCP Host の検証と、既存 DaVinci の段階的な切替・復旧試験。
+1. **Local Core**: Go daemon, SQLite, workspaces, File / Command API, operation IDs / audit.
+2. **Linux Execution**: sandbox, asynchronous jobs, **interactive process sessions and continuous I/O**, stop and ownership, reconciliation after restart.
+3. **DaVinci local integration**: local API / adapter for DaVinci. Keep the existing agent protocols and development workflow, and delegate execution to Reach. Verify a local E2E.
+4. **Remote MCP**: Workers MCP Gateway, OAuth, node registration, DO WebSocket broker, connector WSS.
+5. **Acceptance / rollout**: verification on real Linux / hosted Cloudflare / multiple MCP hosts, plus staged cutover and recovery tests for the existing DaVinci.
 
-### 必須の受け入れテスト
+### Required acceptance tests
 
-- Cloudflare を使わず Linux の Reach を単独利用できる。
-- 認証された MCP クライアントが許可された Workspace にアクセスできる。
-- Workspace 外パス、symlink 逸脱、未許可コマンド、秘密情報の取得を拒否する。
-- Job を開始した後に MCP / WSS を切断しても、Linux 上の処理と記録が維持される。
-- 同一 Operation ID の再送が二重実行にならない。
-- 通信タイムアウトで unknown を正しく扱い、実行結果を照合できる。
-- DO の Hibernation / 再生成や Connector 再接続後にジョブ照会できる。
-- Node オフライン中に受理していない処理が、復帰後に勝手に実行されない。
-- 本番 OAuth、Node credential の失効、permission 変更が反映される。
-- DaVinci が Reach 経由で Codex 等を起動し、同じプロセスへ複数回入力し、stdout/stderr を順序通り再取得できる。
-- DaVinci の Run / Agent turn / GitHub Issue / draft PR の意味・状態が Reach Job と混同されない。
-- DaVinci Controller 再起動・重複 stdin・Session stop・provider credential 分離を実プロセスで検証する。
-- Reach の Job ID / Process Session ID と DaVinci の Run ID の対応が DaVinci に保存され、復旧後も照合できる。
+- Reach on Linux can be used standalone without Cloudflare.
+- An authenticated MCP client can access permitted workspaces.
+- Paths outside the workspace, symlink escapes, unpermitted commands, and attempts to obtain secrets are rejected.
+- After a job is started, disconnecting MCP / WSS does not stop the processing or the records on Linux.
+- Resending the same operation ID does not cause double execution.
+- Communication timeouts are handled correctly as unknown, and execution results can be reconciled.
+- Jobs can be queried after DO hibernation / recreation or connector reconnection.
+- Work that was not accepted while the node was offline is not executed on its own after recovery.
+- Production OAuth, node credential revocation, and permission changes take effect.
+- DaVinci launches Codex etc. through Reach, sends input to the same process multiple times, and re-fetches stdout/stderr in order.
+- The meaning and state of DaVinci runs / agent turns / GitHub issues / draft PRs are not confused with Reach jobs.
+- DaVinci Controller restarts, duplicate stdin, session stop, and provider credential separation are verified with real processes.
+- The mapping between Reach job / process session IDs and DaVinci run IDs is stored in DaVinci and can be reconciled after recovery.
 
-## 12. 設計検証が必要な事項
+## 12. Items requiring design verification
 
-| 論点 | 実装前に検証すること |
+| Topic | What to verify before implementation |
 | --- | --- |
-| Remote MCP | 対象 MCP Host と採用 SDK の 2026-07-28 / 2025-11-25 互換 |
-| 認証 | OAuth Issuer / Gate を使う場合の接続登録・失効・権限マッピング |
-| Node Credential | 発行、秘密情報保存、期限、失効、再登録 |
-| Linux Sandbox | bubblewrap、namespace、cgroups のサポート境界と fail-closed |
-| Job | systemd user transient unit / 独立プロセスの復旧と停止 |
-| Broker | DO Hibernation 後の WebSocket 復元、同時要求、切断時の相関 |
-| MCP 応答 | Tool timeout、Job 受理 ACK、結果不明時の再照合 |
-| Data | Operation / Job / Process Session schema、入力 receipt、ログ・artifact 保持量と削除 |
-| DaVinci integration | 既存 Run / Agent session / sandbox / credential 契約を維持した Adapter と移行計画 |
-| Interactive I/O | stdin の書込み lease、再配送、stdout/stderr cursor、backpressure、PTY の必要性 |
+| Remote MCP | Compatibility of target MCP hosts and the chosen SDK with 2026-07-28 / 2025-11-25 |
+| Authentication | Connection registration, revocation, and permission mapping when using an OAuth issuer / Gate |
+| Node credential | Issuance, secret storage, expiry, revocation, re-registration |
+| Linux sandbox | Support boundaries and fail-closed behavior of bubblewrap, namespaces, cgroups |
+| Job | Recovery and stop of systemd user transient units / independent processes |
+| Broker | WebSocket restoration after DO hibernation, concurrent requests, correlation on disconnect |
+| MCP responses | Tool timeouts, job acceptance ACKs, reconciliation on unknown results |
+| Data | Operation / job / process session schema, input receipts, retention and deletion of logs / artifacts |
+| DaVinci integration | An adapter and migration plan that keep the existing run / agent session / sandbox / credential contracts |
+| Interactive I/O | stdin write leases, redelivery, stdout/stderr cursors, backpressure, need for PTY |
 
-これらは詳細設計および実環境の検証で決める。設計文書は稼働中の機能や本番の受け入れ完了を示すものではない。
+These are decided in detailed design and verification on real environments. Design documents do not indicate running functionality or completed production acceptance.
 
-## 13. DaVinci の実行環境統合
+## 13. DaVinci execution environment integration
 
-DaVinci は Reach の初期利用サービスとして、ローカル API を使って Agent プロセス、ビルド、テスト、検証の実行を委譲する。DaVinci の Issue/PR、Agent provider protocol、Run / Attempt、成果の判断・受入れを Reach に移さない。
+As Reach's first client service, DaVinci uses the local API to delegate execution of agent processes, builds, tests, and verification. DaVinci's issues/PRs, agent provider protocols, runs / attempts, and judgment and acceptance of results are not moved into Reach.
 
-既存 DaVinci の Go 実装（Process / Sandbox / Command Delivery / Recovery）を設計・テストの参照実装とし、責務単位で Reach に汎用化する。既存コードは DaVinci 固有の依存と終了条件を持つため、一括コピーや旧 Controller の停止を先行させない。
+DaVinci's existing Go implementation (process / sandbox / command delivery / recovery) serves as the reference implementation for design and tests and is generalized into Reach one responsibility at a time. Because the existing code has DaVinci-specific dependencies and termination conditions, wholesale copying or stopping the old controller first is not done.
 
-DaVinci が現在持つ Cloud Run / Firestore の Issue 投影、Dashboard、コマンド配送は別プロダクトの業務契約である。Reach の Cloudflare Broker に置き換える対象は汎用実行接続だけであり、DaVinci の業務クラウド機能まで無条件に置換しない。
+DaVinci's current Cloud Run / Firestore issue projection, dashboard, and command delivery are business contracts of a separate product. What Reach's Cloudflare broker replaces is only the generic execution connection; DaVinci's business cloud features are not replaced unconditionally.
 
-実装・段階的移行の境界と検収事項は [DaVinci Execution Integration](docs/davinci-execution-integration.md) を参照する。
+For the implementation and staged migration boundaries and acceptance items, see [DaVinci Execution Integration](docs/davinci-execution-integration.md).
 
-## 14. 参考仕様
+## 14. Reference specifications
 
 - [Cloudflare: Stateless MCP Handler](https://developers.cloudflare.com/agents/model-context-protocol/apis/handler-api/)
 - [Cloudflare: Durable Objects WebSocket Hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 - [MCP specification](https://modelcontextprotocol.io/specification/)
 
-関連資料：[README](README.md) / [Product Definition](PRODUCT.md) / [DaVinci Execution Integration](docs/davinci-execution-integration.md)
+Related: [README](README.md) / [Product Definition](PRODUCT.md) / [DaVinci Execution Integration](docs/davinci-execution-integration.md)
