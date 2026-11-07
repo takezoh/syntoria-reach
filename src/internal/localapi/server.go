@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 )
 
@@ -87,16 +88,16 @@ type handler struct {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeError(w, &service.Error{Code: service.CodeInvalidRequest, Message: "use POST"})
+		writeError(w, &core.Error{Code: core.CodeInvalidRequest, Message: "use POST"})
 		return
 	}
 	if uid, ok := r.Context().Value(peerUIDKey{}).(int); !ok || uid != h.uid {
-		writeError(w, &service.Error{Code: service.CodeUnauthorized, Message: "peer user is not allowed"})
+		writeError(w, &core.Error{Code: core.CodeUnauthorized, Message: "peer user is not allowed"})
 		return
 	}
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
-		writeError(w, &service.Error{Code: service.CodeUnauthorized, Message: "missing bearer token"})
+		writeError(w, &core.Error{Code: core.CodeUnauthorized, Message: "missing bearer token"})
 		return
 	}
 	client, err := h.svc.Authenticate(token)
@@ -153,7 +154,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "stop_agent_session":
 		result, err = call(r, func(req service.StopAgentSessionRequest) (any, error) { return h.svc.StopAgentSession(client, req) })
 	default:
-		err = &service.Error{Code: service.CodeNotFound, Message: "unknown method " + r.URL.Path}
+		err = &core.Error{Code: core.CodeNotFound, Message: "unknown method " + r.URL.Path}
 	}
 	if err != nil {
 		writeError(w, err)
@@ -168,24 +169,24 @@ func call[T any](r *http.Request, fn func(T) (any, error)) (any, error) {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		return nil, &service.Error{Code: service.CodeInvalidRequest, Message: fmt.Sprintf("decode request: %v", err)}
+		return nil, &core.Error{Code: core.CodeInvalidRequest, Message: fmt.Sprintf("decode request: %v", err)}
 	}
 	return fn(req)
 }
 
 func writeError(w http.ResponseWriter, err error) {
-	var e *service.Error
+	var e *core.Error
 	if !errors.As(err, &e) {
-		e = &service.Error{Code: service.CodeInternal, Message: "internal error"}
+		e = &core.Error{Code: core.CodeInternal, Message: "internal error"}
 	}
 	status := map[string]int{
-		service.CodeInvalidRequest:    http.StatusBadRequest,
-		service.CodeUnauthorized:      http.StatusUnauthorized,
-		service.CodePermissionDenied:  http.StatusForbidden,
-		service.CodeNotFound:          http.StatusNotFound,
-		service.CodeOperationConflict: http.StatusConflict,
-		service.CodeVersionConflict:   http.StatusConflict,
-		service.CodeInvalidState:      http.StatusConflict,
+		core.CodeInvalidRequest:    http.StatusBadRequest,
+		core.CodeUnauthorized:      http.StatusUnauthorized,
+		core.CodePermissionDenied:  http.StatusForbidden,
+		core.CodeNotFound:          http.StatusNotFound,
+		core.CodeOperationConflict: http.StatusConflict,
+		core.CodeVersionConflict:   http.StatusConflict,
+		core.CodeInvalidState:      http.StatusConflict,
 	}[e.Code]
 	if status == 0 {
 		status = http.StatusInternalServerError

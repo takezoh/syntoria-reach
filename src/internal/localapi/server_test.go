@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/takezoh/syntoria-reach/src/internal/config"
-	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
-	"github.com/takezoh/syntoria-reach/src/internal/store"
+	"github.com/takezoh/syntoria-reach/src/internal/service/servicetest"
 )
 
 const token = "token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -26,22 +26,14 @@ func start(t *testing.T) *http.Client {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	st, err := store.Open(filepath.Join(dir, "reach.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-	svc, err := service.New(&config.Config{
-		Database: filepath.Join(dir, "reach.db"),
-		Orca:     orcatest.Command(t, "TestFakeOrca", dir),
+	// The service runs on fakes: this package owns HTTP decoding, peer and
+	// token checks and error mapping, not the operations themselves.
+	svc := service.New(&config.Config{
 		Projects: []config.Project{{ID: "proj", Repo: "/repo"}},
 		Clients: []config.Client{{ID: "a", Token: token, Grants: []config.Grant{
-			{Project: "proj", Allow: []string{config.PermWorkspaceCreate, config.PermFileRead, config.PermFileWrite}},
+			{Project: "proj", Allow: []string{core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite}},
 		}}},
-	}, st)
-	if err != nil {
-		t.Fatal(err)
-	}
+	}, servicetest.New().Deps())
 	t.Cleanup(svc.Close)
 
 	sock := filepath.Join(dir, "reach.sock")
@@ -79,12 +71,6 @@ func post(t *testing.T, c *http.Client, method, tok string, body any) (int, map[
 	return resp.StatusCode, out
 }
 
-// TestFakeOrca is not a test: it turns the test binary into a fake Orca CLI.
-func TestFakeOrca(t *testing.T) {
-	orcatest.MaybeRun()
-	t.Skip("helper process")
-}
-
 func TestLocalAPI(t *testing.T) {
 	c := start(t)
 	status, created := post(t, c, "create_workspace", token, map[string]any{"operation_id": "cw", "project": "proj", "name": "ws"})
@@ -119,5 +105,20 @@ func TestLocalAPI(t *testing.T) {
 	}
 	if status, out := post(t, c, "run_command", token, map[string]any{"operation_id": "c1", "workspace": ws, "executable": "/bin/sh"}); status != 403 {
 		t.Fatalf("run_command without permission: %d %v", status, out)
+	}
+	status, out := post(t, c, "write_file", token, map[string]any{"operation_id": "w1", "workspace": ws, "path": "other.txt"})
+	if e, _ := out["error"].(map[string]any); status != 409 || e["code"] != core.CodeOperationConflict {
+		t.Fatalf("operation conflict: %d %v", status, out)
+	}
+	if status, out := post(t, c, "no_such_method", token, map[string]any{}); status != 404 {
+		t.Fatalf("unknown method: %d %v", status, out)
+	}
+	resp, err := c.Get("http://reach/v1/list_projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("GET: %d", resp.StatusCode)
 	}
 }

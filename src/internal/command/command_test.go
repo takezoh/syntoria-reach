@@ -5,10 +5,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 func TestRun(t *testing.T) {
-	res, err := Run(context.Background(), Spec{
+	res, err := Run(context.Background(), core.CommandSpec{
 		Executable: "/bin/sh", Args: []string{"-c", "echo out; echo err >&2; exit 3"},
 		Dir: t.TempDir(), Timeout: 10 * time.Second, OutputLimit: 1024,
 	})
@@ -22,14 +24,14 @@ func TestRun(t *testing.T) {
 
 func TestRunNoShellExpansionAndEnv(t *testing.T) {
 	t.Setenv("REACH_TEST_SECRET", "s3cret")
-	res, err := Run(context.Background(), Spec{
+	res, err := Run(context.Background(), core.CommandSpec{
 		Executable: "/bin/echo", Args: []string{"$HOME", "*"},
 		Dir: t.TempDir(), Timeout: 10 * time.Second, OutputLimit: 1024,
 	})
 	if err != nil || string(res.Stdout) != "$HOME *\n" {
 		t.Fatalf("got %q, %v", res.Stdout, err)
 	}
-	res, _ = Run(context.Background(), Spec{
+	res, _ = Run(context.Background(), core.CommandSpec{
 		Executable: "/usr/bin/env", Dir: t.TempDir(), Timeout: 10 * time.Second, OutputLimit: 4096,
 	})
 	if s := string(res.Stdout); strings.Contains(s, "REACH_TEST_SECRET") {
@@ -39,7 +41,7 @@ func TestRunNoShellExpansionAndEnv(t *testing.T) {
 
 func TestRunTimeoutKillsGroupAndTruncates(t *testing.T) {
 	start := time.Now()
-	res, err := Run(context.Background(), Spec{
+	res, err := Run(context.Background(), core.CommandSpec{
 		Executable: "/bin/sh", Args: []string{"-c", "head -c 5000 /dev/zero; sleep 30 & wait"},
 		Dir: t.TempDir(), Timeout: 300 * time.Millisecond, OutputLimit: 100,
 	})

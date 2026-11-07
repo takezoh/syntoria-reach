@@ -4,38 +4,15 @@ import (
 	"database/sql"
 	"errors"
 	"time"
-)
 
-// Workspace states. A workspace being created or deleted when the daemon
-// stopped becomes StateUnknown and can no longer be used through Reach.
-const (
-	WorkspaceCreating = "creating"
-	WorkspaceReady    = "ready"
-	WorkspaceDeleting = "deleting"
-	WorkspaceDeleted  = "deleted"
-	WorkspaceFailed   = "failed"
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
-
-// Workspace is an Orca workspace created by a client through Reach.
-type Workspace struct {
-	ID           string    `json:"workspace"`
-	ClientID     string    `json:"-"`
-	ProjectID    string    `json:"project"`
-	Name         string    `json:"name"`
-	State        string    `json:"state"`
-	OrcaID       string    `json:"-"`
-	Path         string    `json:"path,omitempty"`
-	Branch       string    `json:"branch,omitempty"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-}
 
 // CreateWorkspace records a workspace in the creating state.
-func (s *Store) CreateWorkspace(w *Workspace) error {
+func (s *Store) CreateWorkspace(w *core.Workspace) error {
 	now := s.now().UnixMilli()
 	_, err := s.db.Exec(`INSERT INTO workspaces (id, client_id, project_id, name, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, w.ID, w.ClientID, w.ProjectID, w.Name, WorkspaceCreating, now, now)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, w.ID, w.ClientID, w.ProjectID, w.Name, core.WorkspaceCreating, now, now)
 	return err
 }
 
@@ -58,8 +35,8 @@ func (s *Store) SetWorkspaceState(id, from, to, orcaID, path, branch, errMessage
 
 const workspaceColumns = `id, client_id, project_id, name, state, orca_id, path, branch, error_message, created_at, updated_at`
 
-func scanWorkspace(row interface{ Scan(...any) error }) (*Workspace, error) {
-	w := &Workspace{}
+func scanWorkspace(row interface{ Scan(...any) error }) (*core.Workspace, error) {
+	w := &core.Workspace{}
 	var created, updated int64
 	err := row.Scan(&w.ID, &w.ClientID, &w.ProjectID, &w.Name, &w.State, &w.OrcaID, &w.Path, &w.Branch, &w.ErrorMessage, &created, &updated)
 	if err != nil {
@@ -70,23 +47,23 @@ func scanWorkspace(row interface{ Scan(...any) error }) (*Workspace, error) {
 }
 
 // GetWorkspace returns the client's workspace.
-func (s *Store) GetWorkspace(clientID, id string) (*Workspace, error) {
+func (s *Store) GetWorkspace(clientID, id string) (*core.Workspace, error) {
 	w, err := scanWorkspace(s.db.QueryRow(`SELECT `+workspaceColumns+` FROM workspaces WHERE id = ? AND client_id = ?`, id, clientID))
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+		return nil, core.ErrNotFound
 	}
 	return w, err
 }
 
 // ListWorkspaces returns the client's ready workspaces, oldest first.
-func (s *Store) ListWorkspaces(clientID string) ([]*Workspace, error) {
+func (s *Store) ListWorkspaces(clientID string) ([]*core.Workspace, error) {
 	rows, err := s.db.Query(`SELECT `+workspaceColumns+` FROM workspaces
-		WHERE client_id = ? AND state = ? ORDER BY created_at, id`, clientID, WorkspaceReady)
+		WHERE client_id = ? AND state = ? ORDER BY created_at, id`, clientID, core.WorkspaceReady)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []*Workspace{}
+	out := []*core.Workspace{}
 	for rows.Next() {
 		w, err := scanWorkspace(rows)
 		if err != nil {

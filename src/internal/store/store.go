@@ -1,4 +1,5 @@
-// Package store persists operations and audit records in SQLite.
+// Package store keeps Reach's records in SQLite: operations, audit
+// records, jobs, agent sessions and workspaces.
 package store
 
 import (
@@ -11,43 +12,9 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
-
-// Operation states.
-const (
-	StateRunning   = "running"
-	StateSucceeded = "succeeded"
-	StateFailed    = "failed"
-	// StateUnknown marks an operation whose outcome could not be confirmed,
-	// e.g. the daemon stopped while it was running. It is never re-executed.
-	StateUnknown = "unknown"
-)
-
-// Operation is the durable record of one side-effecting request.
-type Operation struct {
-	ClientID     string          `json:"-"`
-	OperationID  string          `json:"operation_id"`
-	Kind         string          `json:"kind"`
-	ArgsHash     string          `json:"-"`
-	State        string          `json:"state"`
-	Result       json.RawMessage `json:"result,omitempty"`
-	ErrorCode    string          `json:"error_code,omitempty"`
-	ErrorMessage string          `json:"error_message,omitempty"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
-}
-
-// AuditRecord describes one request. It never contains file contents,
-// command output, or environment values.
-type AuditRecord struct {
-	ClientID    string
-	Action      string
-	WorkspaceID string
-	Target      string
-	OperationID string
-	Outcome     string
-	ErrorCode   string
-}
 
 // Store is the SQLite-backed state of a Reach node.
 type Store struct {
@@ -181,13 +148,13 @@ func (s *Store) migrate() error {
 // Admit records a new running operation. If the client already used
 // operationID, the existing record is returned with created=false and nothing
 // is written; the caller compares ArgsHash to detect a conflict.
-func (s *Store) Admit(clientID, operationID, kind, argsHash string) (op *Operation, created bool, err error) {
+func (s *Store) Admit(clientID, operationID, kind, argsHash string) (op *core.Operation, created bool, err error) {
 	now := s.now().UnixMilli()
 	res, err := s.db.Exec(`INSERT INTO operations
 		(client_id, operation_id, kind, args_hash, state, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (client_id, operation_id) DO NOTHING`,
-		clientID, operationID, kind, argsHash, StateRunning, now, now)
+		clientID, operationID, kind, argsHash, core.StateRunning, now, now)
 	if err != nil {
 		return nil, false, err
 	}
@@ -203,7 +170,7 @@ func (s *Store) Admit(clientID, operationID, kind, argsHash string) (op *Operati
 }
 
 // Finish stores the outcome of a running operation.
-func (s *Store) Finish(clientID, operationID, state string, result any, errCode, errMessage string) (*Operation, error) {
+func (s *Store) Finish(clientID, operationID, state string, result any, errCode, errMessage string) (*core.Operation, error) {
 	var raw []byte
 	if result != nil {
 		var err error
@@ -214,26 +181,23 @@ func (s *Store) Finish(clientID, operationID, state string, result any, errCode,
 	_, err := s.db.Exec(`UPDATE operations
 		SET state = ?, result = ?, error_code = ?, error_message = ?, updated_at = ?
 		WHERE client_id = ? AND operation_id = ? AND state = ?`,
-		state, raw, errCode, errMessage, s.now().UnixMilli(), clientID, operationID, StateRunning)
+		state, raw, errCode, errMessage, s.now().UnixMilli(), clientID, operationID, core.StateRunning)
 	if err != nil {
 		return nil, err
 	}
 	return s.GetOperation(clientID, operationID)
 }
 
-// ErrNotFound is returned when an operation does not exist for the client.
-var ErrNotFound = errors.New("operation not found")
-
 // GetOperation returns the client's operation.
-func (s *Store) GetOperation(clientID, operationID string) (*Operation, error) {
-	op := &Operation{ClientID: clientID, OperationID: operationID}
+func (s *Store) GetOperation(clientID, operationID string) (*core.Operation, error) {
+	op := &core.Operation{ClientID: clientID, OperationID: operationID}
 	var result []byte
 	var created, updated int64
 	err := s.db.QueryRow(`SELECT kind, args_hash, state, result, error_code, error_message, created_at, updated_at
 		FROM operations WHERE client_id = ? AND operation_id = ?`, clientID, operationID).
 		Scan(&op.Kind, &op.ArgsHash, &op.State, &result, &op.ErrorCode, &op.ErrorMessage, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+		return nil, core.ErrNotFound
 	}
 	if err != nil {
 		return nil, err
@@ -271,7 +235,7 @@ func (s *Store) MarkRunningUnknown() (int64, error) {
 }
 
 // Audit appends an audit record.
-func (s *Store) Audit(r AuditRecord) error {
+func (s *Store) Audit(r core.AuditRecord) error {
 	_, err := s.db.Exec(`INSERT INTO audit_records
 		(at, client_id, action, workspace_id, target, operation_id, outcome, error_code)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

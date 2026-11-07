@@ -1,17 +1,14 @@
 // Package agent runs agent harnesses as sessions: Codex (app-server), Claude
 // Code (stream-json) and ACP agents such as DSH. The protocol clients and the
 // process handling are ported from DaVinci's agent adapters and execution
-// package, without DaVinci's prompts and output contracts. Reach starts the
-// harness, opens a protocol session, delivers prompts one turn at a time and
-// records normalized events. The harness sandboxes its own tools; Reach does
-// not interpret what the agent produces.
+// package, without DaVinci's prompts and output contracts. The manager starts
+// the harness, opens a protocol session and delivers prompts one turn at a
+// time. It records nothing itself: what happens is reported to the caller
+// through core.AgentEvents. The harness sandboxes its own tools.
 package agent
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,22 +17,7 @@ import (
 	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/command"
-	"github.com/takezoh/syntoria-reach/src/internal/config"
-	"github.com/takezoh/syntoria-reach/src/internal/store"
-)
-
-// Event types recorded for a session.
-const (
-	EventMessage       = "message"        // text the agent sent to the user
-	EventError         = "error"          // an error reported by the harness or Reach
-	EventTurnCompleted = "turn_completed" // text is the stop reason / turn status
-)
-
-var (
-	// ErrNotActive: the session is not running in this daemon.
-	ErrNotActive = errors.New("agent session is not active")
-	// ErrBusy: a turn is already in progress.
-	ErrBusy = errors.New("a turn is already in progress")
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // harness is one protocol connection to a running harness process.
@@ -54,9 +36,8 @@ const (
 	stderrLimit  = 16 << 20 // per session harness log
 )
 
-// Manager owns the running sessions of this daemon.
-type Manager struct {
-	store    *store.Store
+// Runtime owns the running sessions of this daemon.
+type Runtime struct {
 	logDir   string
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -66,60 +47,56 @@ type session struct {
 	id      string
 	proc    *process
 	h       harness
+	events  core.AgentEvents
 	exited  chan struct{}
 	mu      sync.Mutex
-	busy    bool
 	turn    int
-	stopped bool
+	ongoing chan struct{} // closed when the turn in progress was reported; nil if none
+	stopped bool          // Stop was called
+	gone    bool          // the harness exited
 }
 
-// New returns a manager that keeps harness stderr logs under logDir.
-func New(st *store.Store, logDir string) *Manager {
-	return &Manager{store: st, logDir: logDir, sessions: map[string]*session{}}
-}
-
-// StartSpec describes a session to start.
-type StartSpec struct {
-	ClientID    string
-	WorkspaceID string
-	Dir         string
-	Agent       config.Agent
-	Resume      string // protocol session ID to resume, if any
-	Model       string // Codex and Claude
-	Effort      string // Codex and Claude
-}
-
-// Start launches the harness and opens a protocol session within a minute.
-// ctx should not be tied to the caller's connection. On failure the session
-// is recorded as failed and the error is returned.
-func (m *Manager) Start(ctx context.Context, s StartSpec) (*store.AgentSession, error) {
-	id := "as_" + randomID()
-	if err := m.store.CreateAgentSession(&store.AgentSession{ID: id, ClientID: s.ClientID, WorkspaceID: s.WorkspaceID, AgentID: s.Agent.ID}); err != nil {
-		return nil, err
+// turnDone returns a channel closed once no turn is in progress.
+func (s *session) turnDone() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ongoing == nil {
+		c := make(chan struct{})
+		close(c)
+		return c
 	}
+	return s.ongoing
+}
+
+// New returns a runtime that keeps harness stderr logs under logDir.
+func New(logDir string) *Runtime {
+	return &Runtime{logDir: logDir, sessions: map[string]*session{}}
+}
+
+// Start launches the harness for session id and opens a protocol session
+// within a minute; it returns the protocol session ID. ctx should not be
+// tied to the caller's connection. Once Start returned, what happens in the
+// session is reported to events.
+func (m *Runtime) Start(ctx context.Context, id string, s core.AgentStart, events core.AgentEvents) (string, error) {
 	sess, protoID, err := m.launch(ctx, id, s)
 	if err != nil {
-		m.store.UpdateAgentSession(id, store.AgentSessionUpdate{State: store.SessionFailed, ErrorMessage: err.Error()})
-		return nil, err
+		return "", err
 	}
-	if err := m.store.UpdateAgentSession(id, store.AgentSessionUpdate{State: store.SessionIdle, ProtocolSessionID: protoID}); err != nil {
-		m.closeSession(sess)
-		return nil, err
-	}
+	sess.events = events
 	m.mu.Lock()
 	m.sessions[id] = sess
 	m.mu.Unlock()
 	go m.watch(sess)
-	return m.store.GetAgentSession(s.ClientID, id)
+	return protoID, nil
 }
 
-func (m *Manager) launch(ctx context.Context, id string, s StartSpec) (*session, string, error) {
+func (m *Runtime) launch(ctx context.Context, id string, s core.AgentStart) (*session, string, error) {
 	if err := os.MkdirAll(m.logDir, 0o700); err != nil {
 		return nil, "", err
 	}
-	argv := append([]string{}, s.Agent.Command...)
+	argv := append([]string{}, s.Harness.Command...)
 	claudeSession := s.Resume
-	if s.Agent.Protocol == config.ProtocolClaude {
+	if s.Harness.Protocol == core.ProtocolClaude {
 		if claudeSession == "" {
 			claudeSession = newClaudeSessionID()
 		} else if !validClaudeSessionID(claudeSession) {
@@ -127,18 +104,18 @@ func (m *Manager) launch(ctx context.Context, id string, s StartSpec) (*session,
 		}
 		argv = append(argv, claudeArgs(claudeSession, s.Resume != "", s.Model, s.Effort)...)
 	}
-	proc, err := startProcess(argv, s.Dir, command.Env(s.Agent.Env), filepath.Join(m.logDir, id+".stderr"))
+	proc, err := startProcess(argv, s.Dir, command.Env(s.Harness.Env), filepath.Join(m.logDir, id+".stderr"))
 	if err != nil {
 		return nil, "", fmt.Errorf("start harness: %w", err)
 	}
 	sess := &session{id: id, proc: proc, exited: make(chan struct{})}
-	switch s.Agent.Protocol {
-	case config.ProtocolCodex:
-		sess.h = newCodex(proc.stdin, proc.stdout, s.Agent.Sandbox, s.Model, s.Effort)
-	case config.ProtocolClaude:
+	switch s.Harness.Protocol {
+	case core.ProtocolCodex:
+		sess.h = newCodex(proc.stdin, proc.stdout, s.Harness.Sandbox, s.Model, s.Effort)
+	case core.ProtocolClaude:
 		sess.h = newClaude(proc.stdin, proc.stdout, claudeSession)
 	default:
-		sess.h = newACP(proc.stdin, proc.stdout, s.Agent.AllowPermissions)
+		sess.h = newACP(proc.stdin, proc.stdout, s.Harness.AllowPermissions)
 	}
 	go func() {
 		proc.wait(sess.h.done())
@@ -154,105 +131,117 @@ func (m *Manager) launch(ctx context.Context, id string, s StartSpec) (*session,
 	return sess, protoID, nil
 }
 
-// watch marks the session failed if the harness exits without Stop.
-func (m *Manager) watch(sess *session) {
+// watch reports the exit of a harness that was not stopped, after any turn
+// in progress has been reported.
+func (m *Runtime) watch(sess *session) {
 	<-sess.exited
 	m.mu.Lock()
 	delete(m.sessions, sess.id)
 	m.mu.Unlock()
 	sess.mu.Lock()
+	sess.gone = true
+	sess.mu.Unlock()
+	<-sess.turnDone()
+	sess.mu.Lock()
 	stopped, turn := sess.stopped, sess.turn
 	sess.mu.Unlock()
 	if !stopped {
-		m.store.AppendAgentEvent(sess.id, turn, EventError, "harness exited")
-		m.store.UpdateAgentSession(sess.id, store.AgentSessionUpdate{State: store.SessionFailed, ErrorMessage: "harness exited"})
+		sess.events.Exited(sess.id, turn)
 	}
 }
 
-func (m *Manager) active(id string) (*session, error) {
+func (m *Runtime) active(id string) (*session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sess, ok := m.sessions[id]
 	if !ok {
-		return nil, ErrNotActive
+		return nil, core.ErrSessionInactive
 	}
 	return sess, nil
 }
 
 // Prompt starts a turn and returns its number without waiting for the agent.
-// The turn's output is recorded as events.
-func (m *Manager) Prompt(id, text string) (int, error) {
+// The turn is reported to the session's events: TurnStarted before the
+// prompt is delivered, then its events, then TurnEnded unless the harness
+// exited.
+func (m *Runtime) Prompt(id, text string) (int, error) {
 	sess, err := m.active(id)
 	if err != nil {
 		return 0, err
 	}
 	sess.mu.Lock()
-	if sess.busy || sess.stopped {
+	switch {
+	case sess.stopped || sess.gone:
 		sess.mu.Unlock()
-		return 0, ErrBusy
+		return 0, core.ErrSessionInactive
+	case sess.ongoing != nil:
+		sess.mu.Unlock()
+		return 0, core.ErrSessionBusy
 	}
-	sess.busy = true
 	sess.turn++
 	turn := sess.turn
+	ongoing := make(chan struct{})
+	sess.ongoing = ongoing
 	sess.mu.Unlock()
-	if err := m.store.UpdateAgentSession(id, store.AgentSessionUpdate{State: store.SessionRunning, AddTurn: true}); err != nil {
+	end := func() {
 		sess.mu.Lock()
-		sess.busy = false
+		sess.ongoing = nil
 		sess.mu.Unlock()
+		close(ongoing)
+	}
+	if err := sess.events.TurnStarted(id, turn); err != nil {
+		sess.mu.Lock()
+		sess.turn--
+		sess.mu.Unlock()
+		end()
 		return 0, err
 	}
 
 	go func() {
-		emit := func(typ, text string) {
-			if err := m.store.AppendAgentEvent(id, turn, typ, text); err != nil {
-				slog.Error("record agent event", "session", id, "err", err)
-			}
-		}
+		defer end()
+		emit := func(typ, text string) { sess.events.Event(id, turn, typ, text) }
 		stop, err := sess.h.prompt(context.Background(), text, emit)
 		if err != nil {
-			emit(EventError, err.Error())
+			emit(core.EventError, err.Error())
 		} else {
-			emit(EventTurnCompleted, stop)
+			emit(core.EventTurnCompleted, stop)
 		}
-		sess.mu.Lock()
-		sess.busy = false
-		sess.mu.Unlock()
 		select {
 		case <-sess.h.done():
-			// watch records the failure.
+			// watch reports the exit.
 		default:
-			m.store.UpdateAgentSession(id, store.AgentSessionUpdate{State: store.SessionIdle})
+			sess.events.TurnEnded(id, turn)
 		}
 	}()
 	return turn, nil
 }
 
-// Stop ends any turn and the protocol session, ends the harness process and
-// marks the session closed. Stopping an inactive session returns ErrNotActive.
-func (m *Manager) Stop(id string) error {
-	sess, err := m.active(id)
-	if err != nil {
-		return err
+// Stop ends any turn and the protocol session and ends the harness process.
+// It returns after the session's last event was reported; nothing is
+// reported afterwards. Stopping an inactive session returns
+// core.ErrSessionInactive.
+func (m *Runtime) Stop(id string) error {
+	m.mu.Lock()
+	sess, ok := m.sessions[id]
+	delete(m.sessions, id)
+	m.mu.Unlock()
+	if !ok {
+		return core.ErrSessionInactive
 	}
 	sess.mu.Lock()
 	sess.stopped = true
 	sess.mu.Unlock()
 	m.closeSession(sess)
-	return m.store.UpdateAgentSession(id, store.AgentSessionUpdate{State: store.SessionClosed})
+	<-sess.turnDone()
+	return nil
 }
 
 // closeSession performs the protocol close, then kills and reaps the harness.
-func (m *Manager) closeSession(sess *session) {
+func (m *Runtime) closeSession(sess *session) {
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 	if err := sess.proc.close(ctx, sess.h); err != nil {
 		slog.Warn("harness close", "session", sess.id, "err", err)
 	}
 	<-sess.exited
-}
-
-func randomID() string {
-	b := make([]byte, 12)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }

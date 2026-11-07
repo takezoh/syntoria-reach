@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 	"sync"
+
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // acp speaks the Agent Client Protocol (v1), following DaVinci's DSH client,
@@ -93,7 +95,7 @@ func (c *acp) permission(params json.RawMessage) any {
 // flushLocked emits buffered message chunks as one message event.
 func (c *acp) flushLocked() {
 	if c.text.Len() > 0 && c.emit != nil {
-		c.emit(EventMessage, c.text.String())
+		c.emit(core.EventMessage, c.text.String())
 	}
 	c.text.Reset()
 }

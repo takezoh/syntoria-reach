@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
 )
 
@@ -49,7 +50,7 @@ func TestWorktreeLifecycle(t *testing.T) {
 func TestOrcaErrors(t *testing.T) {
 	root := t.TempDir()
 	cli := &CLI{Command: orcatest.Command(t, "TestFakeOrca", root)}
-	var oe *Error
+	var oe *core.OrcaError
 	if _, err := cli.CreateWorktree(context.Background(), "/repo", "fail"); !errors.As(err, &oe) || oe.Code != "git_failed" {
 		t.Fatalf("create error = %v", err)
 	}

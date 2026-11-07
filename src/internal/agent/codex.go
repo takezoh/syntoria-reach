@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"sync"
+
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // codex speaks the Codex app-server protocol, following DaVinci's Codex
@@ -149,12 +151,12 @@ func (c *codex) prompt(ctx context.Context, text string, emit func(typ, text str
 		}
 		switch {
 		case m.Method == "item/completed" && p.TurnID == turn && p.Item.Type == "agentMessage":
-			emit(EventMessage, p.Item.Text)
+			emit(core.EventMessage, p.Item.Text)
 		case m.Method == "error" && p.TurnID == turn && !p.WillRetry:
-			emit(EventError, p.Error.Message)
+			emit(core.EventError, p.Error.Message)
 		case m.Method == "turn/completed" && p.Turn.ID == turn:
 			if p.Turn.Status != "completed" && p.Turn.Error != nil {
-				emit(EventError, p.Turn.Error.Message)
+				emit(core.EventError, p.Turn.Error.Message)
 			}
 			return p.Turn.Status, nil
 		}

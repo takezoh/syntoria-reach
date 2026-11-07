@@ -1,91 +1,103 @@
-package service
+package service_test
+
+// The service runs against the fakes of its ports. What the adapters do
+// with the operating system, SQLite and Orca is covered by their own tests
+// (including the shared contracts in servicetest) and by the end-to-end test
+// in cmd/reach.
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/takezoh/syntoria-reach/src/internal/agent/agenttest"
 	"github.com/takezoh/syntoria-reach/src/internal/config"
-	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
-	"github.com/takezoh/syntoria-reach/src/internal/store"
+	"github.com/takezoh/syntoria-reach/src/internal/core"
+	"github.com/takezoh/syntoria-reach/src/internal/service"
+	"github.com/takezoh/syntoria-reach/src/internal/service/servicetest"
 )
 
 const (
 	tokenA = "token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	tokenB = "token-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tokenC = "token-cccccccccccccccccccccccccccccccc"
 )
 
 type fixture struct {
-	svc      *Service
-	st       *store.Store
-	db       string
-	orcaRoot string
-	ws       string // a workspace of client a
-	root     string // its path
-	a, b     *Client
+	svc     *service.Service
+	fakes   *servicetest.Fakes
+	a, b, c *service.Client // a: everything; b: read only; c: agents only
+	ws      string          // a workspace of client a
+	root    string          // its path
 }
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	dir := t.TempDir()
-	orcaRoot := filepath.Join(dir, "orca")
-	if err := os.Mkdir(orcaRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.Open(filepath.Join(dir, "reach.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-	agentCmd, agentEnv := agenttest.Agent(t, config.ProtocolCodex, "TestFakeHarness")
 	cfg := &config.Config{
-		Database: filepath.Join(dir, "reach.db"),
-		Orca:     orcatest.Command(t, "TestFakeHarness", orcaRoot),
-		Agents:   []config.Agent{{ID: "codex", Protocol: config.ProtocolCodex, Command: agentCmd, Env: agentEnv, Sandbox: "workspace-write"}},
-		Projects: []config.Project{{ID: "proj", Repo: "/repo", Commands: []string{"/bin/sh"}, Agents: []string{"codex"}}},
+		Agents: []config.Agent{
+			{ID: "codex", Protocol: core.ProtocolCodex, Command: []string{"/bin/codex", "app-server"}, Env: map[string]string{"K": "V"}, Sandbox: "workspace-write"},
+			{ID: "dsh", Protocol: core.ProtocolACP, Command: []string{"/bin/dsh"}},
+		},
+		Projects: []config.Project{{ID: "proj", Repo: "/repo", Commands: []string{"/bin/sh"}, Agents: []string{"codex", "dsh"}}},
 		Clients: []config.Client{
 			{ID: "a", Token: tokenA, Grants: []config.Grant{{Project: "proj", Allow: []string{
-				config.PermWorkspaceCreate, config.PermFileRead, config.PermFileWrite, config.PermCommandRun, config.PermAgentRun}}}},
-			{ID: "b", Token: tokenB, Grants: []config.Grant{{Project: "proj", Allow: []string{config.PermWorkspaceCreate, config.PermFileRead}}}},
+				core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite, core.PermCommandRun, core.PermAgentRun}}}},
+			{ID: "b", Token: tokenB, Grants: []config.Grant{{Project: "proj", Allow: []string{core.PermWorkspaceCreate, core.PermFileRead}}}},
+			{ID: "c", Token: tokenC, Grants: []config.Grant{{Project: "proj", Allow: []string{core.PermWorkspaceCreate, core.PermAgentRun}}}},
 		},
 	}
-	svc, err := New(cfg, st)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fakes := servicetest.New()
+	svc := service.New(cfg, fakes.Deps())
 	t.Cleanup(svc.Close)
-	a, _ := svc.Authenticate(tokenA)
-	b, _ := svc.Authenticate(tokenB)
-	f := &fixture{svc: svc, st: st, db: filepath.Join(dir, "reach.db"), orcaRoot: orcaRoot, a: a, b: b}
-	f.ws = f.newWorkspace(t, a, "ws")
-	f.root = filepath.Join(orcaRoot, "ws")
+	f := &fixture{svc: svc, fakes: fakes}
+	f.a, _ = svc.Authenticate(tokenA)
+	f.b, _ = svc.Authenticate(tokenB)
+	f.c, _ = svc.Authenticate(tokenC)
+	f.ws = f.newWorkspace(t, f.a, "ws")
+	f.root = "/orca/ws"
 	return f
 }
 
 // newWorkspace creates a workspace for c and returns its ID.
-func (f *fixture) newWorkspace(t *testing.T, c *Client, name string) string {
+func (f *fixture) newWorkspace(t *testing.T, c *service.Client, name string) string {
 	t.Helper()
-	op, err := f.svc.CreateWorkspace(context.Background(), c, CreateWorkspaceRequest{OperationID: "create-" + name, Project: "proj", Name: name})
-	if err != nil || op.State != store.StateSucceeded {
+	op, err := f.svc.CreateWorkspace(context.Background(), c, service.CreateWorkspaceRequest{OperationID: "create-" + name, Project: "proj", Name: name})
+	if err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("create workspace: %+v %v", op, err)
 	}
-	var w store.Workspace
-	json.Unmarshal(op.Result, &w)
-	return w.ID
+	return result[core.Workspace](t, op).ID
+}
+
+// result decodes an operation's result.
+func result[T any](t *testing.T, op *core.Operation) T {
+	t.Helper()
+	var v T
+	if err := json.Unmarshal(op.Result, &v); err != nil {
+		t.Fatalf("result of %+v: %v", op, err)
+	}
+	return v
 }
 
 func code(err error) string {
-	var e *Error
+	var e *core.Error
 	if errors.As(err, &e) {
 		return e.Code
 	}
 	return ""
+}
+
+// audit returns the audit log as "client|action|target|outcome|code" lines,
+// leaving out the fixture's workspace creation.
+func (f *fixture) audit() []string {
+	var out []string
+	for _, r := range f.fakes.Store.AuditRecords() {
+		if r.OperationID == "create-ws" {
+			continue
+		}
+		out = append(out, strings.Join([]string{r.ClientID, r.Action, r.Target, r.Outcome, r.ErrorCode}, "|"))
+	}
+	return out
 }
 
 func TestAuthenticate(t *testing.T) {
@@ -93,109 +105,182 @@ func TestAuthenticate(t *testing.T) {
 	if f.a.ID != "a" || f.b.ID != "b" {
 		t.Fatal("wrong client")
 	}
-	if _, err := f.svc.Authenticate("wrong"); code(err) != CodeUnauthorized {
+	if _, err := f.svc.Authenticate("wrong"); code(err) != core.CodeUnauthorized {
 		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestRunCommandIsIdempotent(t *testing.T) {
 	f := newFixture(t)
-	req := RunCommandRequest{OperationID: "op-1", Workspace: f.ws, Executable: "/bin/sh", Args: []string{"-c", "echo x >> count; cat count"}}
-	op1, err := f.svc.RunCommand(context.Background(), f.a, req)
-	if err != nil || op1.State != store.StateSucceeded {
+	ctx := context.Background()
+	req := service.RunCommandRequest{OperationID: "op-1", Workspace: f.ws, Executable: "/bin/sh", Args: []string{"-c", "true"}}
+	op1, err := f.svc.RunCommand(ctx, f.a, req)
+	if err != nil || op1.State != core.StateSucceeded || result[core.CommandResult](t, op1).ExitCode != 0 {
 		t.Fatalf("op=%+v err=%v", op1, err)
 	}
-	op2, err := f.svc.RunCommand(context.Background(), f.a, req)
+	op2, err := f.svc.RunCommand(ctx, f.a, req)
 	if err != nil || string(op2.Result) != string(op1.Result) {
 		t.Fatalf("replay: op=%+v err=%v", op2, err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(f.root, "count")); string(b) != "x\n" {
-		t.Fatalf("command ran more than once: %q", b)
+	calls := f.fakes.Commands.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("command ran %d times", len(calls))
+	}
+	if c := calls[0]; c.Dir != f.root || c.Timeout.Seconds() != 60 || c.OutputLimit != 1<<20 {
+		t.Fatalf("spec = %+v", c)
 	}
 
 	req.Args = []string{"-c", "echo different"}
-	if _, err := f.svc.RunCommand(context.Background(), f.a, req); code(err) != CodeOperationConflict {
+	if _, err := f.svc.RunCommand(ctx, f.a, req); code(err) != core.CodeOperationConflict {
 		t.Fatalf("conflict err = %v", err)
 	}
-	op, err := f.svc.GetOperation(f.a, GetOperationRequest{OperationID: "op-1"})
-	if err != nil || op.State != store.StateSucceeded {
+	if op, err := f.svc.GetOperation(f.a, service.GetOperationRequest{OperationID: "op-1"}); err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("get_operation: %+v %v", op, err)
 	}
 	// Operation IDs are scoped per client.
-	if _, err := f.svc.GetOperation(f.b, GetOperationRequest{OperationID: "op-1"}); code(err) != CodeNotFound {
+	if _, err := f.svc.GetOperation(f.b, service.GetOperationRequest{OperationID: "op-1"}); code(err) != core.CodeNotFound {
 		t.Fatalf("other client sees operation: %v", err)
+	}
+	if _, err := f.svc.RunCommand(ctx, f.a, service.RunCommandRequest{OperationID: "bad id", Workspace: f.ws, Executable: "/bin/sh"}); code(err) != core.CodeInvalidRequest {
+		t.Fatalf("invalid operation ID: %v", err)
+	}
+	if got, want := f.audit(), []string{
+		"a|run_command|/bin/sh|ok|",
+		"a|run_command|/bin/sh|replayed|",
+		"a|run_command|/bin/sh|error|operation_conflict",
+		"a|get_operation||ok|",
+		"b|get_operation||error|not_found",
+		"a|run_command|/bin/sh|error|invalid_request",
+	}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("audit = %q", got)
+	}
+}
+
+func TestCommandStartFailureIsRecorded(t *testing.T) {
+	f := newFixture(t)
+	f.fakes.Commands.Result = func(core.CommandSpec) (*core.CommandResult, error) { return nil, errors.New("exec format error") }
+	op, err := f.svc.RunCommand(context.Background(), f.a, service.RunCommandRequest{OperationID: "op", Workspace: f.ws, Executable: "/bin/sh"})
+	if err != nil || op.State != core.StateFailed || op.ErrorCode != core.CodeInvalidRequest || !strings.Contains(op.ErrorMessage, "exec format error") {
+		t.Fatalf("op=%+v err=%v", op, err)
+	}
+	if got := f.audit(); len(got) != 1 || got[0] != "a|run_command|/bin/sh|failed|invalid_request" {
+		t.Fatalf("audit = %q", got)
 	}
 }
 
 func TestPermissions(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
-	if _, err := f.svc.RunCommand(ctx, f.b, RunCommandRequest{OperationID: "x", Workspace: f.ws, Executable: "/bin/sh"}); code(err) != CodePermissionDenied {
-		t.Fatalf("client without command.run: %v", err)
+	cases := map[string]struct {
+		call func() error
+		code string
+	}{
+		"client without command.run": {func() error {
+			_, err := f.svc.RunCommand(ctx, f.b, service.RunCommandRequest{OperationID: "x", Workspace: f.ws, Executable: "/bin/sh"})
+			return err
+		}, core.CodePermissionDenied},
+		"executable not in allowlist": {func() error {
+			_, err := f.svc.RunCommand(ctx, f.a, service.RunCommandRequest{OperationID: "x", Workspace: f.ws, Executable: "/bin/bash"})
+			return err
+		}, core.CodePermissionDenied},
+		"timeout out of range": {func() error {
+			_, err := f.svc.RunCommand(ctx, f.a, service.RunCommandRequest{OperationID: "x", Workspace: f.ws, Executable: "/bin/sh", TimeoutSeconds: 601})
+			return err
+		}, core.CodeInvalidRequest},
+		"client without file.write": {func() error {
+			_, err := f.svc.WriteFile(f.b, service.WriteFileRequest{OperationID: "x", Workspace: f.ws, Path: "f", Content: []byte("x")})
+			return err
+		}, core.CodePermissionDenied},
+		"content too large": {func() error {
+			_, err := f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "x", Workspace: f.ws, Path: "f", Content: make([]byte, 8<<20+1)})
+			return err
+		}, core.CodeInvalidRequest},
+		"foreign workspace": {func() error {
+			_, err := f.svc.ReadFile(f.b, service.ReadFileRequest{Workspace: f.ws, Path: "f"})
+			return err
+		}, core.CodePermissionDenied},
+		"unknown workspace": {func() error {
+			_, err := f.svc.ListFiles(f.a, service.ListFilesRequest{Workspace: "nope"})
+			return err
+		}, core.CodePermissionDenied},
+		"path outside": {func() error {
+			_, err := f.svc.ReadFile(f.a, service.ReadFileRequest{Workspace: f.ws, Path: "../x"})
+			return err
+		}, core.CodeInvalidRequest},
+		"read limit": {func() error {
+			_, err := f.svc.ReadFile(f.a, service.ReadFileRequest{Workspace: f.ws, Path: "f", Limit: 4<<20 + 1})
+			return err
+		}, core.CodeInvalidRequest},
 	}
-	if _, err := f.svc.RunCommand(ctx, f.a, RunCommandRequest{OperationID: "x", Workspace: f.ws, Executable: "/bin/bash"}); code(err) != CodePermissionDenied {
-		t.Fatalf("executable not in allowlist: %v", err)
+	for name, c := range cases {
+		if err := c.call(); code(err) != c.code {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
-	if _, err := f.svc.WriteFile(f.b, WriteFileRequest{OperationID: "x", Workspace: f.ws, Path: "f", Content: []byte("x")}); code(err) != CodePermissionDenied {
-		t.Fatalf("client without file.write: %v", err)
+	// Denied requests are not admitted as operations and run nothing.
+	for _, client := range []string{"a", "b"} {
+		if _, err := f.fakes.Store.GetOperation(client, "x"); !errors.Is(err, core.ErrNotFound) {
+			t.Errorf("denied request of %s was admitted: %v", client, err)
+		}
 	}
-	if _, err := f.svc.ReadFile(f.a, ReadFileRequest{Workspace: "nope", Path: "f"}); code(err) != CodePermissionDenied {
-		t.Fatalf("unknown workspace: %v", err)
-	}
-	if _, err := f.svc.ReadFile(f.a, ReadFileRequest{Workspace: f.ws, Path: "../x"}); code(err) != CodeInvalidRequest {
-		t.Fatalf("path outside: %v", err)
-	}
-	// Denied requests must not create operations.
-	if _, err := f.st.GetOperation("b", "x"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("denied request was admitted: %v", err)
+	if len(f.fakes.Commands.Calls()) != 0 {
+		t.Error("denied command ran")
 	}
 }
 
-func TestWriteFileFailureIsRecorded(t *testing.T) {
+func TestFiles(t *testing.T) {
 	f := newFixture(t)
-	req := WriteFileRequest{OperationID: "w1", Workspace: f.ws, Path: "f.txt", Content: []byte("one")}
+	req := service.WriteFileRequest{OperationID: "w1", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("one")}
 	op, err := f.svc.WriteFile(f.a, req)
-	if err != nil || op.State != store.StateSucceeded {
+	if err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("op=%+v err=%v", op, err)
 	}
-	var res WriteFileResult
-	json.Unmarshal(op.Result, &res)
+	v1 := result[service.WriteFileResult](t, op).Version
+	if b, _ := f.fakes.Files.Get(f.root, "dir/f.txt"); string(b) != "one" {
+		t.Fatalf("content = %q", b)
+	}
 
 	// Creating again without a version fails, and the failure is stored.
-	op, err = f.svc.WriteFile(f.a, WriteFileRequest{OperationID: "w2", Workspace: f.ws, Path: "f.txt", Content: []byte("two")})
-	if err != nil || op.State != store.StateFailed || op.ErrorCode != CodeVersionConflict {
+	op, err = f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "w2", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("two")})
+	if err != nil || op.State != core.StateFailed || op.ErrorCode != core.CodeVersionConflict {
 		t.Fatalf("op=%+v err=%v", op, err)
 	}
-	op, err = f.svc.WriteFile(f.a, WriteFileRequest{OperationID: "w3", Workspace: f.ws, Path: "f.txt", Content: []byte("two"), ExpectedVersion: res.Version})
-	if err != nil || op.State != store.StateSucceeded {
+	op, err = f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "w3", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("two"), ExpectedVersion: v1})
+	if err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("op=%+v err=%v", op, err)
+	}
+
+	chunk, err := f.svc.ReadFile(f.b, service.ReadFileRequest{Workspace: f.newWorkspace(t, f.b, "b"), Path: "x"})
+	if code(err) != core.CodeNotFound || chunk != nil {
+		t.Fatalf("missing file: %+v %v", chunk, err)
+	}
+	if chunk, err = f.svc.ReadFile(f.a, service.ReadFileRequest{Workspace: f.ws, Path: "dir/f.txt"}); err != nil || string(chunk.Data) != "two" || !chunk.EOF {
+		t.Fatalf("read: %+v %v", chunk, err)
+	}
+	list, err := f.svc.ListFiles(f.a, service.ListFilesRequest{Workspace: f.ws})
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Name != "dir" {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+	// One open root per workspace, released by Close.
+	if n := f.fakes.Files.OpenRoots(f.root); n != 1 {
+		t.Fatalf("open roots = %d", n)
+	}
+	f.svc.Close()
+	if n := f.fakes.Files.OpenRoots(f.root); n != 0 {
+		t.Fatalf("open roots after close = %d", n)
 	}
 }
 
 func TestAuditHasNoContent(t *testing.T) {
 	f := newFixture(t)
-	f.svc.WriteFile(f.a, WriteFileRequest{OperationID: "w1", Workspace: f.ws, Path: "f.txt", Content: []byte("TOPSECRET")})
-	f.svc.RunCommand(context.Background(), f.b, RunCommandRequest{OperationID: "c1", Workspace: f.ws, Executable: "/bin/sh"})
-
-	db, err := sql.Open("sqlite", f.db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	rows, err := db.Query(`SELECT client_id, action, target, outcome, error_code FROM audit_records
-		WHERE action != 'create_workspace' ORDER BY id`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	var got []string
-	for rows.Next() {
-		var c, a, tg, o, e string
-		rows.Scan(&c, &a, &tg, &o, &e)
-		got = append(got, strings.Join([]string{c, a, tg, o, e}, "|"))
-	}
+	f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "w1", Workspace: f.ws, Path: "f.txt", Content: []byte("TOPSECRET")})
+	f.svc.RunCommand(context.Background(), f.b, service.RunCommandRequest{OperationID: "c1", Workspace: f.ws, Executable: "/bin/sh", Args: []string{"SECRET-ARG"}})
 	want := []string{"a|write_file|f.txt|ok|", "b|run_command|/bin/sh|denied|permission_denied"}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+	if got := f.audit(); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("audit = %v", got)
+	}
+	b, _ := json.Marshal(f.fakes.Store.AuditRecords())
+	if strings.Contains(string(b), "SECRET") {
+		t.Fatalf("audit holds request content: %s", b)
 	}
 }

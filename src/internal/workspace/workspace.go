@@ -6,11 +6,9 @@
 package workspace
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -19,20 +17,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
-)
 
-var (
-	// ErrInvalidPath: the path is not a clean relative path.
-	ErrInvalidPath = errors.New("invalid path")
-	// ErrOutside: the path resolves outside the workspace or onto another mount.
-	ErrOutside = errors.New("path leaves the workspace")
-	// ErrNotFound: the path does not exist.
-	ErrNotFound = errors.New("not found")
-	// ErrVersionConflict: the file's current version differs from the expected one.
-	ErrVersionConflict = errors.New("version conflict")
-	// ErrNotRegular: the path is not a regular file (or not a directory for List).
-	ErrNotRegular = errors.New("unexpected file type")
+	"github.com/takezoh/syntoria-reach/src/internal/core"
+	"github.com/takezoh/syntoria-reach/src/internal/ids"
 )
 
 // FS is an open workspace root.
@@ -59,20 +46,12 @@ func Open(dir string) (*FS, error) {
 // Close releases the root.
 func (w *FS) Close() error { return w.root.Close() }
 
-// Entry is one item of a directory listing.
-type Entry struct {
-	Name    string    `json:"name"`
-	Type    string    `json:"type"` // file, dir, symlink, other
-	Size    int64     `json:"size"`
-	ModTime time.Time `json:"mod_time"`
-}
-
 // List returns up to limit entries of the directory rel ("" or "." for the root).
-func (w *FS) List(rel string, limit int) (entries []Entry, truncated bool, err error) {
+func (w *FS) List(rel string, limit int) (entries []core.FileEntry, truncated bool, err error) {
 	if rel == "" {
 		rel = "."
 	}
-	if err := checkPath(rel); err != nil {
+	if err := core.CheckPath(rel); err != nil {
 		return nil, false, err
 	}
 	dir, err := w.open(rel)
@@ -83,7 +62,7 @@ func (w *FS) List(rel string, limit int) (entries []Entry, truncated bool, err e
 	if info, err := dir.Stat(); err != nil {
 		return nil, false, mapErr(err)
 	} else if !info.IsDir() {
-		return nil, false, ErrNotRegular
+		return nil, false, core.ErrNotRegular
 	}
 	des, err := dir.ReadDir(limit + 1)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -93,7 +72,7 @@ func (w *FS) List(rel string, limit int) (entries []Entry, truncated bool, err e
 		des, truncated = des[:limit], true
 	}
 	for _, de := range des {
-		e := Entry{Name: de.Name(), Type: typeOf(de.Type())}
+		e := core.FileEntry{Name: de.Name(), Type: typeOf(de.Type())}
 		if info, err := de.Info(); err == nil {
 			e.Size, e.ModTime = info.Size(), info.ModTime().UTC()
 		}
@@ -102,19 +81,10 @@ func (w *FS) List(rel string, limit int) (entries []Entry, truncated bool, err e
 	return entries, truncated, nil
 }
 
-// ReadResult is a bounded slice of a file.
-type ReadResult struct {
-	Data    []byte `json:"data"`
-	Size    int64  `json:"size"`
-	Offset  int64  `json:"offset"`
-	EOF     bool   `json:"eof"`
-	Version string `json:"version"`
-}
-
 // Read returns at most limit bytes of rel starting at offset, plus the file's
 // version (hash of the whole content) for a later conditional Write.
-func (w *FS) Read(rel string, offset int64, limit int) (*ReadResult, error) {
-	if err := checkPath(rel); err != nil {
+func (w *FS) Read(rel string, offset int64, limit int) (*core.FileChunk, error) {
+	if err := core.CheckPath(rel); err != nil {
 		return nil, err
 	}
 	f, err := w.openRegular(rel)
@@ -135,7 +105,7 @@ func (w *FS) Read(rel string, offset int64, limit int) (*ReadResult, error) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, mapErr(err)
 	}
-	return &ReadResult{
+	return &core.FileChunk{
 		Data:    buf[:n],
 		Size:    info.Size(),
 		Offset:  offset,
@@ -148,7 +118,7 @@ func (w *FS) Read(rel string, offset int64, limit int) (*ReadResult, error) {
 // the file does not exist; otherwise it must equal the current version.
 // Missing parent directories are created. It returns the new version.
 func (w *FS) Write(rel string, data []byte, expectedVersion string) (string, error) {
-	if err := checkPath(rel); err != nil {
+	if err := core.CheckPath(rel); err != nil {
 		return "", err
 	}
 	w.writeMu.Lock()
@@ -157,9 +127,9 @@ func (w *FS) Write(rel string, data []byte, expectedVersion string) (string, err
 	mode := fs.FileMode(0o644)
 	f, err := w.openRegular(rel)
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, core.ErrNotFound):
 		if expectedVersion != "" {
-			return "", ErrVersionConflict
+			return "", core.ErrVersionConflict
 		}
 	case err != nil:
 		return "", err
@@ -171,7 +141,7 @@ func (w *FS) Write(rel string, data []byte, expectedVersion string) (string, err
 			return "", mapErr(err)
 		}
 		if expectedVersion != current {
-			return "", ErrVersionConflict
+			return "", core.ErrVersionConflict
 		}
 		mode = info.Mode().Perm()
 	}
@@ -186,7 +156,7 @@ func (w *FS) Write(rel string, data []byte, expectedVersion string) (string, err
 		d.Close()
 	}
 
-	tmp := path.Join(dir, ".reach-tmp-"+randomSuffix())
+	tmp := path.Join(dir, ids.New(".reach-tmp-"))
 	tf, err := w.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return "", mapErr(err)
@@ -205,8 +175,7 @@ func (w *FS) Write(rel string, data []byte, expectedVersion string) (string, err
 		w.root.Remove(tmp)
 		return "", mapErr(err)
 	}
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
+	return core.FileVersion(data), nil
 }
 
 // open opens rel inside the root. It accepts only regular files and
@@ -224,11 +193,11 @@ func (w *FS) open(rel string) (*os.File, error) {
 	}
 	if !info.Mode().IsRegular() && !info.IsDir() {
 		f.Close()
-		return nil, ErrNotRegular
+		return nil, core.ErrNotRegular
 	}
 	if deviceOf(info) != w.dev {
 		f.Close()
-		return nil, ErrOutside
+		return nil, core.ErrOutside
 	}
 	return f, nil
 }
@@ -243,28 +212,18 @@ func (w *FS) openRegular(rel string) (*os.File, error) {
 		if err != nil {
 			return nil, mapErr(err)
 		}
-		return nil, ErrNotRegular
+		return nil, core.ErrNotRegular
 	}
 	return f, nil
-}
-
-func checkPath(rel string) error {
-	if rel == "." {
-		return nil
-	}
-	if !filepath.IsLocal(rel) || strings.ContainsRune(rel, 0) {
-		return fmt.Errorf("%w: %q", ErrInvalidPath, rel)
-	}
-	return nil
 }
 
 func mapErr(err error) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return ErrNotFound
+		return core.ErrNotFound
 	// os.Root does not export its escape error.
 	case strings.Contains(err.Error(), "path escapes from parent"):
-		return ErrOutside
+		return core.ErrOutside
 	}
 	return err
 }
@@ -294,10 +253,4 @@ func typeOf(m fs.FileMode) string {
 		return "symlink"
 	}
 	return "other"
-}
-
-func randomSuffix() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }

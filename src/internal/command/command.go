@@ -13,27 +13,9 @@ import (
 	"sort"
 	"syscall"
 	"time"
+
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
-
-// Spec describes one execution. Executable must be an absolute path and Args
-// are passed verbatim (no shell expansion).
-type Spec struct {
-	Executable  string
-	Args        []string
-	Dir         string
-	Timeout     time.Duration
-	OutputLimit int // per stream, in bytes
-}
-
-// Result is the observed outcome of a finished process.
-type Result struct {
-	ExitCode   int    `json:"exit_code"`
-	Stdout     []byte `json:"stdout"`
-	Stderr     []byte `json:"stderr"`
-	Truncated  bool   `json:"truncated"`
-	TimedOut   bool   `json:"timed_out"`
-	DurationMS int64  `json:"duration_ms"`
-}
 
 // Env returns the whole environment of a child: a fixed PATH, LANG and HOME
 // plus extra. The daemon's own environment is not inherited.
@@ -79,7 +61,7 @@ func KillGroup(cmd *exec.Cmd) error {
 
 // Run starts the process and waits for it. A non-zero exit or a timeout is a
 // Result, not an error; an error means the process could not be started.
-func Run(ctx context.Context, s Spec) (*Result, error) {
+func Run(ctx context.Context, s core.CommandSpec) (*core.CommandResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 
@@ -95,7 +77,7 @@ func Run(ctx context.Context, s Spec) (*Result, error) {
 	}
 	err := cmd.Wait()
 	KillGroup(cmd) // children left behind by the main process
-	res := &Result{
+	res := &core.CommandResult{
 		ExitCode:   cmd.ProcessState.ExitCode(),
 		Stdout:     stdoutBuf.Bytes(),
 		Stderr:     stderrBuf.Bytes(),

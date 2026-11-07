@@ -10,6 +10,8 @@ import (
 	"io"
 	"strings"
 	"sync"
+
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // claude drives Claude Code's stream-json interface (`claude --print
@@ -230,12 +232,12 @@ func (c *claude) prompt(ctx context.Context, text string, emit func(typ, text st
 		}
 		if m.Subtype != "success" || m.IsError {
 			if m.Result != "" {
-				emit(EventError, m.Result)
+				emit(core.EventError, m.Result)
 			}
 			return m.Subtype, nil
 		}
 		if m.Result != "" {
-			emit(EventMessage, m.Result)
+			emit(core.EventMessage, m.Result)
 		}
 		return m.Subtype, nil
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/command"
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 const timeout = 2 * time.Minute
@@ -23,26 +24,11 @@ type CLI struct {
 	Command []string
 }
 
-// Worktree is an Orca workspace.
-type Worktree struct {
-	ID     string `json:"id"`
-	Path   string `json:"path"`
-	Branch string `json:"branch"`
-}
-
-// Error is a failure reported by Orca.
-type Error struct {
-	Code    string
-	Message string
-}
-
-func (e *Error) Error() string { return "orca: " + e.Code + ": " + e.Message }
-
 // CreateWorktree creates a new worktree of the registered repo at repoPath.
 // Repo setup hooks and agent launches are skipped; Reach starts agents itself.
-func (c *CLI) CreateWorktree(ctx context.Context, repoPath, name string) (*Worktree, error) {
+func (c *CLI) CreateWorktree(ctx context.Context, repoPath, name string) (*core.Worktree, error) {
 	var res struct {
-		Worktree Worktree `json:"worktree"`
+		Worktree core.Worktree `json:"worktree"`
 	}
 	if err := c.run(ctx, &res, "worktree", "create", "--repo", "path:"+repoPath, "--name", name, "--no-parent", "--setup", "skip"); err != nil {
 		return nil, err
@@ -90,7 +76,7 @@ func (c *CLI) run(ctx context.Context, out any, args ...string) error {
 	}
 	if !resp.OK {
 		if resp.Error != nil {
-			return &Error{Code: resp.Error.Code, Message: resp.Error.Message}
+			return &core.OrcaError{Code: resp.Error.Code, Message: resp.Error.Message}
 		}
 		return fmt.Errorf("orca %s failed", args[0]+" "+args[1])
 	}

@@ -7,24 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-)
 
-// Permissions a client can be granted on a project. workspace.create lets
-// the client create (and delete) its own workspaces from the project; the
-// other permissions apply to those workspaces.
-const (
-	PermWorkspaceCreate = "workspace.create"
-	PermFileRead        = "file.read"
-	PermFileWrite       = "file.write"
-	PermCommandRun      = "command.run" // run_command and jobs
-	PermAgentRun        = "agent.run"
-)
-
-// Agent harness protocols.
-const (
-	ProtocolCodex  = "codex"  // Codex app-server
-	ProtocolClaude = "claude" // Claude Code stream-json
-	ProtocolACP    = "acp"    // Agent Client Protocol v1 (e.g. DSH)
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // Config is the on-disk daemon configuration. It contains client tokens, so the
@@ -38,12 +22,9 @@ type Config struct {
 	Clients  []Client  `json:"clients"`
 }
 
-// Agent is an agent harness Reach can start. Command[0] is an absolute path;
-// Env is added to the minimal child environment. For Claude, Reach appends
-// the stream-json and session flags; permission mode and sandbox flags belong
-// in Command. The harness sandboxes its own tools: Sandbox is the Codex
-// sandbox mode (default "workspace-write"), and AllowPermissions lets Reach
-// approve ACP permission requests (default deny).
+// Agent is an agent harness Reach can start (see core.Harness). The
+// harness sandboxes its own tools: Sandbox defaults to "workspace-write" for
+// Codex, and ACP permission requests are denied unless AllowPermissions.
 type Agent struct {
 	ID               string            `json:"id"`
 	Protocol         string            `json:"protocol"`
@@ -51,6 +32,11 @@ type Agent struct {
 	Env              map[string]string `json:"env"`
 	Sandbox          string            `json:"sandbox"`
 	AllowPermissions bool              `json:"allow_permissions"`
+}
+
+// Harness returns how to start the agent.
+func (a Agent) Harness() core.Harness {
+	return core.Harness{Protocol: a.Protocol, Command: a.Command, Env: a.Env, Sandbox: a.Sandbox, AllowPermissions: a.AllowPermissions}
 }
 
 // Project is a repository registered in the Orca server from which clients
@@ -77,7 +63,8 @@ type Grant struct {
 	Allow   []string `json:"allow"`
 }
 
-// Load reads and validates the configuration at path.
+// Load reads and validates the configuration at path. Defaults come from
+// the process environment.
 func Load(path string) (*Config, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -94,29 +81,31 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	if err := c.applyDefaults(); err != nil {
+	home, _ := os.UserHomeDir()
+	if err := c.ApplyDefaults(os.Getenv, home); err != nil {
 		return nil, err
 	}
-	if err := c.validate(); err != nil {
+	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
 	return &c, nil
 }
 
-func (c *Config) applyDefaults() error {
+// ApplyDefaults fills unset paths from the environment (getenv) and the
+// user's home directory.
+func (c *Config) ApplyDefaults(getenv func(string) string, home string) error {
 	if c.Socket == "" {
-		dir := os.Getenv("XDG_RUNTIME_DIR")
+		dir := getenv("XDG_RUNTIME_DIR")
 		if dir == "" {
 			return errors.New("socket is not set and XDG_RUNTIME_DIR is empty")
 		}
 		c.Socket = filepath.Join(dir, "reach", "reach.sock")
 	}
 	if c.Database == "" {
-		dir := os.Getenv("XDG_STATE_HOME")
+		dir := getenv("XDG_STATE_HOME")
 		if dir == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return err
+			if home == "" {
+				return errors.New("database is not set and the home directory is unknown")
 			}
 			dir = filepath.Join(home, ".local", "state")
 		}
@@ -125,7 +114,9 @@ func (c *Config) applyDefaults() error {
 	return nil
 }
 
-func (c *Config) validate() error {
+// Validate checks the configuration and fills agent defaults. It has no
+// side effects beyond c.
+func (c *Config) Validate() error {
 	if !filepath.IsAbs(c.Socket) || !filepath.IsAbs(c.Database) {
 		return errors.New("socket and database must be absolute paths")
 	}
@@ -139,21 +130,21 @@ func (c *Config) validate() error {
 			return fmt.Errorf("agent id %q is empty or duplicated", a.ID)
 		}
 		agents[a.ID] = true
-		if a.Protocol != ProtocolCodex && a.Protocol != ProtocolClaude && a.Protocol != ProtocolACP {
-			return fmt.Errorf("agent %s: protocol must be %q, %q or %q", a.ID, ProtocolCodex, ProtocolClaude, ProtocolACP)
+		if a.Protocol != core.ProtocolCodex && a.Protocol != core.ProtocolClaude && a.Protocol != core.ProtocolACP {
+			return fmt.Errorf("agent %s: protocol must be %q, %q or %q", a.ID, core.ProtocolCodex, core.ProtocolClaude, core.ProtocolACP)
 		}
 		if len(a.Command) == 0 || !filepath.IsAbs(a.Command[0]) {
 			return fmt.Errorf("agent %s: command must start with an absolute path", a.ID)
 		}
-		if a.Protocol == ProtocolCodex && a.Sandbox == "" {
+		if a.Protocol == core.ProtocolCodex && a.Sandbox == "" {
 			a.Sandbox = "workspace-write"
 		}
 		switch {
-		case a.Protocol != ProtocolCodex && a.Sandbox != "":
+		case a.Protocol != core.ProtocolCodex && a.Sandbox != "":
 			return fmt.Errorf("agent %s: sandbox applies to codex agents only", a.ID)
-		case a.Protocol != ProtocolACP && a.AllowPermissions:
+		case a.Protocol != core.ProtocolACP && a.AllowPermissions:
 			return fmt.Errorf("agent %s: allow_permissions applies to acp agents only", a.ID)
-		case a.Protocol == ProtocolCodex && a.Sandbox != "read-only" && a.Sandbox != "workspace-write" && a.Sandbox != "danger-full-access":
+		case a.Protocol == core.ProtocolCodex && a.Sandbox != "read-only" && a.Sandbox != "workspace-write" && a.Sandbox != "danger-full-access":
 			return fmt.Errorf("agent %s: unknown codex sandbox %q", a.ID, a.Sandbox)
 		}
 	}
@@ -197,7 +188,7 @@ func (c *Config) validate() error {
 			}
 			for _, p := range g.Allow {
 				switch p {
-				case PermWorkspaceCreate, PermFileRead, PermFileWrite, PermCommandRun, PermAgentRun:
+				case core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite, core.PermCommandRun, core.PermAgentRun:
 				default:
 					return fmt.Errorf("client %s: unknown permission %q", cl.ID, p)
 				}

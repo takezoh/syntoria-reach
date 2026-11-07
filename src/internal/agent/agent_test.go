@@ -2,120 +2,158 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/agent/agenttest"
-	"github.com/takezoh/syntoria-reach/src/internal/config"
-	"github.com/takezoh/syntoria-reach/src/internal/store"
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
-func newManager(t *testing.T) (*Manager, *store.Store) {
-	t.Helper()
-	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "reach.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-	return New(st, filepath.Join(dir, "agents")), st
+// recorder is a core.AgentEvents that keeps what the runtime reported.
+type recorder struct {
+	mu       sync.Mutex
+	log      []string // "start:1", "message:...", "ended:1", "exited:1"
+	changed  chan struct{}
+	failNext error // returned by the next TurnStarted
 }
 
-func fakeAgent(t *testing.T, protocol string) config.Agent {
+func newRecorder() *recorder { return &recorder{changed: make(chan struct{}, 1)} }
+
+func (r *recorder) add(s string) {
+	r.mu.Lock()
+	r.log = append(r.log, s)
+	r.mu.Unlock()
+	select {
+	case r.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (r *recorder) TurnStarted(_ string, turn int) error {
+	r.mu.Lock()
+	err := r.failNext
+	r.failNext = nil
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	r.add("start:" + strconv.Itoa(turn))
+	return nil
+}
+func (r *recorder) Event(_ string, _ int, typ, text string) { r.add(typ + ":" + text) }
+func (r *recorder) TurnEnded(_ string, turn int)            { r.add("ended:" + strconv.Itoa(turn)) }
+func (r *recorder) Exited(_ string, turn int)               { r.add("exited:" + strconv.Itoa(turn)) }
+
+func (r *recorder) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.log, " | ")
+}
+
+// waitFor waits until the log ends with suffix.
+func (r *recorder) waitFor(t *testing.T, suffix string) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for !strings.HasSuffix(r.String(), suffix) {
+		select {
+		case <-r.changed:
+		case <-deadline:
+			t.Fatalf("log = %q, want suffix %q", r.String(), suffix)
+		}
+	}
+}
+
+func fakeHarness(t *testing.T, protocol string) core.Harness {
 	t.Helper()
 	cmd, env := agenttest.Agent(t, protocol, "TestFakeHarness")
-	a := config.Agent{ID: protocol, Protocol: protocol, Command: cmd, Env: env}
+	h := core.Harness{Protocol: protocol, Command: cmd, Env: env}
 	switch protocol {
-	case config.ProtocolCodex:
-		a.Sandbox = "workspace-write"
-	case config.ProtocolACP:
-		a.AllowPermissions = true
+	case core.ProtocolCodex:
+		h.Sandbox = "workspace-write"
+	case core.ProtocolACP:
+		h.AllowPermissions = true
 	}
-	return a
+	return h
 }
 
-func start(t *testing.T, m *Manager, a config.Agent, resume string) *store.AgentSession {
+func start(t *testing.T, h core.Harness, resume string) (*Runtime, *recorder, string) {
 	t.Helper()
-	sess, err := m.Start(context.Background(), StartSpec{ClientID: "c", WorkspaceID: "ws", Dir: t.TempDir(), Agent: a, Resume: resume})
+	m := New(filepath.Join(t.TempDir(), "agents"))
+	r := newRecorder()
+	proto, err := m.Start(context.Background(), "as_1", core.AgentStart{Dir: t.TempDir(), Harness: h, Resume: resume}, r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { m.Stop(sess.ID) })
-	return sess
-}
-
-// waitTurn waits until the session leaves the running state and returns its events.
-func waitTurn(t *testing.T, st *store.Store, id string) (*store.AgentSession, []store.AgentEvent) {
-	t.Helper()
-	for range 200 {
-		s, err := st.GetAgentSession("c", id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if s.State != store.SessionRunning {
-			events, err := st.ListAgentEvents(id, 0, 100)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return s, events
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("turn did not finish")
-	return nil, nil
-}
-
-func summary(events []store.AgentEvent) string {
-	var parts []string
-	for _, e := range events {
-		parts = append(parts, e.Type+":"+e.Text)
-	}
-	return strings.Join(parts, " | ")
+	t.Cleanup(func() { m.Stop("as_1") })
+	return m, r, proto
 }
 
 func TestSessions(t *testing.T) {
 	cases := map[string]string{
-		config.ProtocolCodex:  "message:echo hi (sandbox=workspace-write approval=rejected) | turn_completed:completed",
-		config.ProtocolACP:    "message:echo hi (permission=selected yes) | turn_completed:end_turn",
-		config.ProtocolClaude: "message:echo hi (resumed=false) | turn_completed:success",
+		core.ProtocolCodex:  "start:1 | message:echo hi (sandbox=workspace-write approval=rejected) | turn_completed:completed | ended:1",
+		core.ProtocolACP:    "start:1 | message:echo hi (permission=selected yes) | turn_completed:end_turn | ended:1",
+		core.ProtocolClaude: "start:1 | message:echo hi (resumed=false) | turn_completed:success | ended:1",
 	}
 	for protocol, want := range cases {
 		t.Run(protocol, func(t *testing.T) {
-			m, st := newManager(t)
-			sess := start(t, m, fakeAgent(t, protocol), "")
-			if sess.State != store.SessionIdle || sess.ProtocolSessionID == "" {
-				t.Fatalf("session = %+v", sess)
+			m, r, proto := start(t, fakeHarness(t, protocol), "")
+			if proto == "" {
+				t.Fatal("no protocol session ID")
 			}
-			turn, err := m.Prompt(sess.ID, "hi")
+			turn, err := m.Prompt("as_1", "hi")
 			if err != nil || turn != 1 {
 				t.Fatalf("turn=%d err=%v", turn, err)
 			}
-			got, events := waitTurn(t, st, sess.ID)
-			if got.State != store.SessionIdle || got.Turns != 1 || summary(events) != want {
-				t.Fatalf("state=%s turns=%d events=%s", got.State, got.Turns, summary(events))
+			r.waitFor(t, "ended:1")
+			if r.String() != want {
+				t.Fatalf("log = %s", r)
 			}
 
-			// A second prompt while a turn hangs is rejected; Stop interrupts it.
-			if _, err := m.Prompt(sess.ID, "hang"); err != nil {
+			// A second prompt while a turn hangs is rejected; Stop interrupts
+			// it and reports nothing after it returned.
+			if _, err := m.Prompt("as_1", "hang"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := m.Prompt(sess.ID, "again"); err != ErrBusy {
+			if _, err := m.Prompt("as_1", "again"); !errors.Is(err, core.ErrSessionBusy) {
 				t.Fatalf("concurrent prompt err = %v", err)
 			}
-			if err := m.Stop(sess.ID); err != nil {
+			if err := m.Stop("as_1"); err != nil {
 				t.Fatal(err)
 			}
-			got, _ = st.GetAgentSession("c", sess.ID)
-			if got.State != store.SessionClosed {
-				t.Fatalf("after stop: %s", got.State)
+			afterStop := r.String()
+			if strings.Contains(afterStop, "exited") || !strings.Contains(afterStop, "start:2") {
+				t.Fatalf("log after stop = %s", afterStop)
 			}
-			if _, err := m.Prompt(sess.ID, "late"); err != ErrNotActive {
+			if _, err := m.Prompt("as_1", "late"); !errors.Is(err, core.ErrSessionInactive) {
 				t.Fatalf("prompt after stop err = %v", err)
+			}
+			if err := m.Stop("as_1"); !errors.Is(err, core.ErrSessionInactive) {
+				t.Fatalf("second stop err = %v", err)
+			}
+			time.Sleep(50 * time.Millisecond) // a late report would show up here
+			if r.String() != afterStop {
+				t.Fatalf("reported after stop: %s", r)
 			}
 		})
 	}
+}
+
+func TestTurnStartedErrorAbortsPrompt(t *testing.T) {
+	m, r, _ := start(t, fakeHarness(t, core.ProtocolCodex), "")
+	r.failNext = errors.New("store down")
+	if _, err := m.Prompt("as_1", "hi"); err == nil || err.Error() != "store down" {
+		t.Fatalf("err = %v", err)
+	}
+	// The aborted turn does not count and the session stays usable.
+	if turn, err := m.Prompt("as_1", "hi"); err != nil || turn != 1 {
+		t.Fatalf("turn=%d err=%v", turn, err)
+	}
+	r.waitFor(t, "ended:1")
 }
 
 func TestResume(t *testing.T) {
@@ -124,72 +162,76 @@ func TestResume(t *testing.T) {
 		protocol, resume string
 		env              map[string]string
 	}{
-		"codex":              {config.ProtocolCodex, "previous-thread", nil},
-		"acp session/load":   {config.ProtocolACP, "previous-session", nil},
-		"acp session/resume": {config.ProtocolACP, "previous-session", map[string]string{"REACH_FAKE_ACP_RESUME": "1"}},
-		"claude":             {config.ProtocolClaude, claudeID, nil},
+		"codex":              {core.ProtocolCodex, "previous-thread", nil},
+		"acp session/load":   {core.ProtocolACP, "previous-session", nil},
+		"acp session/resume": {core.ProtocolACP, "previous-session", map[string]string{"REACH_FAKE_ACP_RESUME": "1"}},
+		"claude":             {core.ProtocolClaude, claudeID, nil},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			m, st := newManager(t)
-			a := fakeAgent(t, c.protocol)
+			h := fakeHarness(t, c.protocol)
 			for k, v := range c.env {
-				a.Env[k] = v
+				h.Env[k] = v
 			}
-			sess := start(t, m, a, c.resume)
-			if sess.ProtocolSessionID != c.resume {
-				t.Fatalf("protocol session = %q", sess.ProtocolSessionID)
+			_, r, proto := start(t, h, c.resume)
+			if proto != c.resume {
+				t.Fatalf("protocol session = %q", proto)
 			}
-			// History replayed by session/load is not recorded as events.
-			if events, _ := st.ListAgentEvents(sess.ID, 0, 10); len(events) != 0 {
-				t.Fatalf("replayed history recorded: %s", summary(events))
+			// History replayed by session/load is not reported as events.
+			if r.String() != "" {
+				t.Fatalf("replayed history reported: %s", r)
 			}
 		})
 	}
-	m, _ := newManager(t)
-	if _, err := m.Start(context.Background(), StartSpec{ClientID: "c", WorkspaceID: "ws", Dir: t.TempDir(),
-		Agent: fakeAgent(t, config.ProtocolClaude), Resume: "not-a-uuid"}); err == nil {
+	m := New(t.TempDir())
+	if _, err := m.Start(context.Background(), "as_x", core.AgentStart{Dir: t.TempDir(),
+		Harness: fakeHarness(t, core.ProtocolClaude), Resume: "not-a-uuid"}, newRecorder()); err == nil {
 		t.Fatal("invalid Claude session id accepted")
 	}
 }
 
 func TestClaudeFailedTurn(t *testing.T) {
-	m, st := newManager(t)
-	sess := start(t, m, fakeAgent(t, config.ProtocolClaude), "")
-	if _, err := m.Prompt(sess.ID, "fail"); err != nil {
+	m, r, _ := start(t, fakeHarness(t, core.ProtocolClaude), "")
+	if _, err := m.Prompt("as_1", "fail"); err != nil {
 		t.Fatal(err)
 	}
-	got, events := waitTurn(t, st, sess.ID)
-	if got.State != store.SessionIdle || summary(events) != "error:boom | turn_completed:error_during_execution" {
-		t.Fatalf("state=%s events=%s", got.State, summary(events))
+	r.waitFor(t, "ended:1")
+	if r.String() != "start:1 | error:boom | turn_completed:error_during_execution | ended:1" {
+		t.Fatalf("log = %s", r)
 	}
 }
 
-func TestHarnessCrashFailsSession(t *testing.T) {
-	for _, protocol := range []string{config.ProtocolCodex, config.ProtocolClaude, config.ProtocolACP} {
+func TestHarnessCrashIsReported(t *testing.T) {
+	for _, protocol := range []string{core.ProtocolCodex, core.ProtocolClaude, core.ProtocolACP} {
 		t.Run(protocol, func(t *testing.T) {
-			m, st := newManager(t)
-			sess := start(t, m, fakeAgent(t, protocol), "")
-			if _, err := m.Prompt(sess.ID, "crash"); err != nil {
+			m, r, _ := start(t, fakeHarness(t, protocol), "")
+			if _, err := m.Prompt("as_1", "crash"); err != nil {
 				t.Fatal(err)
 			}
-			for range 200 {
-				if got, _ := st.GetAgentSession("c", sess.ID); got.State == store.SessionFailed {
-					return
-				}
-				time.Sleep(20 * time.Millisecond)
+			// The exit is reported once, after the interrupted turn.
+			r.waitFor(t, "exited:1")
+			if log := r.String(); !strings.HasPrefix(log, "start:1 | error:") || strings.Contains(log, "| ended:") {
+				t.Fatalf("log = %s", log)
 			}
-			got, _ := st.GetAgentSession("c", sess.ID)
-			t.Fatalf("state = %s", got.State)
+			if _, err := m.Prompt("as_1", "late"); !errors.Is(err, core.ErrSessionInactive) {
+				t.Fatalf("prompt after crash err = %v", err)
+			}
 		})
 	}
 }
 
 func TestStartFailure(t *testing.T) {
-	m, _ := newManager(t)
-	a := fakeAgent(t, config.ProtocolACP)
-	a.Env = map[string]string{"REACH_FAKE_AGENT": ""} // exits without speaking ACP
-	if _, err := m.Start(context.Background(), StartSpec{ClientID: "c", WorkspaceID: "ws", Dir: t.TempDir(), Agent: a}); err == nil {
+	h := fakeHarness(t, core.ProtocolACP)
+	h.Env = map[string]string{"REACH_FAKE_AGENT": ""} // exits without speaking ACP
+	m := New(t.TempDir())
+	r := newRecorder()
+	if _, err := m.Start(context.Background(), "as_1", core.AgentStart{Dir: t.TempDir(), Harness: h}, r); err == nil {
 		t.Fatal("start succeeded")
+	}
+	if _, err := m.Prompt("as_1", "hi"); !errors.Is(err, core.ErrSessionInactive) {
+		t.Fatalf("failed session is active: %v", err)
+	}
+	if r.String() != "" {
+		t.Fatalf("failed start reported: %s", r)
 	}
 }
