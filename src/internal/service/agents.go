@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
-	"strings"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
@@ -88,8 +87,8 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 	switch {
 	case !slices.Contains(c.perms, core.PermAgentRun):
 		err = core.Errorf(core.CodePermissionDenied, "%s is not allowed", core.PermAgentRun)
-	case strings.TrimSpace(req.Text) == "":
-		err = core.Errorf(core.CodeInvalidRequest, "text is empty")
+	default:
+		err = core.CheckPrompt(req.Text)
 	}
 	if err != nil {
 		s.audit(rec, err)
@@ -109,6 +108,10 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 			// Without an agent the terminal runs a shell, which would run the
 			// prompt as a command.
 			return nil, core.Errorf(core.CodeInvalidState, "the agent of session %q is no longer running in its terminal", req.SessionID)
+		case sess.WaitingOnHuman != "" && sess.WaitingOnHuman != "unknown":
+			// Orca saw the agent ask its user something, such as a permission;
+			// the answer is the user's, in Orca.
+			return nil, core.Errorf(core.CodeInvalidState, "the agent is waiting for the user in Orca: %s", sess.WaitingOnHuman)
 		}
 		stages, err := s.orca.SendPrompt(ctx, sess.Terminal, req.Text)
 		if err != nil {

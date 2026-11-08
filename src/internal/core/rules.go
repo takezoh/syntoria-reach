@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -21,6 +22,10 @@ var (
 
 // MaxNoteLength bounds a workspace note, in characters.
 const MaxNoteLength = 2000
+
+// MaxPromptBytes bounds a prompt. Orca takes it as one command-line
+// argument, which Linux limits to 128 KiB.
+const MaxPromptBytes = 64 << 10
 
 // Workspace statuses Reach itself sets; Orca accepts others too.
 const (
@@ -95,6 +100,24 @@ var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_./:=@%+,-]+$`)
 func CheckNote(note string) error {
 	if strings.TrimSpace(note) == "" || utf8.RuneCountInString(note) > MaxNoteLength || strings.ContainsRune(note, 0) || !utf8.ValidString(note) {
 		return Errorf(CodeInvalidRequest, "note must be 1 to %d characters of text", MaxNoteLength)
+	}
+	return nil
+}
+
+// CheckPrompt reports whether text can be sent to an agent as a prompt:
+// UTF-8 text of at most MaxPromptBytes, without control characters other
+// than newlines and tabs, that is not an agent command. Claude Code runs
+// text starting with "!" in the shell and text starting with "/" as one of
+// its commands, which would let a client do more than agent.run allows.
+func CheckPrompt(text string) error {
+	trimmed := strings.TrimLeftFunc(text, unicode.IsSpace)
+	switch {
+	case trimmed == "" || len(text) > MaxPromptBytes || !utf8.ValidString(text):
+		return Errorf(CodeInvalidRequest, "text must be 1 to %d bytes of text", MaxPromptBytes)
+	case strings.ContainsFunc(text, func(r rune) bool { return unicode.IsControl(r) && r != '\n' && r != '\t' }):
+		return Errorf(CodeInvalidRequest, "text must not contain control characters other than newlines and tabs")
+	case trimmed[0] == '!' || trimmed[0] == '/':
+		return Errorf(CodeInvalidRequest, "text must be a prompt, not an agent command: it must not start with ! or /")
 	}
 	return nil
 }

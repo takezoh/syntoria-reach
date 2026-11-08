@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -190,6 +191,41 @@ func TestAgentConversation(t *testing.T) {
 	}
 	if _, err := f.svc.GetAgentSession(ctx, f.a, service.AgentSessionRequest{SessionID: s.ID}); code(err) != core.CodeNotFound {
 		t.Fatalf("get after stop: %v", err)
+	}
+}
+
+// A prompt reaches the agent as a prompt: never as one of the agent's
+// commands, nor as the answer to what the agent asks its user.
+func TestPromptsReachOnlyTheAgent(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	s := f.startSession(t, "s", service.StartAgentSessionRequest{})
+	sends := func() (n int) {
+		for _, c := range f.fakes.Orca.Calls() {
+			if strings.HasPrefix(c, "send ") {
+				n++
+			}
+		}
+		return n
+	}
+	for _, text := range []string{"!rm -rf ~", " /add-dir /", "x\x1b[201~y", strings.Repeat("a", core.MaxPromptBytes+1)} {
+		if _, err := f.svc.SendAgentPrompt(ctx, f.a, service.SendAgentPromptRequest{OperationID: "p", SessionID: s.ID, Text: text}); code(err) != core.CodeInvalidRequest {
+			t.Errorf("%.20q: %v", text, err)
+		}
+	}
+	f.fakes.Orca.AskUser(s.Terminal, "Allow Bash(rm -rf ~)? (via hook)")
+	if op := f.prompt(t, "p-wait", s.ID, "yes"); op.State != core.StateFailed || op.ErrorCode != core.CodeInvalidState {
+		t.Fatalf("prompt while the agent asks its user: %+v", op)
+	}
+	if sends() != 0 {
+		t.Fatalf("%d prompts reached the terminal", sends())
+	}
+	// Orca reports "unknown" when it could not check, as for an older host.
+	for i, waiting := range []string{"", "unknown"} {
+		f.fakes.Orca.AskUser(s.Terminal, waiting)
+		if op := f.prompt(t, fmt.Sprintf("p-%d", i), s.ID, "go on"); op.State != core.StateSucceeded {
+			t.Fatalf("prompt with waitingOnHuman %q: %+v", waiting, op)
+		}
 	}
 }
 

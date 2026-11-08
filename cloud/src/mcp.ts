@@ -73,7 +73,7 @@ const tools: { name: string; description: string; input: Shape; readOnly: boolea
   },
   {
     name: "send_agent_prompt",
-    description: "Types `text` into the agent's terminal and submits it; returns once the agent started its turn, without waiting for the reply. A prompt sent while the agent is still working is queued by the agent. Fails with harness_unavailable if the agent did not start a turn (it may be waiting for input in Orca). Read the reply with read_agent_messages.",
+    description: "Types `text` into the agent's terminal and submits it; returns once the agent started its turn, without waiting for the reply. A prompt sent while the agent is still working is queued by the agent. Fails with harness_unavailable if the agent did not start a turn (it may be waiting for input in Orca), and with invalid_state while the agent waits for the user to answer it in Orca, such as a permission: tell the user. `text` is a prompt in words, up to 64 KiB, without control characters other than newlines and tabs; it must not start with ! or /, which the agent would run as a shell command or one of its own commands. Read the reply with read_agent_messages.",
     input: { operation_id: operationId, session_id: sessionId, text: z.string().min(1) },
     readOnly: false,
   },

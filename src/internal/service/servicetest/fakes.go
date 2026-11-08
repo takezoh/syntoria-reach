@@ -327,6 +327,7 @@ type fakeTerminal struct {
 	command  string
 	open     bool
 	agent    string // the agent running in it; empty for a shell
+	waiting  string // what the agent asks its user, as Orca reports it; empty when nothing
 	messages []json.RawMessage
 }
 
@@ -491,6 +492,14 @@ func (o *Orca) Terminals(context.Context) ([]core.Terminal, error) {
 	return out, nil
 }
 
+// AskUser makes the agent in terminal handle wait for its user, as Orca
+// reports it: reason is what it asks.
+func (o *Orca) AskUser(handle, reason string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.terminals[handle].waiting = reason
+}
+
 // ExitAgent ends the agent in terminal handle and leaves its shell, as when
 // the agent quits.
 func (o *Orca) ExitAgent(handle string) {
@@ -547,7 +556,7 @@ func (o *Orca) Dispatch(_ context.Context, id string) (*core.Dispatch, error) {
 	if !ok {
 		return nil, core.ErrNotFound
 	}
-	return &core.Dispatch{ID: id, Terminal: h, Liveness: "live", WaitingOnHuman: "no"}, nil
+	return &core.Dispatch{ID: id, Terminal: h, Liveness: "live", WaitingOnHuman: o.terminals[h].waiting}, nil
 }
 
 func (o *Orca) Transcript(_ context.Context, id, cursor string, limit int) (*core.Transcript, error) {

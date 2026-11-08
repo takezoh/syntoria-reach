@@ -225,7 +225,7 @@ func MaybeRun() {
 		if !found {
 			fail("dispatch_not_found", id)
 		}
-		ok(map[string]any{"dispatchId": id, "terminal": h, "liveness": "live", "waitingOnHuman": "no"})
+		ok(map[string]any{"dispatchId": id, "terminal": h, "liveness": "live"})
 	case "orchestration worker-read":
 		id := flag(args, "--dispatch")
 		h, found := st.Dispatches[id]

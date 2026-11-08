@@ -284,3 +284,16 @@ func TestShellCommand(t *testing.T) {
 		t.Fatal("WorkspaceOfEntry")
 	}
 }
+
+func TestCheckPrompt(t *testing.T) {
+	for _, ok := range []string{"x", "Fix the README.\nThen run\tthe tests.", "  hello", "a/b!", "日本語", strings.Repeat("a", MaxPromptBytes)} {
+		if err := CheckPrompt(ok); err != nil {
+			t.Errorf("CheckPrompt(%.20q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", " \n\t", "!ls", "  !ls", "/cost", "\n/exit", "a\x1b[201~b", "a\rb", "a\x00b", "a\u0085b", "\xff", strings.Repeat("a", MaxPromptBytes+1)} {
+		if err := CheckPrompt(bad); err == nil {
+			t.Errorf("CheckPrompt(%.20q) accepted", bad)
+		}
+	}
+}
