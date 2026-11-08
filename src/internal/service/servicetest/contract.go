@@ -83,8 +83,10 @@ func StoreContract(t *testing.T, open func(t *testing.T) service.Store) {
 		if w.State != core.WorkspaceReady || w.OrcaID != "orca-ws_1" || w.Path != "/w/ws_1" || w.Branch != "b" || w.ErrorMessage != "dirty" {
 			t.Fatalf("after failed delete: %+v", w)
 		}
+		// The order of the list is not part of the contract.
 		list, err := s.ListWorkspaces("c")
-		if err != nil || len(list) != 2 || list[0].ID != "ws_1" || list[1].ID != "ws_2" {
+		if err != nil || len(list) != 2 || list[0].ID == list[1].ID ||
+			(list[0].ID != "ws_1" && list[0].ID != "ws_2") || (list[1].ID != "ws_1" && list[1].ID != "ws_2") {
 			t.Fatalf("list: %+v %v", list, err)
 		}
 		if list, _ := s.ListWorkspaces("other"); len(list) != 0 {
