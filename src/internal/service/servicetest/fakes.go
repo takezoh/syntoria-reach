@@ -328,6 +328,7 @@ type fakeTerminal struct {
 	open     bool
 	agent    string // the agent running in it; empty for a shell
 	waiting  string // what the agent asks its user, as Orca reports it; empty when nothing
+	busy     bool   // in a turn
 	messages []json.RawMessage
 }
 
@@ -500,6 +501,13 @@ func (o *Orca) AskUser(handle, reason string) {
 	o.terminals[handle].waiting = reason
 }
 
+// Busy puts the agent in terminal handle in a turn, or out of it.
+func (o *Orca) Busy(handle string, busy bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.terminals[handle].busy = busy
+}
+
 // ExitAgent ends the agent in terminal handle and leaves its shell, as when
 // the agent quits.
 func (o *Orca) ExitAgent(handle string) {
@@ -580,8 +588,12 @@ func (o *Orca) Transcript(_ context.Context, id, cursor string, limit int) (*cor
 	if limit > 0 && from+limit < to {
 		to = from + limit
 	}
+	activity := "done"
+	if t.busy {
+		activity = "working"
+	}
 	return &core.Transcript{Messages: slices.Clone(t.messages[from:to]), Cursor: strconv.Itoa(to), Workspace: t.worktree,
-		Activity: "done", Terminal: "running", Liveness: "live"}, nil
+		Activity: activity, Terminal: "running", Liveness: "live"}, nil
 }
 
 func (o *Orca) StopDispatch(_ context.Context, id string) error {

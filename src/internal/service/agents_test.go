@@ -3,7 +3,6 @@ package service_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -217,15 +216,28 @@ func TestPromptsReachOnlyTheAgent(t *testing.T) {
 	if op := f.prompt(t, "p-wait", s.ID, "yes"); op.State != core.StateFailed || op.ErrorCode != core.CodeInvalidState {
 		t.Fatalf("prompt while the agent asks its user: %+v", op)
 	}
+	// Orca reports "unknown" when it could not tell, which may be a question too.
+	f.fakes.Orca.AskUser(s.Terminal, "unknown")
+	if op := f.prompt(t, "p-unknown", s.ID, "yes"); op.State != core.StateFailed || op.ErrorCode != core.CodeInvalidState {
+		t.Fatalf("prompt while Orca cannot tell: %+v", op)
+	}
 	if sends() != 0 {
 		t.Fatalf("%d prompts reached the terminal", sends())
 	}
-	// Orca reports "unknown" when it could not check, as for an older host.
-	for i, waiting := range []string{"", "unknown"} {
-		f.fakes.Orca.AskUser(s.Terminal, waiting)
-		if op := f.prompt(t, fmt.Sprintf("p-%d", i), s.ID, "go on"); op.State != core.StateSucceeded {
-			t.Fatalf("prompt with waitingOnHuman %q: %+v", waiting, op)
-		}
+	f.fakes.Orca.AskUser(s.Terminal, "")
+
+	// Before its first prompt the agent has started no turn.
+	if op := f.prompt(t, "p-first", s.ID, "go on"); op.State != core.StateSucceeded {
+		t.Fatalf("first prompt: %+v", op)
+	}
+	// During a turn the agent may ask its user before a prompt arrives.
+	f.fakes.Orca.Busy(s.Terminal, true)
+	if op := f.prompt(t, "p-busy", s.ID, "and then"); op.State != core.StateFailed || op.ErrorCode != core.CodeInvalidState || sends() != 1 {
+		t.Fatalf("prompt during a turn: %+v, %d sends", op, sends())
+	}
+	f.fakes.Orca.Busy(s.Terminal, false)
+	if op := f.prompt(t, "p-done", s.ID, "and then"); op.State != core.StateSucceeded {
+		t.Fatalf("prompt once the turn is done: %+v", op)
 	}
 }
 

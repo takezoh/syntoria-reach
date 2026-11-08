@@ -80,7 +80,7 @@ type PromptResult struct {
 
 // SendAgentPrompt types a prompt into the session's terminal and submits
 // it, once per operation ID, and returns once the agent started its turn. A
-// prompt sent during a turn is queued by the agent.
+// prompt is sent only while the agent waits for one.
 func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentPromptRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "send_agent_prompt", Target: req.SessionID, OperationID: req.OperationID}
 	var err error
@@ -108,10 +108,21 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 			// Without an agent the terminal runs a shell, which would run the
 			// prompt as a command.
 			return nil, core.Errorf(core.CodeInvalidState, "the agent of session %q is no longer running in its terminal", req.SessionID)
-		case sess.WaitingOnHuman != "" && sess.WaitingOnHuman != "unknown":
-			// Orca saw the agent ask its user something, such as a permission;
-			// the answer is the user's, in Orca.
-			return nil, core.Errorf(core.CodeInvalidState, "the agent is waiting for the user in Orca: %s", sess.WaitingOnHuman)
+		case sess.WaitingOnHuman != "":
+			// Orca saw the agent ask its user something, such as a permission,
+			// or could not tell ("unknown"); the answer is the user's, in Orca.
+			return nil, core.Errorf(core.CodeInvalidState, "the agent may be waiting for the user in Orca: %s", sess.WaitingOnHuman)
+		}
+		// During a turn the agent may ask its user something before the prompt
+		// arrives, and the prompt would answer it. Before its first prompt the
+		// agent has reported no session to Orca, so it has started no turn.
+		tr, err := s.orca.Transcript(ctx, req.SessionID, "", 1)
+		switch {
+		case errors.Is(err, core.ErrTranscriptUnavailable):
+		case err != nil:
+			return nil, orcaError(err)
+		case tr.Activity != "done":
+			return nil, core.Errorf(core.CodeInvalidState, "the agent is not waiting for a prompt (activity %q): read_agent_messages until activity is done", tr.Activity)
 		}
 		stages, err := s.orca.SendPrompt(ctx, sess.Terminal, req.Text)
 		if err != nil {
