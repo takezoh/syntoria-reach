@@ -46,7 +46,7 @@ Collect every missing prerequisite, then report them all at once. Stop if any of
 
 Propose a configuration from what you found, then let the user decide:
 
-- **Agents.** Which agents may be started, each as an `id` and the `command` to type into a terminal, for example `["<claude>", "--model", "claude-opus-5-5", "--effort", "xhigh"]`. Every agent may be started in every workspace.
+- **Agents.** Which agents may be started, each as an `id` and the `command` to type into a terminal, for example `["<claude>", "--model", "claude-opus-5-5", "--effort", "xhigh", "--ax-screen-reader"]`. Every agent may be started in every workspace. Claude Code's command needs `--ax-screen-reader`: callers read an agent's replies from its terminal's output, and only then does Claude Code write the whole conversation into it as lines; its full-screen view (`"tui": "fullscreen"` in `~/.claude/settings.json`) leaves only what the screen shows. On an update, propose adding the flag to an agent that lacks it.
 - **Commands.** Which executables `run_command` and `start_job` may run, as absolute paths.
 - **Clients.** The callers: one client per caller, for example `davinci`, or `local` for manual use. Each client has an `id`, a token, and in `allow` its permissions from `workspace.create`, `file.read`, `file.write`, `command.run` and `agent.run`, which apply to every workspace.
 - **Socket, database and workspaces.** Leave `socket`, `database` and `workspaces` unset unless the user asks; they then default to `$XDG_RUNTIME_DIR/reach/reach.sock`, `$XDG_STATE_HOME/reach/reach.db` (`~/.local/state/reach/reach.db` when `XDG_STATE_HOME` is unset in the systemd user manager) and `workspaces` next to the database. Reach creates each workspace's folder in `workspaces` and registers it in Orca; job output goes next to the database; the paths below assume the default.
@@ -123,9 +123,9 @@ The answer is the client's `permissions`, with the `commands` and `agents` it ma
 **Smoke test (optional).** Only with the user's consent, and with a client that has `workspace.create` and `agent.run`. Use unique `operation_id`s, and a name such as `reach-smoke-<yyyymmdd>` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`).
 
 1. `create_workspace` with `{"operation_id", "name", "note"}`, the note saying it is the smoke test. The operation's `state` is `succeeded`, and its `result.workspace` is the workspace ID; Orca now lists the project `reach-<name>`. A failure names Orca's error in `error_message`.
-2. `start_agent_session` with `{"operation_id", "workspace", "agent"}`. The `result.session_id` is the session, and Orca shows the agent in a terminal of the workspace.
-3. `send_agent_prompt` with `{"operation_id", "session_id", "text": "Reply with OK and nothing else."}`. If it fails with `harness_unavailable`, the agent did not start a turn: look at its terminal in Orca, for example for a trust prompt.
-4. Call `read_agent_messages` with `{"session_id", "cursor"}` every few seconds, passing the cursor of the last read, until the assistant's reply arrived and `activity` is `done`. Show the user the messages.
+2. `start_agent_session` with `{"operation_id", "workspace", "agent"}`. The `result.session_id` is the session, its `result.state` is `idle`, and Orca shows the agent in a terminal of the workspace. If `state` is `waiting_on_human`, the agent asks something at its start, such as a trust prompt: look at its terminal in Orca.
+3. `send_agent_prompt` with `{"operation_id", "session_id", "text": "Reply with OK and nothing else."}`. If it fails with `harness_unavailable`, the agent did not start a turn: look at its terminal in Orca.
+4. Call `read_agent_output` with `{"session_id", "cursor"}`, passing the cursor of the last read, until `state` is `idle` and `more` is false. Show the user the lines: the prompt and the reply `OK` are among them.
 5. `stop_agent_session`, then `update_workspace` with `{"operation_id", "workspace", "status": "completed"}`. The daemon removes the workspace, Orca project and folder, after 7 days without activity.
 
 ## 7. Remote MCP (optional)

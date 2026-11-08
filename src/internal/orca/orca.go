@@ -1,6 +1,6 @@
 // Package orca drives the Orca server of this host through the Orca CLI's
-// JSON output: the projects that are Reach workspaces, and the terminals and
-// Dispatches of the agents Reach starts in them.
+// JSON output: the projects that are Reach workspaces, and the terminals of
+// the agents Reach starts in them.
 package orca
 
 import (
@@ -168,99 +168,105 @@ func (c *CLI) CloseTerminal(ctx context.Context, handle string) error {
 	return c.run(ctx, &res, "terminal", "close", "--terminal", handle)
 }
 
-// AdoptTerminal makes terminal handle the Dispatch of a new Run and Task, so
-// that Orca reads the transcript of the agent in it, and returns the
-// Dispatch ID. The prompt is not injected into the terminal.
-func (c *CLI) AdoptTerminal(ctx context.Context, handle, title string) (string, error) {
-	var run struct {
-		RunID string `json:"runId"`
-	}
-	if err := c.run(ctx, &run, "orchestration", "run-create", "--objective", title); err != nil {
-		return "", err
-	}
-	var task struct {
-		TaskID string `json:"taskId"`
-	}
-	if err := c.run(ctx, &task, "orchestration", "task-create", "--spec", title, "--task-title", title, "--run", run.RunID); err != nil {
-		return "", err
-	}
-	var dispatch struct {
-		Dispatch struct {
-			ID string `json:"id"`
-		} `json:"dispatch"`
-	}
-	if err := c.run(ctx, &dispatch, "orchestration", "dispatch", "--task", task.TaskID, "--to", handle, "--run", run.RunID); err != nil {
-		return "", err
-	}
-	if run.RunID == "" || task.TaskID == "" || dispatch.Dispatch.ID == "" {
-		return "", errors.New("orca: adopting the terminal returned no Dispatch")
-	}
-	return dispatch.Dispatch.ID, nil
-}
-
-// Dispatch shows a Dispatch; core.ErrNotFound if Orca has none.
-func (c *CLI) Dispatch(ctx context.Context, id string) (*core.Dispatch, error) {
-	var res core.Dispatch
-	if err := c.run(ctx, &res, "orchestration", "worker-show", "--dispatch", id); err != nil {
-		return nil, notFound(err)
-	}
-	if res.ID == "" {
-		return nil, core.ErrNotFound
-	}
-	return &res, nil
-}
-
-// Transcript reads the conversation of the agent of Dispatch id from cursor
-// (from the start when empty), at most limit messages (0 for Orca's
-// default). core.ErrTranscriptUnavailable if Orca cannot read it yet.
-func (c *CLI) Transcript(ctx context.Context, id, cursor string, limit int) (*core.Transcript, error) {
-	args := []string{"orchestration", "worker-read", "--dispatch", id, "--source", "transcript"}
-	if cursor != "" {
-		args = append(args, "--cursor", cursor)
-	}
-	if limit > 0 {
-		args = append(args, "--limit", fmt.Sprint(limit))
-	}
+// ShowTerminal shows one terminal; core.ErrNotFound once Orca no longer has
+// it.
+func (c *CLI) ShowTerminal(ctx context.Context, handle string) (*core.TerminalStatus, error) {
 	var res struct {
-		Transcript struct {
-			Messages   []json.RawMessage `json:"messages"`
-			NextCursor string            `json:"nextCursor"`
-		} `json:"transcript"`
-		Status struct {
-			Terminal string `json:"terminal"`
-			Liveness string `json:"liveness"`
-		} `json:"status"`
-		Projection struct {
-			Workspace struct {
-				ID string `json:"id"`
-			} `json:"workspace"`
-			Stage struct {
-				Activity string `json:"activity"`
-			} `json:"stage"`
-		} `json:"projection"`
+		Terminal struct {
+			core.Terminal
+			// Absent when Orca did not look, null when it saw no wait.
+			AgentWait json.RawMessage `json:"agentWait"`
+		} `json:"terminal"`
 	}
-	if err := c.run(ctx, &res, args...); err != nil {
-		var oe *core.OrcaError
-		if errors.As(err, &oe) && oe.Code == "transcript_required" {
-			return nil, core.ErrTranscriptUnavailable
+	if err := c.run(ctx, &res, "terminal", "show", "--terminal", handle); err != nil {
+		return nil, terminalGone(err)
+	}
+	t := &core.TerminalStatus{Terminal: res.Terminal.Terminal}
+	switch w := res.Terminal.AgentWait; {
+	case len(w) == 0:
+		t.WaitingOnHuman = core.WaitUnknown
+	case string(w) != "null":
+		var wait struct {
+			Source string `json:"source"`
+			Reason string `json:"reason"`
 		}
-		return nil, notFound(err)
-	}
-	t := &core.Transcript{Messages: res.Transcript.Messages, Cursor: res.Transcript.NextCursor, Workspace: res.Projection.Workspace.ID,
-		Activity: res.Projection.Stage.Activity, Terminal: res.Status.Terminal, Liveness: res.Status.Liveness}
-	if t.Messages == nil {
-		t.Messages = []json.RawMessage{}
+		if err := json.Unmarshal(w, &wait); err != nil || wait.Source == "" {
+			t.WaitingOnHuman = core.WaitUnknown
+		} else if wait.Reason != "" {
+			t.WaitingOnHuman = wait.Reason + " (" + wait.Source + ")"
+		} else {
+			t.WaitingOnHuman = wait.Source
+		}
 	}
 	return t, nil
 }
 
-// StopDispatch fences a Dispatch.
-func (c *CLI) StopDispatch(ctx context.Context, id string) error {
-	var res struct{}
-	return c.run(ctx, &res, "orchestration", "worker-stop", "--dispatch", id)
+// WaitIdle waits up to timeout for Orca to see the agent in terminal handle
+// idle at its prompt (tui-idle).
+func (c *CLI) WaitIdle(ctx context.Context, handle string, timeout time.Duration) (bool, string, error) {
+	var res struct {
+		Wait struct {
+			Satisfied     bool   `json:"satisfied"`
+			BlockedReason string `json:"blockedReason"`
+		} `json:"wait"`
+	}
+	err := c.run(ctx, &res, "terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", fmt.Sprint(timeout.Milliseconds()))
+	var oe *core.OrcaError
+	if errors.As(err, &oe) && oe.Code == "timeout" {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", terminalGone(err)
+	}
+	return res.Wait.Satisfied, res.Wait.BlockedReason, nil
 }
 
-// notFound turns Orca's answer for an unknown project or Dispatch into
+// ReadTerminal reads terminal handle's output, escape sequences stripped,
+// from cursor. Orca's cursor counts the terminal's completed lines, and a
+// cursor below the oldest line it keeps reads from that line.
+func (c *CLI) ReadTerminal(ctx context.Context, handle, cursor string, limit int) (*core.TerminalOutput, error) {
+	if cursor == "" {
+		cursor = "0"
+	}
+	args := []string{"terminal", "read", "--terminal", handle, "--cursor", cursor}
+	if limit > 0 {
+		args = append(args, "--limit", fmt.Sprint(limit))
+	}
+	var res struct {
+		Terminal struct {
+			Tail       []string `json:"tail"`
+			NextCursor *string  `json:"nextCursor"` // null without line cursors
+			Truncated  bool     `json:"truncated"`
+			Limited    bool     `json:"limited"`
+		} `json:"terminal"`
+	}
+	if err := c.run(ctx, &res, args...); err != nil {
+		return nil, terminalGone(err)
+	}
+	out := &core.TerminalOutput{Lines: res.Terminal.Tail, Cursor: cursor, More: res.Terminal.Limited, Truncated: res.Terminal.Truncated}
+	if res.Terminal.NextCursor != nil {
+		out.Cursor = *res.Terminal.NextCursor
+	}
+	if out.Lines == nil {
+		out.Lines = []string{}
+	}
+	return out, nil
+}
+
+// terminalGone turns Orca's answer for a handle it no longer has, or a
+// terminal whose process ended, into core.ErrNotFound.
+func terminalGone(err error) error {
+	var oe *core.OrcaError
+	if errors.As(err, &oe) {
+		switch oe.Code {
+		case "terminal_handle_stale", "terminal_gone", "terminal_not_found", "terminal_exited":
+			return core.ErrNotFound
+		}
+	}
+	return err
+}
+
+// notFound turns Orca's answer for an unknown project into
 // core.ErrNotFound.
 func notFound(err error) error {
 	var oe *core.OrcaError

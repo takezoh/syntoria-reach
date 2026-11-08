@@ -67,7 +67,7 @@ The standard deployment on Linux is a single Go daemon. The cloud has no residen
 | Durable Object / Node Broker | Accepting and mapping the WSS connection for a node, message delivery, short-lived response correlation | User files, persistent job results |
 | Reach Connector (Go) | Outbound WSS to the cloud, receiving authenticated requests, reconnection, transport separation | LLM inference |
 | Local API (Unix socket) | Provides local services such as DaVinci with the same execution operations as the core | Meaning of issues/PRs |
-| Agent sessions | Starting an agent in an Orca terminal of a workspace, typing prompts into it, reading its transcript through Orca, closing it | Prompts, judging agent output, run semantics; running the agent and sandboxing its tools (Orca and the agent do that) |
+| Agent sessions | Starting an agent in an Orca terminal of a workspace, typing prompts into it, reading its terminal output through Orca, closing it | Prompts, judging agent output, run semantics; running the agent and sandboxing its tools (Orca and the agent do that) |
 | Operation Service | Re-validating arguments and permissions, idempotency decisions, accepting synchronous and asynchronous work | Business state of other Syntoria services |
 | Capability Registry | Public contracts of File / Command / Job, required permissions, choice of OS adapter | External AI decisions |
 | Linux Runtime | File operations in workspaces, process start/stop/isolation | MCP protocol details |
@@ -91,7 +91,7 @@ A DaVinci Controller on the same Linux node calls Reach's local API over a Unix 
 
 Local connections also verify the caller's identity and permissions. Unix socket OS permissions are not used as a substitute for global operation permissions; a permission profile for DaVinci limits the workspaces, commands, and agents it may use.
 
-Reach relays prompts to an agent in an Orca terminal and reads its transcript back through Orca. The caller builds prompts and interprets the agent's output; Reach does not infer the success of an LLM turn or the validity of development results.
+Reach relays prompts to an agent in an Orca terminal and reads its terminal output back through Orca. The caller builds prompts and interprets the agent's output; Reach does not infer the success of an LLM turn or the validity of development results.
 
 ## 4.1 Remote communication and authentication
 
@@ -154,8 +154,8 @@ The initial MCP tools are the following candidates. Formal names and JSON Schema
 | start_job | Start an asynchronous command | operation_id, workspace_id, executable, argv, limits |
 | start_agent_session | Start an agent in an Orca terminal of a workspace | operation_id, workspace_id, agent → session_id, terminal |
 | send_agent_prompt | Type a prompt into the agent's terminal; returns once the turn started | operation_id, session_id, text → stages |
-| read_agent_messages | Read the agent's transcript by cursor, as Orca reads it | session_id, cursor, limit → messages, cursor, activity |
-| get_agent_session | Query a session as Orca reports it | session_id → workspace, terminal, liveness |
+| read_agent_output | Read the agent's terminal output by cursor, as Orca reads it, with the agent's state | session_id, cursor, limit → lines, cursor, more, truncated, state |
+| get_agent_session | Query a session as Orca reports it | session_id → workspace, agent, state, waiting_on_human |
 | stop_agent_session | Close the agent's terminal | operation_id, session_id |
 | get_operation | Reconcile an unknown acceptance result | operation_id, admission / final state |
 | get_job | Current state of a job | job_id, status, timestamps |
@@ -194,14 +194,15 @@ Commands and jobs run as children of the daemon, each in its own process group, 
 
 ### Agent sessions
 
-- An agent session is an agent running in an Orca terminal of a workspace. `start_agent_session` types the agent's configured command (shell-quoted) into a new terminal of the workspace's root entry (`orca terminal create --command`), and adopts the terminal as the Dispatch of a new Orca orchestration Run and Task (`orca orchestration dispatch`, without injecting anything), through which Orca reads the agent's transcript. The session ID is the Dispatch ID. Reach keeps nothing about sessions; they are read from Orca on every request and outlive the daemon.
+- An agent session is an agent running in an Orca terminal of a workspace. `start_agent_session` types the agent's configured command (shell-quoted) into a new terminal of the workspace's root entry (`orca terminal create --command`) and returns once Orca sees the agent idle at its prompt (`orca terminal wait --for tui-idle`), or after 15 s, so that it answers within the remote gateway's 30 s; if no agent runs in the terminal by then, it closes the terminal and fails with `harness_unavailable`. The session ID is the terminal's Orca handle. Reach keeps nothing about sessions; they are read from Orca on every request (`orca terminal show`) and outlive the daemon.
+- A session's state is what Orca observes of its agent: `exited` when Orca sees no agent in the terminal (a shell), `waiting_on_human` while Orca saw it wait for its user (`agentWait` of `terminal show`, from its agent status hooks, the prompt text or the title), cannot tell (no `agentWait`), or sees it stopped at such a prompt while waiting for it (`blockedReason`), `idle` when Orca sees it idle at its prompt within 3 s (`tui-idle`), and `working` otherwise. At a permission prompt, `tui-idle` does not become idle and `agentWait` names the hook (checked with Claude Code 2.1.319).
 - A prompt is an operation: Reach types it into the terminal (`orca terminal send --enter`), and the prompt is delivered once Orca observed the agent start its turn (`turn_started`); otherwise it fails with `harness_unavailable`, as when the agent waits for an answer in its terminal. Resending an operation types nothing again.
-- A prompt is only a prompt. Orca bracket-pastes a prompt to a recognized agent and makes Escape inert, but writes it as typed to a terminal whose agent has quit, so Reach refuses a prompt when the terminal runs no agent. Reach also refuses text that the agent itself would run: Claude Code runs a prompt starting with `!` in the shell and one starting with `/` as one of its commands (checked with Claude Code 2.1.319), which would give `agent.run` what `command.run` and the agent's settings guard. A prompt has no control characters other than newlines and tabs and is at most 64 KiB, below Linux's 128 KiB limit on one command-line argument. While Orca reports the agent waiting for its user (`waitingOnHuman`, such as a permission prompt) or cannot tell (`unknown`), Reach sends nothing: the answer is the user's, in Orca. Nor does Reach send during a turn (transcript `activity` other than `done`), when the agent could ask its user something just before the prompt arrives and the prompt would answer it. Before its first prompt the agent has reported no session, so there is no activity to read, and no turn has started. Orca reads both through its agent status hooks; if they are missing, the transcript cannot be read and the first-prompt rule applies to every prompt.
-- Replies are read from the transcript (`orca orchestration worker-read --source transcript`): messages in Orca's form, a cursor to read on from, and the agent's activity (`done` while it waits for a prompt). The transcript is readable once the agent reported its session to Orca, in practice after the first prompt.
-- `stop_agent_session` stops the Dispatch and closes the terminal, which ends the agent. Orca forgets the session the agent reported when its terminal closes, so the transcript and the workspace of the Dispatch are no longer known, and the session is `not_found` from then on, however the terminal closed. Disconnects of WSS / MCP / DaVinci are detach.
-- Reach drives only sessions whose terminal (or, once closed, transcript) belongs to a Reach workspace, so a caller cannot reach other agents in Orca. Sessions are not owned by the client that started them.
+- A prompt is only a prompt. Orca bracket-pastes a prompt to a recognized agent and makes Escape inert, but writes it as typed to a terminal whose agent has quit, so Reach refuses a prompt when the terminal runs no agent. Reach also refuses text that the agent itself would run: Claude Code runs a prompt starting with `!` in the shell and one starting with `/` as one of its commands (checked with Claude Code 2.1.319), which would give `agent.run` what `command.run` and the agent's settings guard. A prompt has no control characters other than newlines and tabs and is at most 64 KiB, below Linux's 128 KiB limit on one command-line argument. Reach sends a prompt only while the state is `idle`. While the agent waits for its user, or Orca cannot tell, the answer is the user's, in Orca; during a turn, the agent could ask its user something just before the prompt arrives, and the prompt would answer it.
+- Replies are read from the terminal's output (`orca terminal read --cursor`): lines without escape sequences, by Orca's cursor, which counts the terminal's completed lines; no cursor reads from the oldest line Orca keeps. Reach reads the state before the output, so output read once the state is `idle` holds the whole turn. The output is the terminal's text, prompts and status lines included; Reach does not interpret it. It holds the whole conversation only if the agent writes it as lines: Claude Code does with `--ax-screen-reader` in its command. Its full-screen view (`"tui": "fullscreen"`) leaves in the output only what the screen shows, and its default view repaints lines, which come back partly overwritten (checked with Claude Code 2.1.319).
+- `stop_agent_session` closes the terminal, which ends the agent. Orca no longer has the terminal's handle (`terminal_handle_stale`), so the session is `not_found` from then on, however the terminal closed. Disconnects of WSS / MCP / DaVinci are detach.
+- Every terminal in a Reach workspace is a session, and no other terminal is, so a caller cannot reach agents elsewhere in Orca. Sessions are not owned by the client that started them.
 - The agent runs in the user's login shell in the terminal, with its own settings and sandbox. Claude Code must start without a question to answer: the workspaces folder is trusted in `~/.claude.json` (trust applies to the folders inside) and the auto mode setup prompt is dismissed.
-- Orca expects a Dispatch's agent to report `worker_done`; an agent in conversation does not, so Orca leaves a "stopped without reporting" message in the Run's mailbox after each turn. Reach does not read those mailboxes.
+- Reach does not use Orca's orchestration (Runs, Tasks, Dispatches). A Run needs the terminal of its coordinator, which Reach does not have: without `--from`, Orca guesses it from the terminals it has and fails with `no_active_sender_terminal` unless exactly one fits, and the one it picks may be the user's. Orca then reports each turn the agent ends without `worker_done` to the coordinator by typing a pointer to it into the coordinator's terminal, which would also be the agent's own if it coordinated itself.
 
 ## 7. Linux execution
 
@@ -246,7 +247,7 @@ Record the operation ID, authenticated principal, node, workspace, operation typ
 | Store | Contents | Authority |
 | --- | --- | --- |
 | Linux SQLite | operations, jobs, audit_records | **Source of truth for operations / jobs** |
-| Orca server | Projects (`reach-*` are workspaces), their folders' registration, comments (notes) and workspace statuses; agents' terminals, Dispatches and transcripts | **Source of truth for workspaces and agent sessions** |
+| Orca server | Projects (`reach-*` are workspaces), their folders' registration, comments (notes) and workspace statuses; agents' terminals and their output | **Source of truth for workspaces and agent sessions** |
 | Linux files | Job stdout / stderr | **Source of truth for the actual data** |
 | Durable Object | WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
 | Workers | Transient processing and forwarding of authenticated requests | Holds no persistent job state |
@@ -292,7 +293,7 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 - Jobs can be queried after DO hibernation / recreation or connector reconnection.
 - Work that was not accepted while the node was offline is not executed on its own after recovery.
 - Production OAuth, node credential revocation, and permission changes take effect.
-- DaVinci starts agents through Reach, sends multiple turns to the same session, and re-reads the transcript by cursor.
+- DaVinci starts agents through Reach, sends multiple turns to the same session, and re-reads the output by cursor.
 - The meaning and state of DaVinci runs / agent turns / GitHub issues / draft PRs are not confused with Reach jobs.
 - DaVinci Controller restarts, duplicate prompts, session stop, and provider credential separation are verified with real processes.
 - The mapping between Reach job / agent session IDs and DaVinci run IDs is stored in DaVinci and can be reconciled after recovery.
@@ -307,10 +308,10 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 | Agent sandbox | What Claude Code's permission and sandbox settings actually confine for an agent in an Orca terminal on the target Linux |
 | Broker | WebSocket restoration after DO hibernation, concurrent requests, correlation on disconnect |
 | MCP responses | Tool timeouts, job acceptance ACKs, reconciliation on unknown results |
-| Data | Retention and deletion of operations, job output, and logs; Orca's Runs and Dispatches left by agent sessions |
+| Data | Retention and deletion of operations, job output, and logs; Orca's Runs and Dispatches left by the agent sessions of earlier versions |
 | Orca | Stability of the Orca CLI's JSON results across versions; which base ref new workspaces should start from |
 | DaVinci integration | A migration plan that keeps the existing run / prompt / credential contracts on Reach agent sessions |
-| Agents on Orca | Agents other than Claude Code in Orca terminals; questions an agent asks in its terminal (Orca's `waitingOnHuman`) |
+| Agents on Orca | Agents other than Claude Code in Orca terminals; questions an agent asks in its terminal (Orca's `agentWait`); agents that write their conversation only as a full-screen view |
 
 These are decided in detailed design and verification on real environments. Design documents do not indicate running functionality or completed production acceptance.
 

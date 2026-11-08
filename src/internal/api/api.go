@@ -50,8 +50,8 @@ func Call(ctx context.Context, svc *service.Service, c *service.Client, method s
 		return call(body, func(req service.SendAgentPromptRequest) (any, error) { return svc.SendAgentPrompt(ctx, c, req) })
 	case "get_agent_session":
 		return call(body, func(req service.AgentSessionRequest) (any, error) { return svc.GetAgentSession(ctx, c, req) })
-	case "read_agent_messages":
-		return call(body, func(req service.ReadAgentMessagesRequest) (any, error) { return svc.ReadAgentMessages(ctx, c, req) })
+	case "read_agent_output":
+		return call(body, func(req service.ReadAgentOutputRequest) (any, error) { return svc.ReadAgentOutput(ctx, c, req) })
 	case "stop_agent_session":
 		return call(body, func(req service.StopAgentSessionRequest) (any, error) { return svc.StopAgentSession(ctx, c, req) })
 	}

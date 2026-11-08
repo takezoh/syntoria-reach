@@ -16,7 +16,7 @@ One workspace is one unit of work: a folder of its own, with a note saying what 
 - New work: create_workspace with a note that says what the work is, so that you or another AI can find it again. The workspace starts empty; put in it what the work needs (for example, clone a repository).
 Keep the note current with update_workspace as the work moves on. When the work is done, set the status to in-review, or to completed when nothing is left; a completed workspace is removed after a week without activity.
 
-To have an agent do a task in a workspace: start_agent_session with one of your agents (list_capabilities); the agent runs in a terminal of the workspace on the Orca server, where the user can watch it. send_agent_prompt with the task, then call read_agent_messages, passing the cursor it returned last time, until the agent's reply has arrived and activity is "done". Send the next prompt to the same session for a follow-up, and stop_agent_session when done, which ends the session and its conversation; a session outlives a disconnect, so get_agent_session tells whether it is still there.
+To have an agent do a task in a workspace: start_agent_session with one of your agents (list_capabilities); the agent runs in a terminal of the workspace on the Orca server, where the user can watch it. send_agent_prompt with the task, then call read_agent_output, passing the cursor it returned last time, until state is "idle": the agent has finished its turn and its output has been read. The output is the terminal's text, with the agent's status lines among it. Send the next prompt to the same session for a follow-up, and stop_agent_session when done, which closes the terminal and ends the session; a session outlives a disconnect, so get_agent_session tells whether it is still there. If state is "waiting_on_human", the agent asks the user something in Orca, such as a permission: tell the user, and wait.
 
 Tools that change something take an operation_id that you choose, unique per action (for example "create-ws-docs-1"). If a call fails with result_unknown, the request may have run: call get_operation with the same operation_id, or resend the same call with the same operation_id. Never retry with a new operation_id. node_offline means the machine is not connected and nothing ran.`;
 
@@ -63,7 +63,7 @@ const tools: { name: string; description: string; input: Shape; readOnly: boolea
   },
   {
     name: "start_agent_session",
-    description: "Starts an agent in a new terminal of the workspace on the Orca server and opens a session with it; a completed workspace is set back in progress. Returns an operation whose result.session_id is the session.",
+    description: "Starts an agent in a new terminal of the workspace on the Orca server and opens a session with it; a completed workspace is set back in progress. Returns, once the agent waits for its first prompt or 15 s passed, an operation whose result is the session: session_id, and state (\"idle\" when it waits for a prompt).",
     input: {
       operation_id: operationId,
       workspace,
@@ -73,29 +73,29 @@ const tools: { name: string; description: string; input: Shape; readOnly: boolea
   },
   {
     name: "send_agent_prompt",
-    description: "Types `text` into the agent's terminal and submits it; returns once the agent started its turn, without waiting for the reply. Send it only while the agent waits for a prompt: after read_agent_messages reports activity \"done\", or before the first prompt; during a turn it fails with invalid_state. Fails with harness_unavailable if the agent did not start a turn (it may be waiting for input in Orca), and with invalid_state while the agent may be waiting for the user to answer it in Orca, such as a permission: tell the user. `text` is a prompt in words, up to 64 KiB, without control characters other than newlines and tabs; it must not start with ! or /, which the agent would run as a shell command or one of its own commands. Read the reply with read_agent_messages.",
+    description: "Types `text` into the agent's terminal and submits it; returns once the agent started its turn, without waiting for the reply. Send it only while the session's state is \"idle\"; otherwise it fails with invalid_state: during a turn, while the agent may be waiting for the user to answer it in Orca, such as a permission (tell the user), or once the agent quit. Fails with harness_unavailable if the agent did not start a turn (it may be waiting for input in Orca). `text` is a prompt in words, up to 64 KiB, without control characters other than newlines and tabs; it must not start with ! or /, which the agent would run as a shell command or one of its own commands. Read the reply with read_agent_output.",
     input: { operation_id: operationId, session_id: sessionId, text: z.string().min(1) },
     readOnly: false,
   },
   {
-    name: "read_agent_messages",
-    description: "The session's conversation after `cursor`, as Orca reads it from the agent's transcript: messages with role and blocks. Returns the cursor to pass next time, and the agent's status: activity (\"done\" while it waits for a prompt), terminal and liveness. Empty until the agent's first prompt. Once the agent's terminal closes, the session is gone: not_found.",
+    name: "read_agent_output",
+    description: "The session's terminal output after `cursor`, as Orca reads it: lines of text without escape sequences, including the prompts and the agent's status lines. Returns the cursor to pass next time, more (true when more lines follow: read again at once), truncated (lines before the cursor are no longer kept), and the agent's state: idle (it waits for a prompt; the output of its turn has been written), working, waiting_on_human (it asks the user something in Orca; waiting_on_human says what Orca saw) or exited (the agent quit; the terminal runs a shell). A read while the agent works takes a few seconds. Once the terminal closes, the session is gone: not_found.",
     input: {
       session_id: sessionId,
-      cursor: z.string().optional().describe("The cursor from the last read; omitted for the start."),
-      limit: z.number().int().min(1).max(1000).optional(),
+      cursor: z.string().optional().describe("The cursor from the last read; omitted for the oldest output Orca keeps."),
+      limit: z.number().int().min(1).max(1000).optional().describe("At most this many lines."),
     },
     readOnly: true,
   },
   {
     name: "get_agent_session",
-    description: "The session as Orca reports it: its workspace, its terminal (absent once closed), liveness, and whether it waits on a human.",
+    description: "The session as Orca reports it: its workspace, the agent Orca sees in its terminal, and its state (idle, working, waiting_on_human or exited, as in read_agent_output). not_found once the terminal has closed.",
     input: { session_id: sessionId },
     readOnly: true,
   },
   {
     name: "stop_agent_session",
-    description: "Closes the agent's terminal, which ends the agent and its session: the conversation is no longer readable.",
+    description: "Closes the agent's terminal, which ends the agent and its session: the output is no longer readable.",
     input: { operation_id: operationId, session_id: sessionId },
     readOnly: false,
   },

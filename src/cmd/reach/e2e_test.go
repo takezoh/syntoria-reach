@@ -288,22 +288,22 @@ func TestE2E(t *testing.T) {
 	}
 
 	// An agent session: the agent's command is typed into an Orca terminal
-	// of the workspace, a prompt goes to that terminal, and the conversation
-	// is read back from Orca.
+	// of the workspace, a prompt goes to that terminal, and its output is
+	// read back from Orca.
 	op = d.mustCall("start_agent_session", map[string]any{"operation_id": "s1", "workspace": wsID, "agent": "claude"})
 	sessionID := result(op)["session_id"]
-	if op["state"] != "succeeded" || sessionID == nil || result(op)["terminal"] == nil {
+	if op["state"] != "succeeded" || sessionID == nil || result(op)["state"] != "idle" {
 		t.Fatalf("start_agent_session: %v", op)
 	}
-	if m := d.mustCall("read_agent_messages", map[string]any{"session_id": sessionID}); len(m["messages"].([]any)) != 0 {
-		t.Fatalf("messages before a prompt: %v", m)
+	if o := d.mustCall("read_agent_output", map[string]any{"session_id": sessionID}); len(o["lines"].([]any)) != 0 || o["state"] != "idle" {
+		t.Fatalf("output before a prompt: %v", o)
 	}
 	if op := d.mustCall("send_agent_prompt", map[string]any{"operation_id": "p1", "session_id": sessionID, "text": "hi"}); op["state"] != "succeeded" {
 		t.Fatalf("send_agent_prompt: %v", op)
 	}
-	if m := d.mustCall("read_agent_messages", map[string]any{"session_id": sessionID}); len(m["messages"].([]any)) != 2 ||
-		!strings.Contains(fmt.Sprint(m["messages"]), "echo: hi") || m["activity"] != "done" {
-		t.Fatalf("read_agent_messages: %v", m)
+	if o := d.mustCall("read_agent_output", map[string]any{"session_id": sessionID}); len(o["lines"].([]any)) != 2 ||
+		!strings.Contains(fmt.Sprint(o["lines"]), "echo: hi") || o["state"] != "idle" {
+		t.Fatalf("read_agent_output: %v", o)
 	}
 
 	// The daemon crashes while a command and a job are running. Its children
@@ -341,8 +341,8 @@ func TestE2E(t *testing.T) {
 	if op := d.mustCall("send_agent_prompt", map[string]any{"operation_id": "p2", "session_id": sessionID, "text": "still there?"}); op["state"] != "succeeded" {
 		t.Fatalf("prompt after the restart: %v", op)
 	}
-	if m := d.mustCall("read_agent_messages", map[string]any{"session_id": sessionID}); len(m["messages"].([]any)) != 4 {
-		t.Fatalf("the conversation after the restart: %v", m)
+	if o := d.mustCall("read_agent_output", map[string]any{"session_id": sessionID}); len(o["lines"].([]any)) != 4 {
+		t.Fatalf("the output after the restart: %v", o)
 	}
 	if op := d.mustCall("stop_agent_session", map[string]any{"operation_id": "x1", "session_id": sessionID}); op["state"] != "succeeded" {
 		t.Fatalf("stop_agent_session: %v", op)

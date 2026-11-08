@@ -67,7 +67,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 | File access | Yes | List, read, conditional write |
 | Command execution | Yes | Isolated execution of permitted Linux commands |
 | Asynchronous jobs | Yes | Start, get state/output, stop |
-| Agent sessions | Yes | Agents in Orca terminals: start, prompt, read the transcript, stop. The agent sandboxes its own tools |
+| Agent sessions | Yes | Agents in Orca terminals: start, prompt, read the terminal output, stop. The agent sandboxes its own tools |
 | Authentication and permissions | Yes | Permission per AI client, node, workspace, and operation |
 | Audit | Yes | Records of actor, target, time, and result |
 | Browser / Desktop GUI | Later | Browser and screen operation |
@@ -84,7 +84,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 - **Client / Connection**: an authenticated AI client and its connection.
 - **Operation**: an individual operation request. It has a unique identifier used to detect resends and duplicates.
 - **Job**: an asynchronous execution and its state, independent of the communication session.
-- **Agent Session**: an agent running in an Orca terminal of a workspace, which a caller prompts and whose transcript it reads through Reach. Distinct from MCP sessions and from a caller's own run.
+- **Agent Session**: an agent running in an Orca terminal of a workspace, which a caller prompts and whose terminal output it reads through Reach. Distinct from MCP sessions and from a caller's own run.
 - **Artifact**: a reference to output logs or generated files.
 - **Permission**: a definition of what is allowed for an actor, target, and operation.
 
@@ -108,7 +108,7 @@ A Reach job completing does not mean a Weave action has completed. The calling s
 | Item | Reach | DaVinci |
 | --- | --- | --- |
 | Linux processes / jobs | Launch, isolation, state, stop / reconnect / logs | Instructions, interpretation of results |
-| Agent sessions | Starting the agent in an Orca terminal, relaying prompts, reading its transcript through Orca, stopping it | Prompts, output contracts, judging turn results |
+| Agent sessions | Starting the agent in an Orca terminal, relaying prompts, reading its terminal output through Orca, stopping it | Prompts, output contracts, judging turn results |
 | Workspace | Permitted areas and runtime mount / path restrictions | Work targets; meaning and management of clones, branches, and results |
 | Authorization | Final enforcement for node / workspace / capability / operation | Managing development requests, execution purposes, and assignees |
 | Development runs | Only the execution facts of jobs / agent sessions | Runs / attempts, issues, sub-issues, PRs, verification and acceptance |

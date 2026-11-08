@@ -2,7 +2,6 @@ package servicetest
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path"
 	"slices"
@@ -305,31 +304,31 @@ type Orca struct {
 	// Now is the clock for last activity; it defaults to time.Now.
 	Now func() time.Time
 
-	// FailAdopt makes AdoptTerminal fail; SilentAgent makes the agent not
-	// start a turn for a prompt, as one stuck on a question would.
-	FailAdopt   bool
+	// NoAgent makes new terminals run no agent, as when its command fails;
+	// SilentAgent makes the agent not start a turn for a prompt, as one
+	// stuck on a question would.
+	NoAgent     bool
 	SilentAgent bool
 
-	mu         sync.Mutex
-	repos      []core.Repo
-	roots      map[string]*core.Worktree // repo ID -> root entry
-	next       int
-	calls      []string
-	terminals  map[string]*fakeTerminal // by handle
-	dispatches map[string]string        // dispatch ID -> terminal handle
+	mu        sync.Mutex
+	repos     []core.Repo
+	roots     map[string]*core.Worktree // repo ID -> root entry
+	next      int
+	calls     []string
+	terminals map[string]*fakeTerminal // by handle
 }
 
-// fakeTerminal is a terminal with an agent that echoes every prompt. Its
-// transcript becomes readable after the first prompt, as Orca reports a
-// session only once the agent's hooks fire.
+// fakeTerminal is a terminal with an agent that echoes every prompt into
+// its output.
 type fakeTerminal struct {
 	worktree string
 	command  string
 	open     bool
 	agent    string // the agent running in it; empty for a shell
-	waiting  string // what the agent asks its user, as Orca reports it; empty when nothing
+	waiting  string // what Orca saw the agent wait for from its user; empty when nothing
+	blocked  string // what Orca saw the agent stopped at when waiting for it to be idle
 	busy     bool   // in a turn
-	messages []json.RawMessage
+	output   []string
 }
 
 func (o *Orca) AddFolder(_ context.Context, p string) (string, error) {
@@ -472,9 +471,13 @@ func (o *Orca) CreateTerminal(_ context.Context, worktreeID, title, command stri
 	o.next++
 	h := fmt.Sprintf("term-%d", o.next)
 	if o.terminals == nil {
-		o.terminals, o.dispatches = map[string]*fakeTerminal{}, map[string]string{}
+		o.terminals = map[string]*fakeTerminal{}
 	}
-	o.terminals[h] = &fakeTerminal{worktree: worktreeID, command: command, open: true, agent: "agent"}
+	t := &fakeTerminal{worktree: worktreeID, command: command, open: true, agent: "agent"}
+	if o.NoAgent {
+		t.agent = ""
+	}
+	o.terminals[h] = t
 	return h, nil
 }
 
@@ -493,12 +496,70 @@ func (o *Orca) Terminals(context.Context) ([]core.Terminal, error) {
 	return out, nil
 }
 
+// terminal returns open terminal handle, or nil. o.mu is held.
+func (o *Orca) terminal(handle string) *fakeTerminal {
+	if t := o.terminals[handle]; t != nil && t.open {
+		return t
+	}
+	return nil
+}
+
+func (o *Orca) ShowTerminal(_ context.Context, handle string) (*core.TerminalStatus, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	t := o.terminal(handle)
+	if t == nil {
+		return nil, core.ErrNotFound
+	}
+	return &core.TerminalStatus{Terminal: core.Terminal{Handle: handle, WorktreeID: t.worktree, Connected: true, AgentIdentity: t.agent}, WaitingOnHuman: t.waiting}, nil
+}
+
+// WaitIdle reports the agent idle unless it is in a turn, waits for its
+// user, or is gone; a shell is never idle as a TUI is.
+func (o *Orca) WaitIdle(_ context.Context, handle string, _ time.Duration) (bool, string, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	t := o.terminal(handle)
+	if t == nil {
+		return false, "", core.ErrNotFound
+	}
+	if t.blocked != "" {
+		return false, t.blocked, nil
+	}
+	return t.agent != "" && !t.busy && t.waiting == "", "", nil
+}
+
+func (o *Orca) ReadTerminal(_ context.Context, handle, cursor string, limit int) (*core.TerminalOutput, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	t := o.terminal(handle)
+	if t == nil {
+		return nil, core.ErrNotFound
+	}
+	from, _ := strconv.Atoi(cursor)
+	from = min(from, len(t.output))
+	to := len(t.output)
+	if limit > 0 {
+		to = min(to, from+limit)
+	}
+	return &core.TerminalOutput{Lines: slices.Clone(t.output[from:to]), Cursor: strconv.Itoa(to), More: to < len(t.output)}, nil
+}
+
 // AskUser makes the agent in terminal handle wait for its user, as Orca
-// reports it: reason is what it asks.
+// shows it: reason is the evidence Orca reports, core.WaitUnknown when Orca
+// cannot tell.
 func (o *Orca) AskUser(handle, reason string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.terminals[handle].waiting = reason
+}
+
+// Block makes Orca see the agent in terminal handle stopped at reason when
+// it waits for the agent to be idle.
+func (o *Orca) Block(handle, reason string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.terminals[handle].blocked = reason
 }
 
 // Busy puts the agent in terminal handle in a turn, or out of it.
@@ -520,17 +581,14 @@ func (o *Orca) SendPrompt(_ context.Context, handle, text string) ([]string, err
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.calls = append(o.calls, "send "+handle+" "+text)
-	t, ok := o.terminals[handle]
-	if !ok || !t.open {
-		return nil, &core.OrcaError{Code: "terminal_not_found", Message: handle}
+	t := o.terminal(handle)
+	if t == nil {
+		return nil, &core.OrcaError{Code: "terminal_handle_stale", Message: handle}
 	}
 	if o.SilentAgent {
 		return []string{"input_accepted"}, nil
 	}
-	n := len(t.messages)
-	t.messages = append(t.messages,
-		json.RawMessage(fmt.Sprintf(`{"id":"m%d","role":"user","blocks":[{"type":"text","text":%q}]}`, n+1, text)),
-		json.RawMessage(fmt.Sprintf(`{"id":"m%d","role":"assistant","blocks":[{"type":"text","text":%q}]}`, n+2, "echo: "+text)))
+	t.output = append(t.output, "you: "+text, "agent: echo: "+text)
 	return []string{"input_accepted", "turn_started"}, nil
 }
 
@@ -541,65 +599,6 @@ func (o *Orca) CloseTerminal(_ context.Context, handle string) error {
 	if t, ok := o.terminals[handle]; ok {
 		t.open = false
 	}
-	return nil
-}
-
-func (o *Orca) AdoptTerminal(_ context.Context, handle, title string) (string, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.calls = append(o.calls, "adopt "+handle)
-	if o.FailAdopt {
-		return "", &core.OrcaError{Code: "dispatch_failed", Message: "cannot dispatch"}
-	}
-	o.next++
-	id := fmt.Sprintf("ctx-%d", o.next)
-	o.dispatches[id] = handle
-	return id, nil
-}
-
-func (o *Orca) Dispatch(_ context.Context, id string) (*core.Dispatch, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	h, ok := o.dispatches[id]
-	if !ok {
-		return nil, core.ErrNotFound
-	}
-	return &core.Dispatch{ID: id, Terminal: h, Liveness: "live", WaitingOnHuman: o.terminals[h].waiting}, nil
-}
-
-func (o *Orca) Transcript(_ context.Context, id, cursor string, limit int) (*core.Transcript, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	h, ok := o.dispatches[id]
-	if !ok {
-		return nil, core.ErrNotFound
-	}
-	t := o.terminals[h]
-	// Orca reads the transcript through the session the agent reported,
-	// which it forgets when the terminal closes.
-	if len(t.messages) == 0 || !t.open {
-		return nil, core.ErrTranscriptUnavailable
-	}
-	from, _ := strconv.Atoi(cursor)
-	if from > len(t.messages) {
-		from = len(t.messages)
-	}
-	to := len(t.messages)
-	if limit > 0 && from+limit < to {
-		to = from + limit
-	}
-	activity := "done"
-	if t.busy {
-		activity = "working"
-	}
-	return &core.Transcript{Messages: slices.Clone(t.messages[from:to]), Cursor: strconv.Itoa(to), Workspace: t.worktree,
-		Activity: activity, Terminal: "running", Liveness: "live"}, nil
-}
-
-func (o *Orca) StopDispatch(_ context.Context, id string) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.calls = append(o.calls, "stop "+id)
 	return nil
 }
 

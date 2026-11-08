@@ -95,19 +95,21 @@ type Orca interface {
 	// command into its shell, and returns its handle.
 	CreateTerminal(ctx context.Context, worktreeID, title, command string) (string, error)
 	Terminals(ctx context.Context) ([]core.Terminal, error)
+	// ShowTerminal shows one terminal; core.ErrNotFound if Orca has no
+	// terminal with that handle, as once it closed.
+	ShowTerminal(ctx context.Context, handle string) (*core.TerminalStatus, error)
+	// WaitIdle waits up to timeout for the agent in terminal handle to wait
+	// for a prompt, and reports whether it does. Orca may instead see it
+	// stopped at something only a person can answer: blocked says what.
+	WaitIdle(ctx context.Context, handle string, timeout time.Duration) (idle bool, blocked string, err error)
+	// ReadTerminal reads terminal handle's output from cursor (the oldest
+	// line Orca keeps when empty), at most limit lines (0 for Orca's
+	// default).
+	ReadTerminal(ctx context.Context, handle, cursor string, limit int) (*core.TerminalOutput, error)
 	// SendPrompt types and submits text to the agent in terminal handle and
 	// returns the stages Orca observed (input_accepted, turn_started).
 	SendPrompt(ctx context.Context, handle, text string) ([]string, error)
 	CloseTerminal(ctx context.Context, handle string) error
-	// AdoptTerminal makes a terminal a Dispatch, through which Orca reads
-	// the transcript of the agent in it, and returns the Dispatch ID.
-	AdoptTerminal(ctx context.Context, handle, title string) (string, error)
-	// Dispatch shows a Dispatch; core.ErrNotFound if Orca has none.
-	Dispatch(ctx context.Context, id string) (*core.Dispatch, error)
-	// Transcript reads an agent's conversation from cursor (the start when
-	// empty); core.ErrTranscriptUnavailable until Orca can read it.
-	Transcript(ctx context.Context, id, cursor string, limit int) (*core.Transcript, error)
-	StopDispatch(ctx context.Context, id string) error
 }
 
 // Folders creates and removes workspace folders.

@@ -2,21 +2,30 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"slices"
+	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // An agent session is an agent Reach starts in an Orca terminal of a
 // workspace: the agent's configured command is typed into a new terminal,
-// and the terminal is adopted as an Orca Dispatch, through which Orca reads
-// the agent's transcript. Prompts are typed into the terminal. The session
-// ID is the Dispatch ID; Reach keeps nothing about sessions, which outlive
-// the daemon, and only sessions whose terminal runs in a Reach workspace are
-// Reach's.
+// prompts are typed into that terminal, and its output is read back from
+// Orca. The session ID is the terminal's Orca handle; Reach keeps nothing
+// about sessions, which outlive the daemon and end when the terminal closes.
+// Every terminal in a Reach workspace is a session, and no other terminal
+// is.
+
+const (
+	// startWait is how long starting a session waits for the agent to wait
+	// for its first prompt; the remote gateway gives a request 30 s.
+	startWait = 15 * time.Second
+	// idleWait is how long Reach looks for the agent waiting for a prompt
+	// before it reports the agent working.
+	idleWait = 3 * time.Second
+)
 
 // StartAgentSessionRequest starts an agent in a workspace.
 type StartAgentSessionRequest struct {
@@ -26,7 +35,8 @@ type StartAgentSessionRequest struct {
 }
 
 // StartAgentSession starts an agent once per operation ID. The result is the
-// session; a completed workspace is set back in progress.
+// session, once the agent waits for its first prompt or startWait passed; a
+// completed workspace is set back in progress.
 func (s *Service) StartAgentSession(ctx context.Context, c *Client, req StartAgentSessionRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "start_agent_session", WorkspaceID: req.Workspace, Target: req.Agent, OperationID: req.OperationID}
 	w, err := s.authorize(ctx, c, req.Workspace, core.PermAgentRun)
@@ -47,20 +57,32 @@ func (s *Service) StartAgentSession(ctx context.Context, c *Client, req StartAge
 		if err != nil {
 			return nil, err
 		}
-		title := "reach " + req.Agent
-		handle, err := s.orca.CreateTerminal(ctx, root.ID, title, core.ShellCommand(a.Command))
+		handle, err := s.orca.CreateTerminal(ctx, root.ID, "reach "+req.Agent, core.ShellCommand(a.Command))
 		if err != nil {
 			return nil, orcaError(err)
 		}
-		id, err := s.orca.AdoptTerminal(ctx, handle, title)
+		// Until the agent is up, the terminal runs only the shell.
+		_, _, err = s.orca.WaitIdle(ctx, handle, startWait)
+		var sess *core.AgentSession
+		switch {
+		case errors.Is(err, core.ErrNotFound):
+			err = core.Errorf(core.CodeHarnessFailed, "the terminal of agent %q closed as the agent started", req.Agent)
+		case err != nil:
+			err = orcaError(err)
+		default:
+			sess, err = s.agentSession(ctx, handle)
+			if err == nil && sess.State == core.AgentExited {
+				err = core.Errorf(core.CodeHarnessFailed, "agent %q did not start in its terminal; check its command", req.Agent)
+			}
+		}
 		if err != nil {
 			if cerr := s.orca.CloseTerminal(ctx, handle); cerr != nil {
-				slog.Warn("cannot close the terminal of an agent Orca could not adopt", "terminal", handle, "err", cerr)
+				slog.Warn("cannot close the terminal of an agent that failed to start", "terminal", handle, "err", cerr)
 			}
-			return nil, orcaError(err)
+			return nil, err
 		}
 		s.reopen(ctx, req.Workspace)
-		return &core.AgentSession{ID: id, Workspace: req.Workspace, Terminal: handle}, nil
+		return sess, nil
 	})
 }
 
@@ -96,35 +118,29 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 	}
 	ctx = context.WithoutCancel(ctx)
 	return s.operation(c, "send_agent_prompt", req.OperationID, req, rec, func() (any, error) {
-		sess, release, err := s.useSession(ctx, req.SessionID)
+		t, release, err := s.useSession(ctx, req.SessionID)
 		if err != nil {
 			return nil, err
 		}
 		defer release()
-		switch {
-		case sess.Terminal == "":
-			return nil, core.Errorf(core.CodeInvalidState, "session %q has ended", req.SessionID)
-		case sess.Agent == "":
-			// Without an agent the terminal runs a shell, which would run the
-			// prompt as a command.
+		// Without an agent the terminal runs a shell, which would run the
+		// prompt as a command. While the agent asks its user something, such
+		// as a permission, or Orca cannot tell, the prompt would answer it;
+		// the answer is the user's, in Orca. During a turn the agent could
+		// ask just before the prompt arrives.
+		state, err := s.agentState(ctx, t)
+		if err != nil {
+			return nil, err
+		}
+		switch state {
+		case core.AgentExited:
 			return nil, core.Errorf(core.CodeInvalidState, "the agent of session %q is no longer running in its terminal", req.SessionID)
-		case sess.WaitingOnHuman != "":
-			// Orca saw the agent ask its user something, such as a permission,
-			// or could not tell ("unknown"); the answer is the user's, in Orca.
-			return nil, core.Errorf(core.CodeInvalidState, "the agent may be waiting for the user in Orca: %s", sess.WaitingOnHuman)
+		case core.AgentWaitingOnHuman:
+			return nil, core.Errorf(core.CodeInvalidState, "the agent may be waiting for the user in Orca: %s", t.WaitingOnHuman)
+		case core.AgentWorking:
+			return nil, core.Errorf(core.CodeInvalidState, "the agent is not waiting for a prompt: read_agent_output until state is idle")
 		}
-		// During a turn the agent may ask its user something before the prompt
-		// arrives, and the prompt would answer it. Before its first prompt the
-		// agent has reported no session to Orca, so it has started no turn.
-		tr, err := s.orca.Transcript(ctx, req.SessionID, "", 1)
-		switch {
-		case errors.Is(err, core.ErrTranscriptUnavailable):
-		case err != nil:
-			return nil, orcaError(err)
-		case tr.Activity != "done":
-			return nil, core.Errorf(core.CodeInvalidState, "the agent is not waiting for a prompt (activity %q): read_agent_messages until activity is done", tr.Activity)
-		}
-		stages, err := s.orca.SendPrompt(ctx, sess.Terminal, req.Text)
+		stages, err := s.orca.SendPrompt(ctx, req.SessionID, req.Text)
 		if err != nil {
 			return nil, orcaError(err)
 		}
@@ -135,69 +151,54 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 	})
 }
 
-// ReadAgentMessagesRequest reads a session's conversation after Cursor (from
-// the start when empty).
-type ReadAgentMessagesRequest struct {
+// ReadAgentOutputRequest reads a session's terminal output after Cursor
+// (from the oldest line Orca keeps when empty).
+type ReadAgentOutputRequest struct {
 	SessionID string `json:"session_id"`
 	Cursor    string `json:"cursor"`
 	Limit     int    `json:"limit"`
 }
 
-// AgentMessages is a part of a session's conversation, in Orca's form, with
-// the cursor to read on from and the agent's status. Activity is "done"
-// while the agent waits for a prompt.
-type AgentMessages struct {
-	Messages []json.RawMessage `json:"messages"`
-	Cursor   string            `json:"cursor"`
-	Activity string            `json:"activity,omitempty"`
-	Terminal string            `json:"terminal,omitempty"`
-	Liveness string            `json:"liveness,omitempty"`
+// AgentOutput is a part of a session's terminal output, with what the agent
+// does: once State is idle, the output of its turn has been written.
+type AgentOutput struct {
+	core.TerminalOutput
+	State          string `json:"state"`
+	WaitingOnHuman string `json:"waiting_on_human,omitempty"`
 }
 
-const maxAgentMessages = 1000
+const maxAgentOutputLines = 1000
 
-// ReadAgentMessages reads a session's transcript from Orca.
-func (s *Service) ReadAgentMessages(ctx context.Context, c *Client, req ReadAgentMessagesRequest) (out *AgentMessages, err error) {
-	rec := core.AuditRecord{ClientID: c.ID, Action: "read_agent_messages", Target: req.SessionID}
+// ReadAgentOutput reads a session's terminal output from Orca.
+func (s *Service) ReadAgentOutput(ctx context.Context, c *Client, req ReadAgentOutputRequest) (out *AgentOutput, err error) {
+	rec := core.AuditRecord{ClientID: c.ID, Action: "read_agent_output", Target: req.SessionID}
 	defer func() { s.audit(rec, err) }()
 	switch {
 	case !slices.Contains(c.perms, core.PermAgentRun):
 		return nil, core.Errorf(core.CodePermissionDenied, "%s is not allowed", core.PermAgentRun)
-	case req.Limit < 0 || req.Limit > maxAgentMessages:
-		return nil, core.Errorf(core.CodeInvalidRequest, "limit must be between 0 and %d", maxAgentMessages)
+	case req.Limit < 0 || req.Limit > maxAgentOutputLines:
+		return nil, core.Errorf(core.CodeInvalidRequest, "limit must be between 0 and %d", maxAgentOutputLines)
 	}
-	tr, err := s.orca.Transcript(ctx, req.SessionID, req.Cursor, req.Limit)
-	if errors.Is(err, core.ErrTranscriptUnavailable) {
-		// The agent has not reported its session yet: nothing to read.
-		sess, release, err := s.useSession(ctx, req.SessionID)
-		if err != nil {
-			return nil, err
-		}
-		release()
-		rec.WorkspaceID = sess.Workspace
-		return &AgentMessages{Messages: []json.RawMessage{}, Cursor: req.Cursor, Liveness: sess.Liveness}, nil
+	t, release, err := s.useSession(ctx, req.SessionID)
+	if err != nil {
+		return nil, err
 	}
+	defer release()
+	rec.WorkspaceID = core.WorkspaceOfEntry(t.WorktreeID)
+	// The state comes first: output read after the agent was seen idle holds
+	// all of its turn.
+	state, err := s.agentState(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	o, err := s.orca.ReadTerminal(ctx, req.SessionID, req.Cursor, req.Limit)
 	if errors.Is(err, core.ErrNotFound) {
 		return nil, sessionNotFound(req.SessionID)
 	}
 	if err != nil {
 		return nil, orcaError(err)
 	}
-	id := core.WorkspaceOfEntry(tr.Workspace)
-	release, ok := s.use(id)
-	if !ok {
-		return nil, core.Errorf(core.CodeInvalidState, "workspace is being removed")
-	}
-	defer release()
-	if _, err := s.repo(ctx, id); err != nil {
-		return nil, sessionNotFound(req.SessionID)
-	}
-	rec.WorkspaceID = id
-	cursor := tr.Cursor
-	if cursor == "" {
-		cursor = req.Cursor
-	}
-	return &AgentMessages{Messages: tr.Messages, Cursor: cursor, Activity: tr.Activity, Terminal: tr.Terminal, Liveness: tr.Liveness}, nil
+	return &AgentOutput{TerminalOutput: *o, State: state, WaitingOnHuman: t.WaitingOnHuman}, nil
 }
 
 // AgentSessionRequest identifies a session.
@@ -212,13 +213,11 @@ func (s *Service) GetAgentSession(ctx context.Context, c *Client, req AgentSessi
 	if !slices.Contains(c.perms, core.PermAgentRun) {
 		return nil, core.Errorf(core.CodePermissionDenied, "%s is not allowed", core.PermAgentRun)
 	}
-	a, release, err := s.useSession(ctx, req.SessionID)
-	if err != nil {
-		return nil, err
+	a, err = s.agentSession(ctx, req.SessionID)
+	if a != nil {
+		rec.WorkspaceID = a.Workspace
 	}
-	release()
-	rec.WorkspaceID = a.Workspace
-	return a, nil
+	return a, err
 }
 
 // StopAgentSessionRequest ends a session.
@@ -244,70 +243,89 @@ func (s *Service) StopAgentSession(ctx context.Context, c *Client, req StopAgent
 	}
 	ctx = context.WithoutCancel(ctx)
 	return s.operation(c, "stop_agent_session", req.OperationID, req, rec, func() (any, error) {
-		sess, release, err := s.useSession(ctx, req.SessionID)
+		_, release, err := s.useSession(ctx, req.SessionID)
 		if err != nil {
 			return nil, err
 		}
 		defer release()
-		if err := s.orca.StopDispatch(ctx, req.SessionID); err != nil {
-			slog.Warn("cannot stop the Dispatch of an agent session", "session", req.SessionID, "err", err)
-		}
-		if sess.Terminal != "" {
-			if err := s.orca.CloseTerminal(ctx, sess.Terminal); err != nil {
-				return nil, orcaError(err)
-			}
+		if err := s.orca.CloseTerminal(ctx, req.SessionID); err != nil {
+			return nil, orcaError(err)
 		}
 		return StopResult{SessionID: req.SessionID, Stopped: true}, nil
 	})
 }
 
-// session reads session id from Orca. While its terminal is open, the
-// terminal must run in a Reach workspace; once it is closed, the transcript
-// must. Otherwise the session is not found.
-func (s *Service) session(ctx context.Context, id string) (*core.AgentSession, error) {
-	d, err := s.orca.Dispatch(ctx, id)
+// agentSession reads session id from Orca, with what its agent does.
+func (s *Service) agentSession(ctx context.Context, id string) (*core.AgentSession, error) {
+	t, release, err := s.useSession(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	state, err := s.agentState(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	return &core.AgentSession{ID: id, Workspace: core.WorkspaceOfEntry(t.WorktreeID), Agent: t.AgentIdentity, State: state, WaitingOnHuman: t.WaitingOnHuman}, nil
+}
+
+// agentState tells what the agent in terminal t does. Orca tells a question
+// to the user from a turn only through what it saw of the wait, and an
+// agent waiting for a prompt only by seeing it idle within idleWait.
+func (s *Service) agentState(ctx context.Context, t *core.TerminalStatus) (string, error) {
+	switch {
+	case t.AgentIdentity == "":
+		return core.AgentExited, nil
+	case t.WaitingOnHuman != "":
+		return core.AgentWaitingOnHuman, nil
+	}
+	idle, blocked, err := s.orca.WaitIdle(ctx, t.Handle, idleWait)
+	switch {
+	case errors.Is(err, core.ErrNotFound):
+		return "", sessionNotFound(t.Handle)
+	case err != nil:
+		return "", orcaError(err)
+	case blocked != "":
+		t.WaitingOnHuman = blocked
+		return core.AgentWaitingOnHuman, nil
+	case idle:
+		return core.AgentIdle, nil
+	}
+	return core.AgentWorking, nil
+}
+
+// session reads the terminal of session id from Orca. It must be open in a
+// Reach workspace; otherwise the session is not found.
+func (s *Service) session(ctx context.Context, id string) (*core.TerminalStatus, error) {
+	t, err := s.orca.ShowTerminal(ctx, id)
 	if errors.Is(err, core.ErrNotFound) {
 		return nil, sessionNotFound(id)
 	}
 	if err != nil {
 		return nil, orcaError(err)
 	}
-	terms, err := s.orca.Terminals(ctx)
-	if err != nil {
-		return nil, orcaError(err)
-	}
-	sess := &core.AgentSession{ID: id, Liveness: d.Liveness, WaitingOnHuman: d.WaitingOnHuman}
-	for _, t := range terms {
-		if t.Handle == d.Terminal && t.Connected && d.Terminal != "" {
-			sess.Workspace, sess.Terminal, sess.Agent = core.WorkspaceOfEntry(t.WorktreeID), t.Handle, t.AgentIdentity
-		}
-	}
-	if sess.Workspace == "" {
-		tr, err := s.orca.Transcript(ctx, id, "", 1)
-		if err != nil {
-			return nil, sessionNotFound(id)
-		}
-		sess.Workspace = core.WorkspaceOfEntry(tr.Workspace)
-	}
-	if _, err := s.repo(ctx, sess.Workspace); err != nil {
+	if !t.Connected || t.Handle != id {
 		return nil, sessionNotFound(id)
 	}
-	return sess, nil
+	if _, err := s.repo(ctx, core.WorkspaceOfEntry(t.WorktreeID)); err != nil {
+		return nil, sessionNotFound(id)
+	}
+	return t, nil
 }
 
 // useSession reads session id like session and holds its workspace, as a
 // request holding it, until release; it fails while cleanup removes the
 // workspace.
-func (s *Service) useSession(ctx context.Context, id string) (*core.AgentSession, func(), error) {
-	sess, err := s.session(ctx, id)
+func (s *Service) useSession(ctx context.Context, id string) (*core.TerminalStatus, func(), error) {
+	t, err := s.session(ctx, id)
 	if err != nil {
 		return nil, nil, err
 	}
-	release, ok := s.use(sess.Workspace)
+	release, ok := s.use(core.WorkspaceOfEntry(t.WorktreeID))
 	if !ok {
 		return nil, nil, core.Errorf(core.CodeInvalidState, "workspace is being removed")
 	}
-	return sess, release, nil
+	return t, release, nil
 }
 
 func sessionNotFound(id string) error {

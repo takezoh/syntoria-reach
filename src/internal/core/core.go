@@ -59,9 +59,6 @@ var (
 	ErrVersionConflict = errors.New("version conflict")
 	ErrNotRegular      = errors.New("unexpected file type")
 	ErrJobNotRunning   = errors.New("job is not running")
-	// ErrTranscriptUnavailable means Orca cannot read an agent's transcript
-	// yet: the agent has not reported its session.
-	ErrTranscriptUnavailable = errors.New("agent transcript is not available yet")
 )
 
 // Operation states. StateUnknown marks an operation whose outcome could not
@@ -245,35 +242,43 @@ type Terminal struct {
 	AgentIdentity string `json:"agentIdentity"`
 }
 
-// Dispatch is an Orca orchestration Dispatch, as Orca reports it. Reach
-// adopts the terminal of each agent it starts as a Dispatch, which is how
-// Orca reads the agent's transcript.
-type Dispatch struct {
-	ID             string `json:"dispatchId"`
-	Terminal       string `json:"terminal"`
-	Liveness       string `json:"liveness"`
-	WaitingOnHuman string `json:"waitingOnHuman"`
+// TerminalStatus is one terminal as Orca shows it. WaitingOnHuman is what
+// Orca saw the agent in it wait for from its user, such as a permission:
+// empty when Orca looked and saw nothing, WaitUnknown when it did not look.
+type TerminalStatus struct {
+	Terminal
+	WaitingOnHuman string
 }
 
-// Transcript is a part of an agent's conversation as Orca reads it: the
-// messages in Orca's form, the cursor to read on from, and the agent's
-// status.
-type Transcript struct {
-	Messages  []json.RawMessage
-	Cursor    string
-	Workspace string // ID of the workspace entry the agent runs in
-	Activity  string // Orca's: done while the agent waits for a prompt
-	Terminal  string // running, exited or unknown
-	Liveness  string
+// WaitUnknown is TerminalStatus.WaitingOnHuman when Orca could not tell
+// whether the agent waits for its user.
+const WaitUnknown = "unknown"
+
+// TerminalOutput is a part of a terminal's output as Orca reads it: lines
+// without escape sequences, the cursor to read on from, whether more lines
+// follow, and whether lines before the requested cursor are no longer kept.
+type TerminalOutput struct {
+	Lines     []string `json:"lines"`
+	Cursor    string   `json:"cursor"`
+	More      bool     `json:"more"`
+	Truncated bool     `json:"truncated"`
 }
+
+// What an agent in a session does, as Orca observes it.
+const (
+	AgentIdle           = "idle"             // waits for a prompt
+	AgentWorking        = "working"          // in a turn, or not yet ready
+	AgentWaitingOnHuman = "waiting_on_human" // asks its user something, in Orca
+	AgentExited         = "exited"           // no agent runs in the terminal: a shell
+)
 
 // AgentSession is an agent Reach started in an Orca terminal of a
-// workspace. Its ID is the Orca Dispatch ID; Reach keeps nothing about it.
+// workspace. Its ID is the terminal's Orca handle; Reach keeps nothing about
+// it, and it ends when the terminal closes.
 type AgentSession struct {
 	ID             string `json:"session_id"`
 	Workspace      string `json:"workspace"`
-	Terminal       string `json:"terminal,omitempty"` // empty once the terminal is closed
-	Agent          string `json:"agent,omitempty"`    // the agent Orca sees running in it, if any
-	Liveness       string `json:"liveness,omitempty"`
+	Agent          string `json:"agent,omitempty"` // the agent Orca sees running in it, if any
+	State          string `json:"state"`
 	WaitingOnHuman string `json:"waiting_on_human,omitempty"`
 }

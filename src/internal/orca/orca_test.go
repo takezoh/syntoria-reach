@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
@@ -120,33 +121,26 @@ func TestAgentTerminal(t *testing.T) {
 	if terms, err := cli.Terminals(ctx); err != nil || len(terms) != 1 || terms[0] != (core.Terminal{Handle: h, WorktreeID: entry, Connected: true, AgentIdentity: "claude"}) {
 		t.Fatalf("terminals = %+v %v", terms, err)
 	}
-	id, err := cli.AdoptTerminal(ctx, h, "reach claude")
-	if err != nil || id == "" {
-		t.Fatalf("adopt: %q %v", id, err)
+	want := core.TerminalStatus{Terminal: core.Terminal{Handle: h, WorktreeID: entry, Connected: true, AgentIdentity: "claude"}}
+	if st, err := cli.ShowTerminal(ctx, h); err != nil || *st != want {
+		t.Fatalf("show = %+v %v", st, err)
 	}
-	if d, err := cli.Dispatch(ctx, id); err != nil || d.Terminal != h || d.Liveness != "live" {
-		t.Fatalf("dispatch = %+v %v", d, err)
+	if idle, blocked, err := cli.WaitIdle(ctx, h, 3*time.Second); err != nil || !idle || blocked != "" {
+		t.Fatalf("wait = %v %q %v", idle, blocked, err)
 	}
-	// Nothing is readable before the agent reported its session.
-	if _, err := cli.Transcript(ctx, id, "", 0); !errors.Is(err, core.ErrTranscriptUnavailable) {
-		t.Fatalf("transcript before a prompt: %v", err)
+	if out, err := cli.ReadTerminal(ctx, h, "", 0); err != nil || len(out.Lines) != 0 || out.Cursor != "0" || out.More {
+		t.Fatalf("output before a prompt = %+v %v", out, err)
 	}
 	// A prompt starting with "--" stays the text.
 	if stages, err := cli.SendPrompt(ctx, h, "--hello"); err != nil || strings.Join(stages, ",") != "input_accepted,turn_started" {
 		t.Fatalf("send: %q %v", stages, err)
 	}
-	tr, err := cli.Transcript(ctx, id, "", 0)
-	if err != nil || len(tr.Messages) != 2 || tr.Workspace != entry || tr.Activity != "done" || tr.Terminal != "running" || tr.Cursor == "" {
-		t.Fatalf("transcript = %+v %v", tr, err)
+	out, err := cli.ReadTerminal(ctx, h, "", 1)
+	if err != nil || strings.Join(out.Lines, "|") != "you: --hello" || out.Cursor != "1" || !out.More {
+		t.Fatalf("first line = %+v %v", out, err)
 	}
-	if !strings.Contains(string(tr.Messages[1]), "echo: --hello") {
-		t.Fatalf("reply = %s", tr.Messages[1])
-	}
-	if more, err := cli.Transcript(ctx, id, tr.Cursor, 10); err != nil || len(more.Messages) != 0 {
-		t.Fatalf("read on: %+v %v", more, err)
-	}
-	if err := cli.StopDispatch(ctx, id); err != nil {
-		t.Fatal(err)
+	if out, err = cli.ReadTerminal(ctx, h, out.Cursor, 0); err != nil || strings.Join(out.Lines, "|") != "claude: echo: --hello" || out.Cursor != "2" || out.More {
+		t.Fatalf("read on = %+v %v", out, err)
 	}
 	if err := cli.CloseTerminal(ctx, h); err != nil {
 		t.Fatal(err)
@@ -154,20 +148,75 @@ func TestAgentTerminal(t *testing.T) {
 	if terms, _ := cli.Terminals(ctx); len(terms) != 0 {
 		t.Fatalf("closed terminal listed: %+v", terms)
 	}
-	if _, err := cli.Dispatch(ctx, "ctx_nope"); !errors.Is(err, core.ErrNotFound) {
-		t.Fatalf("unknown dispatch: %v", err)
+	// Orca no longer has the handle of a closed terminal.
+	if _, err := cli.ShowTerminal(ctx, h); !errors.Is(err, core.ErrNotFound) {
+		t.Fatalf("show a closed terminal: %v", err)
+	}
+	if _, _, err := cli.WaitIdle(ctx, h, time.Second); !errors.Is(err, core.ErrNotFound) {
+		t.Fatalf("wait on a closed terminal: %v", err)
+	}
+	if _, err := cli.ReadTerminal(ctx, h, "0", 0); !errors.Is(err, core.ErrNotFound) {
+		t.Fatalf("read a closed terminal: %v", err)
 	}
 	calls := orcatest.Calls(t, root)
 	for _, want := range []string{
 		"terminal create --worktree id:" + entry + " --title reach claude --command /bin/claude --model 'opus x' --json",
-		"orchestration dispatch --task ",
+		"terminal show --terminal " + h + " --json",
+		"terminal wait --terminal " + h + " --for tui-idle --timeout-ms 3000 --json",
+		"terminal read --terminal " + h + " --cursor 0 --json",
+		"terminal read --terminal " + h + " --cursor 0 --limit 1 --json",
 		"terminal send --terminal " + h + " --text=--hello --enter --wait-submit 30 --json",
-		"orchestration worker-read --dispatch " + id + " --source transcript --json",
-		"orchestration worker-stop --dispatch " + id + " --json",
 		"terminal close --terminal " + h + " --json",
 	} {
 		if !strings.Contains(calls, want) {
 			t.Errorf("missing call %q in:\n%s", want, calls)
 		}
+	}
+}
+
+// answering is an Orca CLI that answers every call with $REPLY_JSON.
+var answering = &CLI{Command: []string{"/bin/sh", "-c", `printf '%s\n' "$REPLY_JSON"`, "sh"}}
+
+// What Orca saw the agent wait for, and the answers of tui-idle, as the
+// real Orca reports them.
+func TestTerminalWaits(t *testing.T) {
+	ctx := context.Background()
+	show := func(wait string) string {
+		return `{"ok":true,"result":{"terminal":{"handle":"term_1","worktreeId":"r::/w","connected":true,"agentIdentity":"claude"` + wait + `}}}`
+	}
+	for reply, want := range map[string]string{
+		show(`,"agentWait":null`): "",
+		show(``):                  core.WaitUnknown, // Orca did not look
+		show(`,"agentWait":{"source":"hook","since":1794132705694}`):         "hook",
+		show(`,"agentWait":{"source":"prompt-text","reason":"Allow Bash?"}`): "Allow Bash? (prompt-text)",
+	} {
+		t.Setenv("REPLY_JSON", reply)
+		if st, err := answering.ShowTerminal(ctx, "term_1"); err != nil || st.WaitingOnHuman != want || st.AgentIdentity != "claude" {
+			t.Errorf("%s: %+v %v", reply, st, err)
+		}
+	}
+	// A shell is not an agent: Orca reports no agent identity.
+	t.Setenv("REPLY_JSON", `{"ok":true,"result":{"terminal":{"handle":"term_1","worktreeId":"r::/w","connected":true,"agentIdentity":null,"agentWait":null}}}`)
+	if st, err := answering.ShowTerminal(ctx, "term_1"); err != nil || st.AgentIdentity != "" || st.WaitingOnHuman != "" {
+		t.Errorf("shell: %+v %v", st, err)
+	}
+	// An agent in a turn, or at a permission prompt, is not idle by the
+	// deadline; Orca answers timeout.
+	t.Setenv("REPLY_JSON", `{"ok":false,"error":{"code":"timeout","message":"timeout"}}`)
+	if idle, blocked, err := answering.WaitIdle(ctx, "term_1", time.Second); err != nil || idle || blocked != "" {
+		t.Errorf("timeout: %v %q %v", idle, blocked, err)
+	}
+	t.Setenv("REPLY_JSON", `{"ok":true,"result":{"wait":{"handle":"term_1","condition":"tui-idle","satisfied":false,"status":"running","exitCode":null,"blockedReason":"permission"}}}`)
+	if idle, blocked, err := answering.WaitIdle(ctx, "term_1", time.Second); err != nil || idle || blocked != "permission" {
+		t.Errorf("blocked: %v %q %v", idle, blocked, err)
+	}
+	t.Setenv("REPLY_JSON", `{"ok":false,"error":{"code":"terminal_exited","message":"terminal_exited"}}`)
+	if _, _, err := answering.WaitIdle(ctx, "term_1", time.Second); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("exited: %v", err)
+	}
+	// Without line cursors Orca returns no next cursor: read on from the same.
+	t.Setenv("REPLY_JSON", `{"ok":true,"result":{"terminal":{"handle":"term_1","status":"running","tail":[],"truncated":true,"nextCursor":null}}}`)
+	if out, err := answering.ReadTerminal(ctx, "term_1", "7", 0); err != nil || out.Cursor != "7" || !out.Truncated || out.Lines == nil {
+		t.Errorf("no cursors: %+v %v", out, err)
 	}
 }
