@@ -38,9 +38,9 @@ func (f *fixture) prompt(t *testing.T, opID, session, text string) *core.Operati
 	return op
 }
 
-func (f *fixture) read(t *testing.T, session, cursor string, limit int) *service.AgentOutput {
+func (f *fixture) read(t *testing.T, session string) *service.AgentOutput {
 	t.Helper()
-	o, err := f.svc.ReadAgentOutput(context.Background(), f.a, service.ReadAgentOutputRequest{SessionID: session, Cursor: cursor, Limit: limit})
+	o, err := f.svc.ReadAgentOutput(context.Background(), f.a, service.ReadAgentOutputRequest{SessionID: session})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,35 +118,35 @@ func TestAgentConversation(t *testing.T) {
 	ctx := context.Background()
 	s := f.startSession(t, "s", service.StartAgentSessionRequest{})
 
-	if o := f.read(t, s.ID, "", 0); len(o.Lines) != 0 || o.Cursor != "0" || o.State != core.AgentIdle {
+	if o := f.read(t, s.ID); o.Reply != "" || o.State != core.AgentIdle {
 		t.Fatalf("before any prompt: %+v", o)
 	}
 	op := f.prompt(t, "p1", s.ID, "hello")
 	if r := result[service.PromptResult](t, op); op.State != core.StateSucceeded || strings.Join(r.Stages, ",") != "input_accepted,turn_started" {
 		t.Fatalf("prompt: %+v", op)
 	}
-	o := f.read(t, s.ID, "", 0)
-	if strings.Join(o.Lines, "|") != "you: hello|agent: echo: hello" || o.State != core.AgentIdle || o.More {
-		t.Fatalf("output: %+v", o)
+	if o := f.read(t, s.ID); o.Reply != "echo: hello" || o.State != core.AgentIdle || o.ReplyTruncated {
+		t.Fatalf("reply: %+v", o)
 	}
-	// The cursor reads on from there; a resent prompt is not typed again.
-	if more := f.read(t, s.ID, o.Cursor, 0); len(more.Lines) != 0 || more.Cursor != o.Cursor {
-		t.Fatalf("read on: %+v", more)
-	}
+	// A resent prompt is not typed again.
 	f.prompt(t, "p1", s.ID, "hello")
-	if o := f.read(t, s.ID, "", 0); len(o.Lines) != 2 {
-		t.Fatalf("the resent prompt was typed again: %q", o.Lines)
+	if n := f.sends(s.ID); n != 1 {
+		t.Fatalf("the prompt was typed %d times", n)
 	}
-	// A limited read says more follows.
-	if o := f.read(t, s.ID, "", 1); len(o.Lines) != 1 || !o.More {
-		t.Fatalf("limited read: %+v", o)
+	// The terminal can look idle before the agent's status hooks report
+	// that the turn ended. Until they do, the reply is not there yet: the
+	// agent is working, and takes no prompt.
+	f.fakes.Orca.Hooks(s.ID, core.AgentTurn{Running: true})
+	if o := f.read(t, s.ID); o.State != core.AgentWorking || o.Reply != "" {
+		t.Fatalf("before the hooks report the end of the turn: %+v", o)
 	}
-	if _, err := f.svc.ReadAgentOutput(ctx, f.a, service.ReadAgentOutputRequest{SessionID: s.ID, Limit: 1001}); code(err) != core.CodeInvalidRequest {
-		t.Fatalf("limit over the maximum: %v", err)
+	if op := f.prompt(t, "p-early", s.ID, "next"); op.ErrorCode != core.CodeInvalidState || f.sends(s.ID) != 1 {
+		t.Fatalf("prompt before the hooks report the end of the turn: %+v", op)
 	}
-	// A cursor is one Orca returned, never text for Orca's command line.
-	if _, err := f.svc.ReadAgentOutput(ctx, f.a, service.ReadAgentOutputRequest{SessionID: s.ID, Cursor: "--terminal=term-9"}); code(err) != core.CodeInvalidRequest {
-		t.Fatalf("cursor that looks like a flag: %v", err)
+	// A reply as long as Orca keeps may be cut, and says so.
+	f.fakes.Orca.Hooks(s.ID, core.AgentTurn{Reply: "long", Truncated: true})
+	if o := f.read(t, s.ID); o.State != core.AgentIdle || o.Reply != "long" || !o.ReplyTruncated {
+		t.Fatalf("cut reply: %+v", o)
 	}
 	if _, err := f.svc.SendAgentPrompt(ctx, f.a, service.SendAgentPromptRequest{OperationID: "p2", SessionID: s.ID, Text: " "}); code(err) != core.CodeInvalidRequest {
 		t.Fatalf("empty prompt: %v", err)
@@ -215,7 +215,7 @@ func TestPromptsReachOnlyTheAgent(t *testing.T) {
 		if op := f.prompt(t, "p-"+name, s.ID, "yes"); op.State != core.StateFailed || op.ErrorCode != core.CodeInvalidState {
 			t.Errorf("%s: prompt %+v", name, op)
 		}
-		if o := f.read(t, s.ID, "", 0); o.State != core.AgentWaitingOnHuman || o.WaitingOnHuman == "" {
+		if o := f.read(t, s.ID); o.State != core.AgentWaitingOnHuman || o.WaitingOnHuman == "" {
 			t.Errorf("%s: read %+v", name, o)
 		}
 		f.fakes.Orca.AskUser(s.ID, "")
@@ -230,12 +230,16 @@ func TestPromptsReachOnlyTheAgent(t *testing.T) {
 	if op := f.prompt(t, "p-busy", s.ID, "and then"); op.State != core.StateFailed || op.ErrorCode != core.CodeInvalidState || f.sends(s.ID) != 0 {
 		t.Fatalf("prompt during a turn: %+v, %d sends", op, f.sends(s.ID))
 	}
-	if o := f.read(t, s.ID, "", 0); o.State != core.AgentWorking {
+	// Only a finished turn has a reply.
+	if o := f.read(t, s.ID); o.State != core.AgentWorking || o.Reply != "" {
 		t.Fatalf("read during a turn: %+v", o)
 	}
 	f.fakes.Orca.Busy(s.ID, false)
 	if op := f.prompt(t, "p-done", s.ID, "and then"); op.State != core.StateSucceeded {
 		t.Fatalf("prompt once the turn is done: %+v", op)
+	}
+	if o := f.read(t, s.ID); o.State != core.AgentIdle || o.Reply != "echo: and then" {
+		t.Fatalf("reply once the turn is done: %+v", o)
 	}
 }
 

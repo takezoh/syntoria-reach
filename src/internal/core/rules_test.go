@@ -297,17 +297,3 @@ func TestCheckPrompt(t *testing.T) {
 		}
 	}
 }
-
-func TestCheckCursor(t *testing.T) {
-	for _, ok := range []string{"", "0", "547", strings.Repeat("9", 18)} {
-		if err := CheckCursor(ok); err != nil {
-			t.Errorf("CheckCursor(%q) = %v", ok, err)
-		}
-	}
-	// Never a flag or another value for Orca's command line.
-	for _, bad := range []string{"-1", "--terminal=term_other", "--environment", "1 2", "1e3", "+1", "٣", strings.Repeat("9", 19)} {
-		if err := CheckCursor(bad); err == nil {
-			t.Errorf("CheckCursor(%q) accepted", bad)
-		}
-	}
-}

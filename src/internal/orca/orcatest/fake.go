@@ -5,8 +5,8 @@
 // comment) is removed only with --force, removing a project leaves its
 // folder on disk, and a terminal that is closed or was never there is
 // terminal_handle_stale. The agent in every terminal is idle at its prompt
-// and answers a prompt with the output lines "you: <prompt>" and
-// "claude: echo: <prompt>".
+// and replies to a prompt with "echo: <prompt>", which its status hooks
+// report to Orca (worktree ps).
 package orcatest
 
 import (
@@ -59,12 +59,16 @@ type worktree struct {
 
 // terminal is a terminal whose agent echoes every prompt.
 type terminal struct {
-	Handle   string   `json:"handle"`
-	Worktree string   `json:"worktreeId"`
-	Command  string   `json:"command"`
-	Open     bool     `json:"open"`
-	Output   []string `json:"output"`
+	Handle   string `json:"handle"`
+	Worktree string `json:"worktreeId"`
+	Command  string `json:"command"`
+	Open     bool   `json:"open"`
+	Reply    string `json:"reply"` // the agent's last message; empty before the first prompt
 }
+
+// TabID and LeafID place terminal handle in Orca's layout.
+func TabID(handle string) string  { return "tab_" + handle }
+func LeafID(handle string) string { return "leaf_" + handle }
 
 type state struct {
 	Next      int                  `json:"next"`
@@ -188,31 +192,46 @@ func MaybeRun() {
 		ok(map[string]any{"terminals": list, "totalCount": len(list), "truncated": false})
 	case "terminal show":
 		t := findTerminal()
-		ok(map[string]any{"terminal": map[string]any{"handle": t.Handle, "worktreeId": t.Worktree, "connected": true, "agentIdentity": "claude", "agentWait": nil}})
+		ok(map[string]any{"terminal": map[string]any{"handle": t.Handle, "worktreeId": t.Worktree, "connected": true, "agentIdentity": "claude", "agentWait": nil,
+			"tabId": TabID(t.Handle), "leafId": LeafID(t.Handle)}})
 	case "terminal wait":
 		t := findTerminal()
 		if flag(args, "--for") != "tui-idle" || flag(args, "--timeout-ms") == "" {
 			fail("invalid_argument", strings.Join(args, " "))
 		}
 		ok(map[string]any{"wait": map[string]any{"handle": t.Handle, "condition": "tui-idle", "satisfied": true, "status": "running", "exitCode": nil}})
-	case "terminal read":
-		t := findTerminal()
-		// Orca's cursor counts completed lines; without one it reads the tail.
-		if !has(args, "--cursor") {
-			fail("unsupported", "the fake reads only by cursor")
+	case "worktree ps":
+		// Orca's agent status: every agent by the pane key of its terminal.
+		agents := map[string][]map[string]any{}
+		for _, t := range st.Terminals {
+			if !t.Open {
+				continue
+			}
+			var reply any
+			if t.Reply != "" {
+				reply = t.Reply
+			}
+			agents[t.Worktree] = append(agents[t.Worktree], map[string]any{"paneKey": TabID(t.Handle) + ":" + LeafID(t.Handle), "agentType": "claude",
+				"state": "done", "mainAgent": map[string]any{"state": "done"}, "lastAssistantMessage": reply, "hasLivePty": true})
 		}
-		from, _ := strconv.Atoi(flag(args, "--cursor"))
-		from = min(from, len(t.Output))
-		to := len(t.Output)
-		if limit, _ := strconv.Atoi(flag(args, "--limit")); limit > 0 {
-			to = min(to, from+limit)
+		rows := []map[string]any{}
+		for _, w := range st.Worktrees {
+			rows = append(rows, map[string]any{"worktreeId": w.ID, "path": w.Path, "agents": agents[w.ID]})
+			delete(agents, w.ID)
 		}
-		ok(map[string]any{"terminal": map[string]any{"handle": t.Handle, "status": "running", "tail": t.Output[from:to], "truncated": false,
-			"limited": to < len(t.Output), "oldestCursor": "0", "nextCursor": strconv.Itoa(to), "latestCursor": strconv.Itoa(len(t.Output)), "source": "stream"}})
+		for id, a := range agents { // terminals of entries the fake does not keep
+			rows = append(rows, map[string]any{"worktreeId": id, "agents": a})
+		}
+		limit, _ := strconv.Atoi(flag(args, "--limit"))
+		truncated := limit > 0 && len(rows) > limit
+		if truncated {
+			rows = rows[:limit]
+		}
+		ok(map[string]any{"worktrees": rows, "totalCount": len(rows), "truncated": truncated})
 	case "terminal send":
 		t := findTerminal()
 		text := flag(args, "--text")
-		t.Output = append(t.Output, "you: "+text, "claude: echo: "+text)
+		t.Reply = "echo: " + text
 		save(root, st)
 		ok(map[string]any{"send": map[string]any{"handle": t.Handle, "accepted": true, "prompt": map[string]any{"stages": []string{"input_accepted", "turn_started"}}}})
 	case "terminal close":

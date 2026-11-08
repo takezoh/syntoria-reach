@@ -121,26 +121,23 @@ func TestAgentTerminal(t *testing.T) {
 	if terms, err := cli.Terminals(ctx); err != nil || len(terms) != 1 || terms[0] != (core.Terminal{Handle: h, WorktreeID: entry, Connected: true, AgentIdentity: "claude"}) {
 		t.Fatalf("terminals = %+v %v", terms, err)
 	}
-	want := core.TerminalStatus{Terminal: core.Terminal{Handle: h, WorktreeID: entry, Connected: true, AgentIdentity: "claude"}}
-	if st, err := cli.ShowTerminal(ctx, h); err != nil || *st != want {
+	want := core.TerminalStatus{Terminal: core.Terminal{Handle: h, WorktreeID: entry, Connected: true, AgentIdentity: "claude", TabID: orcatest.TabID(h), LeafID: orcatest.LeafID(h)}}
+	st, err := cli.ShowTerminal(ctx, h)
+	if err != nil || *st != want {
 		t.Fatalf("show = %+v %v", st, err)
 	}
 	if idle, blocked, err := cli.WaitIdle(ctx, h, 3*time.Second); err != nil || !idle || blocked != "" {
 		t.Fatalf("wait = %v %q %v", idle, blocked, err)
 	}
-	if out, err := cli.ReadTerminal(ctx, h, "", 0); err != nil || len(out.Lines) != 0 || out.Cursor != "0" || out.More {
-		t.Fatalf("output before a prompt = %+v %v", out, err)
+	if turn, err := cli.AgentTurn(ctx, st.PaneKey()); err != nil || turn == nil || *turn != (core.AgentTurn{}) {
+		t.Fatalf("turn before a prompt = %+v %v", turn, err)
 	}
 	// A prompt starting with "--" stays the text.
 	if stages, err := cli.SendPrompt(ctx, h, "--hello"); err != nil || strings.Join(stages, ",") != "input_accepted,turn_started" {
 		t.Fatalf("send: %q %v", stages, err)
 	}
-	out, err := cli.ReadTerminal(ctx, h, "", 1)
-	if err != nil || strings.Join(out.Lines, "|") != "you: --hello" || out.Cursor != "1" || !out.More {
-		t.Fatalf("first line = %+v %v", out, err)
-	}
-	if out, err = cli.ReadTerminal(ctx, h, out.Cursor, 0); err != nil || strings.Join(out.Lines, "|") != "claude: echo: --hello" || out.Cursor != "2" || out.More {
-		t.Fatalf("read on = %+v %v", out, err)
+	if turn, err := cli.AgentTurn(ctx, st.PaneKey()); err != nil || turn == nil || *turn != (core.AgentTurn{Reply: "echo: --hello"}) {
+		t.Fatalf("turn = %+v %v", turn, err)
 	}
 	if err := cli.CloseTerminal(ctx, h); err != nil {
 		t.Fatal(err)
@@ -155,8 +152,8 @@ func TestAgentTerminal(t *testing.T) {
 	if _, _, err := cli.WaitIdle(ctx, h, time.Second); !errors.Is(err, core.ErrNotFound) {
 		t.Fatalf("wait on a closed terminal: %v", err)
 	}
-	if _, err := cli.ReadTerminal(ctx, h, "0", 0); !errors.Is(err, core.ErrNotFound) {
-		t.Fatalf("read a closed terminal: %v", err)
+	if turn, err := cli.AgentTurn(ctx, st.PaneKey()); err != nil || turn != nil {
+		t.Fatalf("turn of a closed terminal: %+v %v", turn, err)
 	}
 	// A handle that looks like a flag stays the handle.
 	if _, err := cli.ShowTerminal(ctx, "--environment=elsewhere"); !errors.Is(err, core.ErrNotFound) {
@@ -167,8 +164,7 @@ func TestAgentTerminal(t *testing.T) {
 		"terminal create --worktree id:" + entry + " --title reach claude --command /bin/claude --model 'opus x' --json",
 		"terminal show --terminal=" + h + " --json",
 		"terminal wait --terminal=" + h + " --for tui-idle --timeout-ms 3000 --json",
-		"terminal read --terminal=" + h + " --cursor=0 --json",
-		"terminal read --terminal=" + h + " --cursor=0 --limit 1 --json",
+		"worktree ps --limit 1000 --json",
 		"terminal send --terminal=" + h + " --text=--hello --enter --wait-submit 30 --json",
 		"terminal close --terminal=" + h + " --json",
 	} {
@@ -218,9 +214,44 @@ func TestTerminalWaits(t *testing.T) {
 	if _, _, err := answering.WaitIdle(ctx, "term_1", time.Second); !errors.Is(err, core.ErrNotFound) {
 		t.Errorf("exited: %v", err)
 	}
-	// Without line cursors Orca returns no next cursor: read on from the same.
-	t.Setenv("REPLY_JSON", `{"ok":true,"result":{"terminal":{"handle":"term_1","status":"running","tail":[],"truncated":true,"nextCursor":null}}}`)
-	if out, err := answering.ReadTerminal(ctx, "term_1", "7", 0); err != nil || out.Cursor != "7" || !out.Truncated || out.Lines == nil {
-		t.Errorf("no cursors: %+v %v", out, err)
+}
+
+// The agent's turn as Orca's agent status reports it.
+func TestAgentTurn(t *testing.T) {
+	ctx := context.Background()
+	ps := func(row string) string {
+		return `{"ok":true,"result":{"worktrees":[{"worktreeId":"r::/w","agents":[` + row + `]},{"worktreeId":"q::/v"}],"totalCount":2,"truncated":false}}`
+	}
+	long := strings.Repeat("x", replyLimit)
+	for name, c := range map[string]struct {
+		reply string
+		want  *core.AgentTurn
+	}{
+		"no agent":             {ps(``), nil},
+		"another pane":         {ps(`{"paneKey":"tab:other","state":"done","lastAssistantMessage":"hi"}`), nil},
+		"idle before a prompt": {ps(`{"paneKey":"tab:leaf","state":"done","mainAgent":{"state":"done"},"lastAssistantMessage":null}`), &core.AgentTurn{}},
+		"in a turn":            {ps(`{"paneKey":"tab:leaf","state":"working","mainAgent":{"state":"working"},"lastAssistantMessage":null}`), &core.AgentTurn{Running: true}},
+		// Work the agent left running in the background keeps the pane
+		// working; the agent itself waits for a prompt.
+		"background work": {ps(`{"paneKey":"tab:leaf","state":"working","workingMode":"monitoring","mainAgent":{"state":"done"},"lastAssistantMessage":"done"}`), &core.AgentTurn{Reply: "done"}},
+		"no main agent":   {ps(`{"paneKey":"tab:leaf","state":"working"}`), &core.AgentTurn{Running: true}},
+		"tool output":     {ps(`{"paneKey":"tab:leaf","state":"done","lastAssistantMessage":"ls output","lastAssistantMessageIsToolOutput":true}`), &core.AgentTurn{}},
+		// Orca keeps 8000 UTF-16 code units of a message and drops a high
+		// surrogate left alone at the cut.
+		"cut":                           {ps(`{"paneKey":"tab:leaf","state":"done","lastAssistantMessage":"` + long + `"}`), &core.AgentTurn{Reply: long, Truncated: true}},
+		"cut before a surrogate pair":   {ps(`{"paneKey":"tab:leaf","state":"done","lastAssistantMessage":"` + long[1:] + `"}`), &core.AgentTurn{Reply: long[1:], Truncated: true}},
+		"a surrogate pair is two units": {ps(`{"paneKey":"tab:leaf","state":"done","lastAssistantMessage":"` + long[3:] + `😀"}`), &core.AgentTurn{Reply: long[3:] + "😀", Truncated: true}},
+		"just short":                    {ps(`{"paneKey":"tab:leaf","state":"done","lastAssistantMessage":"` + long[2:] + `"}`), &core.AgentTurn{Reply: long[2:]}},
+	} {
+		t.Setenv("REPLY_JSON", c.reply)
+		turn, err := answering.AgentTurn(ctx, "tab:leaf")
+		if err != nil || (turn == nil) != (c.want == nil) || turn != nil && *turn != *c.want {
+			t.Errorf("%s: %+v %v", name, turn, err)
+		}
+	}
+	// A partial list without the pane is an error, never a missing agent.
+	t.Setenv("REPLY_JSON", `{"ok":true,"result":{"worktrees":[],"truncated":true}}`)
+	if _, err := answering.AgentTurn(ctx, "tab:leaf"); err == nil {
+		t.Error("truncated list accepted")
 	}
 }

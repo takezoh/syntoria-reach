@@ -234,12 +234,24 @@ type JobOutput struct {
 
 // Terminal is an Orca terminal, as Orca reports it. WorktreeID is the ID
 // of the workspace entry it runs in; AgentIdentity names the agent Orca
-// recognizes running in it, empty when there is none (a shell).
+// recognizes running in it, empty when there is none (a shell). TabID and
+// LeafID place it in Orca's layout.
 type Terminal struct {
 	Handle        string `json:"handle"`
 	WorktreeID    string `json:"worktreeId"`
 	Connected     bool   `json:"connected"`
 	AgentIdentity string `json:"agentIdentity"`
+	TabID         string `json:"tabId,omitempty"`
+	LeafID        string `json:"leafId,omitempty"`
+}
+
+// PaneKey is the key under which Orca reports the agent in the terminal
+// (<tabId>:<leafId>), or empty when Orca did not place the terminal.
+func (t Terminal) PaneKey() string {
+	if t.TabID == "" || t.LeafID == "" {
+		return ""
+	}
+	return t.TabID + ":" + t.LeafID
 }
 
 // TerminalStatus is one terminal as Orca shows it. WaitingOnHuman is what
@@ -254,14 +266,14 @@ type TerminalStatus struct {
 // whether the agent waits for its user.
 const WaitUnknown = "unknown"
 
-// TerminalOutput is a part of a terminal's output as Orca reads it: lines
-// without escape sequences, the cursor to read on from, whether more lines
-// follow, and whether lines before the requested cursor are no longer kept.
-type TerminalOutput struct {
-	Lines     []string `json:"lines"`
-	Cursor    string   `json:"cursor"`
-	More      bool     `json:"more"`
-	Truncated bool     `json:"truncated"`
+// AgentTurn is the latest turn of an agent as Orca's agent status hooks
+// report it: whether the agent is still in it, and once it ended, the
+// agent's last message, which Orca keeps only up to a limit; Truncated says
+// the message reached that limit and may be cut.
+type AgentTurn struct {
+	Running   bool
+	Reply     string
+	Truncated bool
 }
 
 // What an agent in a session does, as Orca observes it.

@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
 )
 
 const (
@@ -118,15 +120,13 @@ func TestRemoteE2E(t *testing.T) {
 	if op := c.mustTool("send_agent_prompt", prompt).(map[string]any); op["state"] != "succeeded" {
 		t.Fatalf("send_agent_prompt: %v", op)
 	}
-	out := c.mustTool("read_agent_output", map[string]any{"session_id": sessionID}).(map[string]any)
-	if lines := out["lines"].([]any); len(lines) != 2 || !strings.Contains(fmt.Sprint(lines[1]), "echo: hi") || out["state"] != "idle" {
+	if out := c.mustTool("read_agent_output", map[string]any{"session_id": sessionID}).(map[string]any); out["reply"] != "echo: hi" || out["state"] != "idle" {
 		t.Fatalf("read_agent_output: %v", out)
 	}
-	// Resending the prompt with the same operation ID types nothing again,
-	// and the cursor reads on from where the last read ended.
+	// Resending the prompt with the same operation ID types nothing again.
 	c.mustTool("send_agent_prompt", prompt)
-	if more := c.mustTool("read_agent_output", map[string]any{"session_id": sessionID, "cursor": out["cursor"]}).(map[string]any); len(more["lines"].([]any)) != 0 {
-		t.Fatalf("resent prompt: %v", more)
+	if n := strings.Count(orcatest.Calls(t, filepath.Join(filepath.Dir(d.sock), "orca")), "terminal send "); n != 1 {
+		t.Fatalf("the prompt was typed %d times", n)
 	}
 	if s := c.mustTool("get_agent_session", map[string]any{"session_id": sessionID}).(map[string]any); s["workspace"] != wsID || s["state"] != "idle" {
 		t.Fatalf("get_agent_session: %v", s)

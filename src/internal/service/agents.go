@@ -12,11 +12,11 @@ import (
 
 // An agent session is an agent Reach starts in an Orca terminal of a
 // workspace: the agent's configured command is typed into a new terminal,
-// prompts are typed into that terminal, and its output is read back from
-// Orca. The session ID is the terminal's Orca handle; Reach keeps nothing
-// about sessions, which outlive the daemon and end when the terminal closes.
-// Every terminal in a Reach workspace is a session, and no other terminal
-// is.
+// prompts are typed into that terminal, and the agent's reply is read from
+// Orca's agent status. The session ID is the terminal's Orca handle; Reach
+// keeps nothing about sessions, which outlive the daemon and end when the
+// terminal closes. Every terminal in a Reach workspace is a session, and no
+// other terminal is.
 
 const (
 	// startWait is how long starting a session waits for the agent to wait
@@ -128,7 +128,7 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 		// as a permission, or Orca cannot tell, the prompt would answer it;
 		// the answer is the user's, in Orca. During a turn the agent could
 		// ask just before the prompt arrives.
-		state, err := s.agentState(ctx, t)
+		state, _, err := s.agentState(ctx, t)
 		if err != nil {
 			return nil, err
 		}
@@ -151,36 +151,30 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 	})
 }
 
-// ReadAgentOutputRequest reads a session's terminal output after Cursor
-// (from the oldest line Orca keeps when empty).
+// ReadAgentOutputRequest reads what the agent of a session does and its
+// reply.
 type ReadAgentOutputRequest struct {
 	SessionID string `json:"session_id"`
-	Cursor    string `json:"cursor"`
-	Limit     int    `json:"limit"`
 }
 
-// AgentOutput is a part of a session's terminal output, with what the agent
-// does: once State is idle, the output of its turn has been written.
+// AgentOutput is what the agent of a session does and, once it waits for a
+// prompt (State is idle), its last message of the turn: its reply to the
+// last prompt, empty when Orca reports none. ReplyTruncated says the reply
+// reached the length Orca keeps and may be cut.
 type AgentOutput struct {
-	core.TerminalOutput
 	State          string `json:"state"`
 	WaitingOnHuman string `json:"waiting_on_human,omitempty"`
+	Reply          string `json:"reply"`
+	ReplyTruncated bool   `json:"reply_truncated,omitempty"`
 }
 
-const maxAgentOutputLines = 1000
-
-// ReadAgentOutput reads a session's terminal output from Orca.
+// ReadAgentOutput reads what the agent of a session does, and its reply,
+// from Orca.
 func (s *Service) ReadAgentOutput(ctx context.Context, c *Client, req ReadAgentOutputRequest) (out *AgentOutput, err error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "read_agent_output", Target: req.SessionID}
 	defer func() { s.audit(rec, err) }()
-	switch {
-	case !slices.Contains(c.perms, core.PermAgentRun):
+	if !slices.Contains(c.perms, core.PermAgentRun) {
 		return nil, core.Errorf(core.CodePermissionDenied, "%s is not allowed", core.PermAgentRun)
-	case req.Limit < 0 || req.Limit > maxAgentOutputLines:
-		return nil, core.Errorf(core.CodeInvalidRequest, "limit must be between 0 and %d", maxAgentOutputLines)
-	}
-	if err := core.CheckCursor(req.Cursor); err != nil {
-		return nil, err
 	}
 	t, release, err := s.useSession(ctx, req.SessionID)
 	if err != nil {
@@ -188,20 +182,15 @@ func (s *Service) ReadAgentOutput(ctx context.Context, c *Client, req ReadAgentO
 	}
 	defer release()
 	rec.WorkspaceID = core.WorkspaceOfEntry(t.WorktreeID)
-	// The state comes first: output read after the agent was seen idle holds
-	// all of its turn.
-	state, err := s.agentState(ctx, t)
+	state, turn, err := s.agentState(ctx, t)
 	if err != nil {
 		return nil, err
 	}
-	o, err := s.orca.ReadTerminal(ctx, req.SessionID, req.Cursor, req.Limit)
-	if errors.Is(err, core.ErrNotFound) {
-		return nil, sessionNotFound(req.SessionID)
+	out = &AgentOutput{State: state, WaitingOnHuman: t.WaitingOnHuman}
+	if state == core.AgentIdle && turn != nil {
+		out.Reply, out.ReplyTruncated = turn.Reply, turn.Truncated
 	}
-	if err != nil {
-		return nil, orcaError(err)
-	}
-	return &AgentOutput{TerminalOutput: *o, State: state, WaitingOnHuman: t.WaitingOnHuman}, nil
+	return out, nil
 }
 
 // AgentSessionRequest identifies a session.
@@ -265,36 +254,49 @@ func (s *Service) agentSession(ctx context.Context, id string) (*core.AgentSessi
 		return nil, err
 	}
 	defer release()
-	state, err := s.agentState(ctx, t)
+	state, _, err := s.agentState(ctx, t)
 	if err != nil {
 		return nil, err
 	}
 	return &core.AgentSession{ID: id, Workspace: core.WorkspaceOfEntry(t.WorktreeID), Agent: t.AgentIdentity, State: state, WaitingOnHuman: t.WaitingOnHuman}, nil
 }
 
-// agentState tells what the agent in terminal t does. Orca tells a question
-// to the user from a turn only through what it saw of the wait, and an
-// agent waiting for a prompt only by seeing it idle within idleWait.
-func (s *Service) agentState(ctx context.Context, t *core.TerminalStatus) (string, error) {
+// agentState tells what the agent in terminal t does and, when it waits for
+// a prompt, returns its latest turn as Orca's agent status reports it (nil
+// when Orca reports none). Orca tells a question to the user from a turn
+// only through what it saw of the wait, and an agent waiting for a prompt
+// only by seeing it idle within idleWait; until the agent's status hooks
+// report the turn ended, its reply is not there yet, so the agent is still
+// working.
+func (s *Service) agentState(ctx context.Context, t *core.TerminalStatus) (string, *core.AgentTurn, error) {
 	switch {
 	case t.AgentIdentity == "":
-		return core.AgentExited, nil
+		return core.AgentExited, nil, nil
 	case t.WaitingOnHuman != "":
-		return core.AgentWaitingOnHuman, nil
+		return core.AgentWaitingOnHuman, nil, nil
 	}
 	idle, blocked, err := s.orca.WaitIdle(ctx, t.Handle, idleWait)
 	switch {
 	case errors.Is(err, core.ErrNotFound):
-		return "", sessionNotFound(t.Handle)
+		return "", nil, sessionNotFound(t.Handle)
 	case err != nil:
-		return "", orcaError(err)
+		return "", nil, orcaError(err)
 	case blocked != "":
 		t.WaitingOnHuman = blocked
-		return core.AgentWaitingOnHuman, nil
-	case idle:
-		return core.AgentIdle, nil
+		return core.AgentWaitingOnHuman, nil, nil
+	case !idle:
+		return core.AgentWorking, nil, nil
 	}
-	return core.AgentWorking, nil
+	var turn *core.AgentTurn
+	if key := t.PaneKey(); key != "" {
+		if turn, err = s.orca.AgentTurn(ctx, key); err != nil {
+			return "", nil, orcaError(err)
+		}
+	}
+	if turn != nil && turn.Running {
+		return core.AgentWorking, nil, nil
+	}
+	return core.AgentIdle, turn, nil
 }
 
 // session reads the terminal of session id from Orca. It must be open in a

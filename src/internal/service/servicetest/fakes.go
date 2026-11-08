@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -318,8 +317,8 @@ type Orca struct {
 	terminals map[string]*fakeTerminal // by handle
 }
 
-// fakeTerminal is a terminal with an agent that echoes every prompt into
-// its output.
+// fakeTerminal is a terminal with an agent that replies to every prompt
+// with "echo: <prompt>".
 type fakeTerminal struct {
 	worktree string
 	command  string
@@ -328,8 +327,11 @@ type fakeTerminal struct {
 	waiting  string // what Orca saw the agent wait for from its user; empty when nothing
 	blocked  string // what Orca saw the agent stopped at when waiting for it to be idle
 	busy     bool   // in a turn
-	output   []string
+	turn     core.AgentTurn
 }
+
+// paneKey is the pane key Orca reports for terminal handle.
+func paneKey(handle string) string { return "tab-" + handle + ":leaf-" + handle }
 
 func (o *Orca) AddFolder(_ context.Context, p string) (string, error) {
 	o.mu.Lock()
@@ -511,7 +513,9 @@ func (o *Orca) ShowTerminal(_ context.Context, handle string) (*core.TerminalSta
 	if t == nil {
 		return nil, core.ErrNotFound
 	}
-	return &core.TerminalStatus{Terminal: core.Terminal{Handle: handle, WorktreeID: t.worktree, Connected: true, AgentIdentity: t.agent}, WaitingOnHuman: t.waiting}, nil
+	tab, leaf, _ := strings.Cut(paneKey(handle), ":")
+	return &core.TerminalStatus{Terminal: core.Terminal{Handle: handle, WorktreeID: t.worktree, Connected: true, AgentIdentity: t.agent,
+		TabID: tab, LeafID: leaf}, WaitingOnHuman: t.waiting}, nil
 }
 
 // WaitIdle reports the agent idle unless it is in a turn, waits for its
@@ -529,20 +533,27 @@ func (o *Orca) WaitIdle(_ context.Context, handle string, _ time.Duration) (bool
 	return t.agent != "" && !t.busy && t.waiting == "", "", nil
 }
 
-func (o *Orca) ReadTerminal(_ context.Context, handle, cursor string, limit int) (*core.TerminalOutput, error) {
+// AgentTurn reports the agent's turn as its status hooks would: running
+// during a turn, with the agent's reply once it ended.
+func (o *Orca) AgentTurn(_ context.Context, key string) (*core.AgentTurn, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	t := o.terminal(handle)
-	if t == nil {
-		return nil, core.ErrNotFound
+	for h, t := range o.terminals {
+		if t.open && t.agent != "" && paneKey(h) == key {
+			turn := t.turn
+			turn.Running = turn.Running || t.busy
+			return &turn, nil
+		}
 	}
-	from, _ := strconv.Atoi(cursor)
-	from = min(from, len(t.output))
-	to := len(t.output)
-	if limit > 0 {
-		to = min(to, from+limit)
-	}
-	return &core.TerminalOutput{Lines: slices.Clone(t.output[from:to]), Cursor: strconv.Itoa(to), More: to < len(t.output)}, nil
+	return nil, nil
+}
+
+// Hooks sets the agent's turn in terminal handle as its status hooks report
+// it, which may lag behind what its terminal shows.
+func (o *Orca) Hooks(handle string, turn core.AgentTurn) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.terminals[handle].turn = turn
 }
 
 // AskUser makes the agent in terminal handle wait for its user, as Orca
@@ -588,7 +599,7 @@ func (o *Orca) SendPrompt(_ context.Context, handle, text string) ([]string, err
 	if o.SilentAgent {
 		return []string{"input_accepted"}, nil
 	}
-	t.output = append(t.output, "you: "+text, "agent: echo: "+text)
+	t.turn = core.AgentTurn{Reply: "echo: " + text}
 	return []string{"input_accepted", "turn_started"}, nil
 }
 

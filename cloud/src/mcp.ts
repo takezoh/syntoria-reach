@@ -16,7 +16,7 @@ One workspace is one unit of work: a folder of its own, with a note saying what 
 - New work: create_workspace with a note that says what the work is, so that you or another AI can find it again. The workspace starts empty; put in it what the work needs (for example, clone a repository).
 Keep the note current with update_workspace as the work moves on. When the work is done, set the status to in-review, or to completed when nothing is left; a completed workspace is removed after a week without activity.
 
-To have an agent do a task in a workspace: start_agent_session with one of your agents (list_capabilities); the agent runs in a terminal of the workspace on the Orca server, where the user can watch it. send_agent_prompt with the task, then call read_agent_output, passing the cursor it returned last time, until state is "idle": the agent has finished its turn and its output has been read. The output is the terminal's text, with the agent's status lines among it. Send the next prompt to the same session for a follow-up, and stop_agent_session when done, which closes the terminal and ends the session; a session outlives a disconnect, so get_agent_session tells whether it is still there. If state is "waiting_on_human", the agent asks the user something in Orca, such as a permission: tell the user, and wait.
+To have an agent do a task in a workspace: start_agent_session with one of your agents (list_capabilities); the agent runs in a terminal of the workspace on the Orca server, where the user can watch it. send_agent_prompt with the task, then call read_agent_output until state is "idle": the agent has finished its turn, and reply is its last message of the turn. Orca keeps the first 8,000 characters of a reply; reply_truncated says the end may be cut off, so ask the agent for the rest or a shorter answer. Send the next prompt to the same session for a follow-up, and stop_agent_session when done, which closes the terminal and ends the session; a session outlives a disconnect, so get_agent_session tells whether it is still there. If state is "waiting_on_human", the agent asks the user something in Orca, such as a permission: tell the user, and wait.
 
 Tools that change something take an operation_id that you choose, unique per action (for example "create-ws-docs-1"). If a call fails with result_unknown, the request may have run: call get_operation with the same operation_id, or resend the same call with the same operation_id. Never retry with a new operation_id. node_offline means the machine is not connected and nothing ran.`;
 
@@ -79,12 +79,8 @@ const tools: { name: string; description: string; input: Shape; readOnly: boolea
   },
   {
     name: "read_agent_output",
-    description: "The session's terminal output after `cursor`, as Orca reads it: lines of text without escape sequences, including the prompts and the agent's status lines. Returns the cursor to pass next time, more (true when more lines follow: read again at once), truncated (lines before the cursor are no longer kept), and the agent's state: idle (it waits for a prompt; the output of its turn has been written), working, waiting_on_human (it asks the user something in Orca; waiting_on_human says what Orca saw) or exited (the agent quit; the terminal runs a shell). A read while the agent works takes a few seconds. Once the terminal closes, the session is gone: not_found.",
-    input: {
-      session_id: sessionId,
-      cursor: z.string().optional().describe("The cursor from the last read; omitted for the oldest output Orca keeps."),
-      limit: z.number().int().min(1).max(1000).optional().describe("At most this many lines."),
-    },
+    description: "The agent's state and, once its turn has ended, its reply. state is idle (it waits for a prompt; reply is its last message of the turn, as Orca reports it, empty before the first prompt), working, waiting_on_human (it asks the user something in Orca; waiting_on_human says what Orca saw) or exited (the agent quit; the terminal runs a shell). reply is empty unless state is idle. Orca keeps the first 8,000 characters of a reply: reply_truncated is true when the reply reached that length and its end may be cut off. A read while the agent works takes a few seconds. Once the terminal closes, the session is gone: not_found.",
+    input: { session_id: sessionId },
     readOnly: true,
   },
   {
@@ -95,7 +91,7 @@ const tools: { name: string; description: string; input: Shape; readOnly: boolea
   },
   {
     name: "stop_agent_session",
-    description: "Closes the agent's terminal, which ends the agent and its session: the output is no longer readable.",
+    description: "Closes the agent's terminal, which ends the agent and its session: its reply is no longer readable.",
     input: { operation_id: operationId, session_id: sessionId },
     readOnly: false,
   },

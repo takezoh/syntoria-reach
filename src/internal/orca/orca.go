@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/takezoh/syntoria-reach/src/internal/command"
 	"github.com/takezoh/syntoria-reach/src/internal/core"
@@ -221,36 +222,69 @@ func (c *CLI) WaitIdle(ctx context.Context, handle string, timeout time.Duration
 	return res.Wait.Satisfied, res.Wait.BlockedReason, nil
 }
 
-// ReadTerminal reads terminal handle's output, escape sequences stripped,
-// from cursor. Orca's cursor counts the terminal's completed lines, and a
-// cursor below the oldest line it keeps reads from that line.
-func (c *CLI) ReadTerminal(ctx context.Context, handle, cursor string, limit int) (*core.TerminalOutput, error) {
-	if cursor == "" {
-		cursor = "0"
-	}
-	args := []string{"terminal", "read", "--terminal=" + handle, "--cursor=" + cursor}
-	if limit > 0 {
-		args = append(args, "--limit", fmt.Sprint(limit))
-	}
+// replyLimit is the length, in UTF-16 code units, at which Orca cuts an
+// agent's last message, dropping a high surrogate the cut leaves alone
+// (Orca 1.4.252).
+const replyLimit = 8000
+
+// agentRow is one agent in Orca's agent status (worktree ps), which Orca
+// keeps from the agents' status hooks.
+type agentRow struct {
+	PaneKey string `json:"paneKey"`
+	// State stays working while work the agent started in the background
+	// runs; MainAgent, when present, is the agent's own state.
+	State     string `json:"state"`
+	MainAgent *struct {
+		State string `json:"state"`
+	} `json:"mainAgent"`
+	// Orca empties the message when a prompt is submitted and sets it when
+	// the turn ends; some agents' hooks set it to a tool's output during
+	// a turn.
+	LastAssistantMessage             string `json:"lastAssistantMessage"`
+	LastAssistantMessageIsToolOutput bool   `json:"lastAssistantMessageIsToolOutput"`
+}
+
+// AgentTurn reads the latest turn of the agent in pane paneKey
+// (<tabId>:<leafId>) from Orca's agent status; nil when Orca reports no
+// agent there.
+func (c *CLI) AgentTurn(ctx context.Context, paneKey string) (*core.AgentTurn, error) {
 	var res struct {
-		Terminal struct {
-			Tail       []string `json:"tail"`
-			NextCursor *string  `json:"nextCursor"` // null without line cursors
-			Truncated  bool     `json:"truncated"`
-			Limited    bool     `json:"limited"`
-		} `json:"terminal"`
+		Worktrees []struct {
+			Agents []agentRow `json:"agents"`
+		} `json:"worktrees"`
+		Truncated bool `json:"truncated"`
 	}
-	if err := c.run(ctx, &res, args...); err != nil {
-		return nil, terminalGone(err)
+	if err := c.run(ctx, &res, "worktree", "ps", "--limit", fmt.Sprint(listLimit)); err != nil {
+		return nil, err
 	}
-	out := &core.TerminalOutput{Lines: res.Terminal.Tail, Cursor: cursor, More: res.Terminal.Limited, Truncated: res.Terminal.Truncated}
-	if res.Terminal.NextCursor != nil {
-		out.Cursor = *res.Terminal.NextCursor
+	for _, w := range res.Worktrees {
+		for _, a := range w.Agents {
+			if a.PaneKey != paneKey {
+				continue
+			}
+			state := a.State
+			if a.MainAgent != nil && a.MainAgent.State != "" {
+				state = a.MainAgent.State
+			}
+			turn := &core.AgentTurn{Running: state == "working"}
+			if !a.LastAssistantMessageIsToolOutput {
+				turn.Reply = a.LastAssistantMessage
+				turn.Truncated = utf16Len(turn.Reply) >= replyLimit-1
+			}
+			return turn, nil
+		}
 	}
-	if out.Lines == nil {
-		out.Lines = []string{}
+	if res.Truncated {
+		return nil, fmt.Errorf("orca: more than %d worktrees", listLimit)
 	}
-	return out, nil
+	return nil, nil
+}
+
+func utf16Len(s string) (n int) {
+	for _, r := range s {
+		n += utf16.RuneLen(r)
+	}
+	return n
 }
 
 // terminalGone turns Orca's answer for a handle it no longer has, or a

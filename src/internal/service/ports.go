@@ -102,10 +102,10 @@ type Orca interface {
 	// for a prompt, and reports whether it does. Orca may instead see it
 	// stopped at something only a person can answer: blocked says what.
 	WaitIdle(ctx context.Context, handle string, timeout time.Duration) (idle bool, blocked string, err error)
-	// ReadTerminal reads terminal handle's output from cursor (the oldest
-	// line Orca keeps when empty), at most limit lines (0 for Orca's
-	// default).
-	ReadTerminal(ctx context.Context, handle, cursor string, limit int) (*core.TerminalOutput, error)
+	// AgentTurn reads the latest turn of the agent in the terminal whose
+	// pane key is paneKey, as Orca's agent status hooks report it; nil when
+	// Orca reports no agent there.
+	AgentTurn(ctx context.Context, paneKey string) (*core.AgentTurn, error)
 	// SendPrompt types and submits text to the agent in terminal handle and
 	// returns the stages Orca observed (input_accepted, turn_started).
 	SendPrompt(ctx context.Context, handle, text string) ([]string, error)
