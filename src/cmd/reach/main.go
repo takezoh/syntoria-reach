@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/agent"
+	"github.com/takezoh/syntoria-reach/src/internal/api"
 	"github.com/takezoh/syntoria-reach/src/internal/command"
 	"github.com/takezoh/syntoria-reach/src/internal/config"
 	"github.com/takezoh/syntoria-reach/src/internal/ids"
 	"github.com/takezoh/syntoria-reach/src/internal/job"
 	"github.com/takezoh/syntoria-reach/src/internal/localapi"
 	"github.com/takezoh/syntoria-reach/src/internal/orca"
+	"github.com/takezoh/syntoria-reach/src/internal/remote"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 	"github.com/takezoh/syntoria-reach/src/internal/store"
 	"github.com/takezoh/syntoria-reach/src/internal/workspace"
@@ -68,11 +70,26 @@ func run() error {
 	go func() { errc <- srv.Serve(l) }()
 	slog.Info("reach listening", "socket", cfg.Socket)
 
+	connector := make(chan struct{})
+	if r := cfg.Remote; r != nil {
+		client, ok := svc.ClientByID(r.Client)
+		if !ok {
+			return errors.New("remote: unknown client " + r.Client) // config.Validate rules this out
+		}
+		c := &remote.Connector{URL: r.URL, Token: r.Token, Handler: func(ctx context.Context, method string, params []byte) (any, error) {
+			return api.Call(ctx, svc, client, method, params)
+		}}
+		go func() { c.Run(ctx); close(connector) }()
+	} else {
+		close(connector)
+	}
+
 	select {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
 	}
+	<-connector
 	shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdown); err != nil && !errors.Is(err, http.ErrServerClosed) {

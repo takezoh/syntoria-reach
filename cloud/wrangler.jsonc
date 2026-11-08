@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "reach-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // Workers logs record requests, not their bodies; the gateway never logs
+  // tool arguments or results.
+  "observability": { "enabled": true },
+  // The gateway answers only at the custom domain given on deploy
+  // (--domain reach-api.<parent>), under Gate's cookie parent: its MCP URL
+  // is the audience registered with Gate.
+  "workers_dev": false,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [{ "name": "NODE", "class_name": "NodeBroker" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NodeBroker"] }],
+  // Uploaded with --secrets-file on deploy (environment variables or .dev.vars
+  // locally), which keeps deployment values out of the repository:
+  //   GATE_ISSUER         Syntoria Gate's issuer, e.g. https://gate.<parent>
+  //   GATE_CLIENT_ID      the gateway's resource client ID in GATE_RESOURCES
+  //   GATE_CLIENT_SECRET  its client secret, at least 32 characters
+  //   OWNER_SUBJECT       the one Gate subject that may use Reach, github:<user ID>
+  //   NODE_TOKEN          the token the Linux daemon connects with, at least 32 characters
+  "secrets": { "required": ["GATE_ISSUER", "GATE_CLIENT_ID", "GATE_CLIENT_SECRET", "OWNER_SUBJECT", "NODE_TOKEN"] }
+}

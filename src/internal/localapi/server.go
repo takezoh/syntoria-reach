@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/takezoh/syntoria-reach/src/internal/api"
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 )
@@ -105,73 +107,23 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-
-	var result any
-	switch strings.TrimPrefix(r.URL.Path, "/v1/") {
-	case "list_projects":
-		result = h.svc.ListProjects(client)
-	case "list_workspaces":
-		result, err = h.svc.ListWorkspaces(client)
-	case "create_workspace":
-		result, err = call(r, func(req service.CreateWorkspaceRequest) (any, error) {
-			return h.svc.CreateWorkspace(r.Context(), client, req)
-		})
-	case "delete_workspace":
-		result, err = call(r, func(req service.WorkspaceRequest) (any, error) {
-			return h.svc.DeleteWorkspace(r.Context(), client, req)
-		})
-	case "list_files":
-		result, err = call(r, func(req service.ListFilesRequest) (any, error) { return h.svc.ListFiles(client, req) })
-	case "read_file":
-		result, err = call(r, func(req service.ReadFileRequest) (any, error) { return h.svc.ReadFile(client, req) })
-	case "write_file":
-		result, err = call(r, func(req service.WriteFileRequest) (any, error) { return h.svc.WriteFile(client, req) })
-	case "run_command":
-		result, err = call(r, func(req service.RunCommandRequest) (any, error) {
-			return h.svc.RunCommand(r.Context(), client, req)
-		})
-	case "get_operation":
-		result, err = call(r, func(req service.GetOperationRequest) (any, error) { return h.svc.GetOperation(client, req) })
-	case "start_job":
-		result, err = call(r, func(req service.StartJobRequest) (any, error) { return h.svc.StartJob(client, req) })
-	case "get_job":
-		result, err = call(r, func(req service.JobRequest) (any, error) { return h.svc.GetJob(client, req) })
-	case "read_job_output":
-		result, err = call(r, func(req service.ReadJobOutputRequest) (any, error) { return h.svc.ReadJobOutput(client, req) })
-	case "cancel_job":
-		result, err = call(r, func(req service.CancelJobRequest) (any, error) { return h.svc.CancelJob(client, req) })
-	case "start_agent_session":
-		result, err = call(r, func(req service.StartAgentSessionRequest) (any, error) {
-			return h.svc.StartAgentSession(r.Context(), client, req)
-		})
-	case "send_agent_prompt":
-		result, err = call(r, func(req service.SendAgentPromptRequest) (any, error) { return h.svc.SendAgentPrompt(client, req) })
-	case "get_agent_session":
-		result, err = call(r, func(req service.AgentSessionRequest) (any, error) { return h.svc.GetAgentSession(client, req) })
-	case "read_agent_events":
-		result, err = call(r, func(req service.ReadAgentEventsRequest) (any, error) { return h.svc.ReadAgentEvents(client, req) })
-	case "stop_agent_session":
-		result, err = call(r, func(req service.StopAgentSessionRequest) (any, error) { return h.svc.StopAgentSession(client, req) })
-	default:
-		err = &core.Error{Code: core.CodeNotFound, Message: "unknown method " + r.URL.Path}
+	method, ok := strings.CutPrefix(r.URL.Path, "/v1/")
+	if !ok {
+		writeError(w, &core.Error{Code: core.CodeNotFound, Message: "unknown method " + r.URL.Path})
+		return
 	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodySize))
+	if err != nil {
+		writeError(w, &core.Error{Code: core.CodeInvalidRequest, Message: fmt.Sprintf("read request: %v", err)})
+		return
+	}
+	result, err := api.Call(r.Context(), h.svc, client, method, body)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
-}
-
-func call[T any](r *http.Request, fn func(T) (any, error)) (any, error) {
-	var req T
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		return nil, &core.Error{Code: core.CodeInvalidRequest, Message: fmt.Sprintf("decode request: %v", err)}
-	}
-	return fn(req)
 }
 
 func writeError(w http.ResponseWriter, err error) {

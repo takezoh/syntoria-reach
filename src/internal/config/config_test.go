@@ -56,6 +56,31 @@ func TestLoadRejects(t *testing.T) {
 	}
 }
 
+func TestRemote(t *testing.T) {
+	withRemote := func(remote string) string {
+		return strings.Replace(valid, `"socket"`, `"remote": `+remote+`, "socket"`, 1)
+	}
+	const token = `"node-token-0123456789abcdef0123456789"`
+	for _, u := range []string{"wss://reach-api.example.test/connect", "ws://127.0.0.1:8787/connect", "ws://localhost:8787/connect", "ws://[::1]:8787/connect"} {
+		c, err := Load(writeConfig(t, 0o600, withRemote(`{"url": "`+u+`", "token": `+token+`, "client": "a"}`)))
+		if err != nil || c.Remote.Client != "a" {
+			t.Errorf("%s: %+v %v", u, c, err)
+		}
+	}
+	bad := map[string]string{
+		"plain ws to a remote host": `{"url": "ws://reach.example.com/connect", "token": ` + token + `, "client": "a"}`,
+		"https":                     `{"url": "https://reach.example.com/connect", "token": ` + token + `, "client": "a"}`,
+		"relative url":              `{"url": "/connect", "token": ` + token + `, "client": "a"}`,
+		"short token":               `{"url": "wss://reach.example.com/connect", "token": "short", "client": "a"}`,
+		"unknown client":            `{"url": "wss://reach.example.com/connect", "token": ` + token + `, "client": "nobody"}`,
+	}
+	for name, remote := range bad {
+		if _, err := Load(writeConfig(t, 0o600, withRemote(remote))); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
 func TestApplyDefaults(t *testing.T) {
 	env := map[string]string{"XDG_RUNTIME_DIR": "/run/user/1"}
 	c := &Config{}

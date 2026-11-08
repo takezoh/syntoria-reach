@@ -34,7 +34,9 @@ type daemon struct {
 	client *http.Client
 }
 
-func newDaemon(t *testing.T) (*daemon, string) {
+// newDaemon builds the daemon and its config. extra holds more top-level
+// config fields, each ending with a comma.
+func newDaemon(t *testing.T, extra ...string) (*daemon, string) {
 	t.Helper()
 	// Unix socket paths are limited to ~108 bytes, so avoid long temp dirs.
 	dir, err := os.MkdirTemp("/tmp", "reach-e2e-")
@@ -58,13 +60,14 @@ func newDaemon(t *testing.T) (*daemon, string) {
 	agent, _ := json.Marshal(map[string]any{"id": "codex", "protocol": "codex", "command": agentCmd, "env": agentEnv})
 	orca, _ := json.Marshal(orcatest.Command(t, "TestFakeHarness", orcaRoot))
 	cfg := fmt.Sprintf(`{
+		%s
 		"socket": %q, "database": %q,
 		"orca": %s,
 		"agents": [%s],
 		"projects": [{"id": "proj", "repo": "/repo", "commands": ["/bin/sh"], "agents": ["codex"]}],
 		"clients": [{"id": "e2e", "token": %q,
 			"grants": [{"project": "proj", "allow": ["workspace.create", "file.read", "file.write", "command.run", "agent.run"]}]}]
-	}`, sock, filepath.Join(dir, "reach.db"), orca, agent, e2eToken)
+	}`, strings.Join(extra, "\n"), sock, filepath.Join(dir, "reach.db"), orca, agent, e2eToken)
 	config := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(config, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)

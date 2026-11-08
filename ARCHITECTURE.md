@@ -1,7 +1,7 @@
 # Syntoria Reach — Technical Architecture
 
-- Status: **Technical overview / Stages 1–2 implemented**
-- Updated: 2026-11-01
+- Status: **Technical overview / Stages 1–2 implemented, Stage 4 in part (remote MCP for workspaces and agent sessions, one node)**
+- Updated: 2026-11-08
 - Initial runtime: **Linux / Go**
 - Adopted remote access: **Cloudflare Workers + Durable Objects + outbound Linux WebSocket (Option B)**
 
@@ -167,6 +167,10 @@ IDs of jobs and agent sessions are generated on Linux. Start, execution state, a
 
 The agent session tools are also provided to the DaVinci local client, which uses the same execution API. How tools are exposed to AI hosts and how streaming is supported are concerns of the connection adapter; the core defines the meaning of sessions, turns, and events.
 
+**Implemented so far.** The remote MCP endpoint exposes the workspace and agent session tools and `get_operation`, with the names, arguments and results of the local API methods; the daemon serves both from one method table. The endpoint is stateless MCP Streamable HTTP with JSON responses, and Reach errors are tool errors carrying `{"error": {"code", "message"}}`. `list_nodes` and `list_capabilities` wait for multiple nodes; file, command and job tools for a later step.
+
+Between the broker and the daemon, the WSS carries JSON text messages: the broker sends `{"id", "method", "params"}` and the daemon answers `{"id", "result"}` or `{"id", "error"}`. The ID is a relay correlation ID (§4.4). The daemon sends `ping` every 30 s, and the broker answers `pong` without waking from hibernation. A connection with no message for 90 s is replaced, and a new connection from the node replaces the old one. The broker waits 30 s for a reply. A request still in flight when the connection drops, or when the wait runs out, is `result_unknown`; with no connection at all, it is `node_offline`.
+
 ## 6. Operations / jobs / idempotency
 
 **Operations and jobs are separate.** An operation is the acceptance of a request and the uniqueness of its side effect; a job is the state of an ongoing execution.
@@ -218,6 +222,14 @@ Initial target: Linux with systemd, single user, single node.
 ### Cloud MCP
 
 Verify external clients' OAuth/OIDC authentication and the binding between Reach users, clients, and nodes. Syntoria Gate can be used as the issuer, but it is not a required runtime dependency of the Reach core. Token issuer / audience / expiry / scopes etc. are verified, and users and nodes are never determined from unverified request parameters.
+
+**Implemented so far (one user, one node).** The gateway is a resource server of Syntoria Gate and holds no OAuth state.
+- **Clients and approval**: MCP hosts register with Gate dynamically and get Gate's opaque access tokens after the person signs in with GitHub and approves the connection. The gateway's protected-resource metadata names Gate as the authorization server.
+- **Tokens**: every MCP request's token is introspected at Gate with the gateway's resource client credentials, and nothing is cached. The issuer, the audience (the gateway's MCP URL, a resource registered in Gate under its cookie parent), the expiry, Gate's approval and the client are checked, using the bearer verification of Gate's SDK. An invalid token is 401; Gate being unreachable is 503, never a sign-out.
+- **Admission**: only the configured subject (`OWNER_SUBJECT`, `github:<ID>`) is admitted. Any other is 403.
+- **The node**: it authenticates with the node token, a Worker secret.
+- **Authorization on Linux**: every remote request acts as the one Reach client named in the daemon's `remote` config, and the daemon authorizes it with that client's grants. The gateway asserts no other identity.
+- **Revocation**: revoking a connection on Gate's `/connections` stops it at its next request. Removing `remote` or rotating the node token cuts off all remote access.
 
 ### Linux runtime
 

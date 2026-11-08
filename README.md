@@ -53,7 +53,7 @@ Each service can be used independently. When a Weave MCP event should trigger a 
 
 Linux, one user, one node: file operations, permitted command execution, asynchronous jobs, **agent sessions**, permission management, operation history, and remote MCP connections. A local end-to-end run in which DaVinci uses Reach as its execution runtime is part of the initial acceptance criteria. Browser/GUI operation, multiple nodes, managing local agent launches, and WebRTC P2P are candidates for later extensions.
 
-Only **Stages 1 (Local Core) and 2 (Linux Execution) of ARCHITECTURE.md §11 are implemented** so far. Everything else described here is design and does not indicate implemented functionality.
+So far, **Stages 1 (Local Core) and 2 (Linux Execution) of ARCHITECTURE.md §11 are implemented, and Stage 4 (Remote MCP) in part**: remote MCP clients that the owner approved in Syntoria Gate can use workspaces and agent sessions on one node. Everything else described here is design and does not indicate implemented functionality.
 
 ## Running Reach (Stages 1–2)
 
@@ -61,7 +61,7 @@ A single Go daemon, `reach`. It serves the local API as HTTP/JSON over a Unix so
 
 Workspaces live on the [Orca](https://www.onorca.dev/) server of the same host. A caller creates a workspace from a project (a repository registered in Orca); Reach creates it as an Orca worktree through the Orca CLI, and only that caller can use and delete it. Callers never talk to Orca or to the agent protocols themselves: they use Reach's methods, and Reach drives Orca and the agents.
 
-The implementation lives in `src/` (Go module `github.com/takezoh/syntoria-reach/src`).
+The implementation lives in `src/` (Go module `github.com/takezoh/syntoria-reach/src`). To install it as a systemd user service, give [INSTALL.md](INSTALL.md) to a coding agent on the host; it is a prompt that checks the prerequisites, agrees on the configuration with you, and installs and verifies the service. The manual steps are:
 
 ~~~sh
 cd src && go build -o ~/.local/bin/reach ./cmd/reach
@@ -115,10 +115,27 @@ Requests are JSON sent to `POST /v1/<method>` with `Authorization: Bearer <token
 - Commands, jobs, and agent harnesses are children of the daemon and die with it. Operations, jobs, and sessions that were running when the daemon stopped become `unknown` at the next start. They are never re-executed or resumed automatically.
 - Sandboxing: agents rely on their harness. Codex runs with its `sandbox` mode (default `workspace-write`) and approvals disabled; Claude Code runs with the permission mode and sandbox settings of its configured command and settings (Reach appends only the stream-json and session flags); ACP agents get no file system or terminal capabilities from Reach, and permission requests are denied unless `allow_permissions` is set. Reach does not sandbox commands and jobs: they run as the daemon's user, restricted to the allowlist and a minimal environment.
 - Orca creates new workspaces from the repository's default base (e.g. `origin/main`); unpushed local commits are not included.
-- Remote MCP (Cloudflare) is not implemented yet.
+
+## Remote MCP (Stage 4, in part)
+
+The gateway in `cloud/` is a Cloudflare Worker: a remote MCP endpoint (MCP Streamable HTTP, stateless) that accepts [Syntoria Gate](https://github.com/takezoh/syntoria-gate) access tokens, and a Durable Object that holds the WebSocket the daemon opens to it. With `remote` in its config, the daemon dials out to the gateway, so no inbound port is needed, and serves the requests that arrive there with the same methods as the local API.
+
+~~~json
+"remote": {"url": "wss://reach-api.<parent>/connect", "token": "<node token>", "client": "remote"}
+~~~
+
+- **Tools**: `list_projects`, `list_workspaces`, `create_workspace`, `delete_workspace`, `start_agent_session`, `send_agent_prompt`, `read_agent_events`, `get_agent_session`, `stop_agent_session`, `get_operation`. Their arguments and results are those of the local API methods; Reach errors come back as tool errors (`{"error": {"code", "message"}}`).
+- **Who may connect**: Gate signs the person in with GitHub, registers each MCP host (dynamic client registration) and has the person approve its connection; `/connections` on Gate revokes one. The gateway's MCP URL is a resource registered in Gate, so the gateway lives under Gate's cookie parent (`reach-api.<parent>`). It checks every request's token with Gate (introspection, nothing cached) and admits only the configured person, `OWNER_SUBJECT`.
+- **What they may do**: every remote request acts as the configured `client`, and the daemon authorizes it with that client's grants, as for the local API. Give that client only what remote AIs should do.
+- **Node**: one node per gateway. The daemon authenticates with the node token (a Worker secret), pings every 30 s and reconnects with backoff. A new connection replaces the old one.
+- **Failures**: `node_offline` when the daemon is not connected (nothing ran). `result_unknown` when the connection dropped or the node did not answer within 30 s: the request may have run, so check it with `get_operation` or resend it with the same `operation_id`. Long work is a session or job the caller polls; a disconnect never stops it.
+- The gateway stores nothing but the Durable Object's connection. Workspaces, sessions and events stay on Linux.
+
+Deploying the gateway and connecting the daemon are part of [INSTALL.md](INSTALL.md). For development, `npm install` and `npm run check` in `cloud/`; `REACH_E2E_GATEWAY=1 go test ./cmd/reach -run TestRemoteE2E` runs the gateway in workerd (`wrangler dev`) against a fake Gate and drives the whole remote path as an MCP client.
 
 ## Documents
 
+- [INSTALL.md](INSTALL.md) — prompt for a coding agent that installs or updates Reach on a host
 - [PRODUCT.md](PRODUCT.md) — product definition, user value, MVP
 - [ARCHITECTURE.md](ARCHITECTURE.md) — technical overview, boundaries, execution/connection/recovery contracts
 - [docs/davinci-execution-integration.md](docs/davinci-execution-integration.md) — separation of responsibilities between DaVinci and Reach, references to the existing implementation, staged migration and verification

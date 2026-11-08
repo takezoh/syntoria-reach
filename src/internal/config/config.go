@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -20,6 +22,16 @@ type Config struct {
 	Agents   []Agent   `json:"agents"`
 	Projects []Project `json:"projects"`
 	Clients  []Client  `json:"clients"`
+	Remote   *Remote   `json:"remote"`
+}
+
+// Remote connects the daemon to the Reach gateway (Cloudflare) so that remote
+// MCP clients reach it. Every request that arrives through the gateway acts
+// as the client named Client, with that client's grants.
+type Remote struct {
+	URL    string `json:"url"`    // the gateway's connect endpoint: wss://, or ws:// to a loopback host
+	Token  string `json:"token"`  // the node token the gateway expects
+	Client string `json:"client"` // ID of a client in Clients
 }
 
 // Agent is an agent harness Reach can start (see core.Harness). The
@@ -195,5 +207,37 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	if r := c.Remote; r != nil {
+		if err := checkRemoteURL(r.URL); err != nil {
+			return fmt.Errorf("remote: %w", err)
+		}
+		if len(r.Token) < 32 {
+			return errors.New("remote: token must be at least 32 characters")
+		}
+		if !clients[r.Client] {
+			return fmt.Errorf("remote: unknown client %q", r.Client)
+		}
+	}
 	return nil
+}
+
+// checkRemoteURL accepts wss:// URLs, and ws:// URLs to a loopback host (a
+// gateway running locally with wrangler dev). The node token must never
+// travel in the clear.
+func checkRemoteURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("url %q is not an absolute URL", raw)
+	}
+	switch u.Scheme {
+	case "wss":
+		return nil
+	case "ws":
+		host := u.Hostname()
+		if ip := net.ParseIP(host); host == "localhost" || (ip != nil && ip.IsLoopback()) {
+			return nil
+		}
+		return fmt.Errorf("url %q: ws:// is allowed only to a loopback host; use wss://", raw)
+	}
+	return fmt.Errorf("url %q must use wss://", raw)
 }

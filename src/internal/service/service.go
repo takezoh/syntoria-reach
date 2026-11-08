@@ -118,6 +118,18 @@ func (s *Service) Authenticate(token string) (*Client, error) {
 	return found, nil
 }
 
+// ClientByID returns the configured client with that ID. The remote
+// connector acts as one configured client: the gateway has authenticated
+// the remote caller, and the client's grants bound what it may do.
+func (s *Service) ClientByID(id string) (*Client, bool) {
+	for _, c := range s.clients {
+		if c.ID == id {
+			return c, true
+		}
+	}
+	return nil, false
+}
+
 // authorize resolves one of the client's ready workspaces on which the
 // client holds perm (through the workspace's project).
 func (s *Service) authorize(c *Client, workspaceID, perm string) (*ws, error) {
