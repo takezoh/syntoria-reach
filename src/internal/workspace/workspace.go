@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/ids"
@@ -269,3 +270,43 @@ func (Folders) Make(path string) error {
 // Remove removes the folder path and everything in it. Symlinks, including
 // path itself, are removed rather than followed.
 func (Folders) Remove(path string) error { return os.RemoveAll(path) }
+
+// List returns the names of the folders in dir, none when dir does not
+// exist. A symlink is not a folder.
+func (Folders) List(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return names, nil
+}
+
+// ChangedSince reports whether the folder path, or anything in it, was
+// modified at or after t. Symlinks are not followed.
+func (Folders) ChangedSince(path string, t time.Time) (bool, error) {
+	changed := false
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.ModTime().Before(t) {
+			changed = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return changed, err
+}

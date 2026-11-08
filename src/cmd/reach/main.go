@@ -99,10 +99,11 @@ func run() error {
 	return nil
 }
 
-// cleanupInterval is how often completed workspaces are checked for removal.
+// cleanupInterval is how often workspaces are checked for removal.
 const cleanupInterval = time.Hour
 
-// cleanup removes due completed workspaces now and every cleanupInterval.
+// cleanup removes due completed workspaces, and the folders of projects
+// removed in Orca, now and every cleanupInterval.
 func cleanup(ctx context.Context, svc *service.Service) {
 	t := time.NewTicker(cleanupInterval)
 	defer t.Stop()

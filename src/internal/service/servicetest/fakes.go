@@ -635,19 +635,19 @@ func (o *Orca) Calls() []string {
 // Folders keeps the set of existing folders in memory.
 type Folders struct {
 	mu   sync.Mutex
-	dirs map[string]bool
+	dirs map[string]time.Time // folder -> when something in it last changed
 }
 
 func (f *Folders) Make(p string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.dirs[p] {
+	if _, ok := f.dirs[p]; ok {
 		return fmt.Errorf("mkdir %s: file exists", p)
 	}
 	if f.dirs == nil {
-		f.dirs = map[string]bool{}
+		f.dirs = map[string]time.Time{}
 	}
-	f.dirs[p] = true
+	f.dirs[p] = time.Now()
 	return nil
 }
 
@@ -658,9 +658,39 @@ func (f *Folders) Remove(p string) error {
 	return nil
 }
 
+func (f *Folders) List(dir string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var names []string
+	for p := range f.dirs {
+		if path.Dir(p) == dir {
+			names = append(names, path.Base(p))
+		}
+	}
+	return names, nil
+}
+
+func (f *Folders) ChangedSince(p string, t time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	at, ok := f.dirs[p]
+	if !ok {
+		return false, fmt.Errorf("lstat %s: no such file or directory", p)
+	}
+	return !at.Before(t), nil
+}
+
+// Change sets when something in folder p last changed.
+func (f *Folders) Change(p string, at time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dirs[p] = at
+}
+
 // Exists reports whether the folder p exists.
 func (f *Folders) Exists(p string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.dirs[p]
+	_, ok := f.dirs[p]
+	return ok
 }

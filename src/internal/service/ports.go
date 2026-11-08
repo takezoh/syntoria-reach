@@ -119,6 +119,12 @@ type Folders interface {
 	Make(path string) error
 	// Remove removes the folder path and everything in it.
 	Remove(path string) error
+	// List returns the names of the folders in dir, none when dir does not
+	// exist.
+	List(dir string) ([]string, error)
+	// ChangedSince reports whether the folder path, or anything in it,
+	// changed at or after t.
+	ChangedSince(path string, t time.Time) (bool, error)
 }
 
 // NewID returns prefix followed by a unique random suffix.

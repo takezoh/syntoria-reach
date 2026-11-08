@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -196,5 +197,47 @@ func TestFolders(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
 		t.Fatal("removal followed a symlink")
+	}
+}
+
+// Cleanup finds workspace folders and tells whether anything in one changed
+// lately, never through a symlink out of it.
+func TestFoldersListAndChanges(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "workspaces")
+	if names, err := (Folders{}).List(base); err != nil || len(names) != 0 {
+		t.Fatalf("list a missing folder: %q %v", names, err)
+	}
+	path := filepath.Join(base, "reach-ws")
+	if err := (Folders{}).Make(path); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	target := filepath.Join(outside, "target")
+	os.WriteFile(target, []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(base, "file"), nil, 0o644)
+	os.Symlink(outside, filepath.Join(base, "reach-link"))
+	if names, err := (Folders{}).List(base); err != nil || !slices.Equal(names, []string{"reach-ws"}) {
+		t.Fatalf("list = %q %v", names, err)
+	}
+
+	nested := filepath.Join(path, "a", "b", "f")
+	os.MkdirAll(filepath.Dir(nested), 0o755)
+	os.WriteFile(nested, []byte("x"), 0o644)
+	os.Symlink(target, filepath.Join(path, "link"))
+	old := time.Now().Add(-48 * time.Hour)
+	for _, p := range []string{nested, filepath.Dir(nested), filepath.Join(path, "a"), path} {
+		os.Chtimes(p, old, old)
+	}
+	since := time.Now() // after everything in the folder was written
+	os.Chtimes(target, since.Add(time.Hour), since.Add(time.Hour))
+	if changed, err := (Folders{}).ChangedSince(path, since); err != nil || changed {
+		t.Fatalf("only the symlink's target changed: %v %v", changed, err)
+	}
+	os.Chtimes(nested, since, since)
+	if changed, err := (Folders{}).ChangedSince(path, since); err != nil || !changed {
+		t.Fatalf("a file deep in the folder changed: %v %v", changed, err)
+	}
+	if _, err := (Folders{}).ChangedSince(filepath.Join(base, "reach-gone"), since); err == nil {
+		t.Fatal("a missing folder has no changes to tell")
 	}
 }

@@ -220,6 +220,55 @@ func TestCleanup(t *testing.T) {
 	}
 }
 
+// A project removed in Orca, outside Reach, leaves its folder, which
+// cleanup removes once nothing in it changed for core.CleanupAfter. Folders
+// that are not Reach's, or that an Orca project still has, stay.
+func TestCleanupRemovesFoldersOfProjectsRemovedInOrca(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+	old := now.Add(-core.CleanupAfter - time.Hour)
+	gone := f.newWorkspace(t, f.a, "gone")   // removed in Orca, untouched since
+	fresh := f.newWorkspace(t, f.a, "fresh") // removed in Orca, changed since
+	kept := f.newWorkspace(t, f.a, "kept")   // still in Orca, not completed
+	for _, id := range []string{gone, fresh} {
+		f.fakes.Orca.DeleteProject(ctx, id)
+	}
+	f.fakes.Folders.Make("/w/notes") // not a workspace folder
+	f.fakes.Folders.Make("/w/reach-renamed")
+	f.fakes.Orca.AddRepo(core.Repo{ID: "renamed", DisplayName: "renamed", Path: "/w/reach-renamed", Kind: "folder"})
+	for _, p := range []string{"/w/reach-gone", "/w/notes", "/w/reach-renamed", "/w/reach-kept", f.root} {
+		f.fakes.Folders.Change(p, old)
+	}
+
+	// Without Orca's list of projects, nothing is removed.
+	f.fakes.Orca.FailList = true
+	if _, err := f.svc.Cleanup(ctx, now); err == nil || !f.fakes.Folders.Exists("/w/reach-gone") {
+		t.Fatalf("cleanup without Orca: %v", err)
+	}
+	f.fakes.Orca.FailList = false
+
+	if removed, err := f.svc.Cleanup(ctx, now); err != nil || len(removed) != 0 {
+		t.Fatalf("removed %q %v", removed, err)
+	}
+	if f.fakes.Folders.Exists("/w/reach-gone") {
+		t.Fatal("the folder of a project removed in Orca stayed")
+	}
+	for _, p := range []string{"/w/reach-fresh", "/w/notes", "/w/reach-renamed", "/w/reach-kept", f.root} {
+		if !f.fakes.Folders.Exists(p) {
+			t.Errorf("%s was removed", p)
+		}
+	}
+	if f.fakes.Orca.Root(kept) == nil {
+		t.Error("a workspace still in Orca was removed")
+	}
+	if !slices.ContainsFunc(f.fakes.Store.AuditRecords(), func(r core.AuditRecord) bool {
+		return r.Action == "cleanup_folder" && r.Target == "reach-gone"
+	}) {
+		t.Error("the removal was not audited")
+	}
+}
+
 // Cleanup never removes a workspace a request is using: here it runs while
 // a command runs in a workspace that is otherwise due (a command leaves no
 // record that makes the workspace busy).

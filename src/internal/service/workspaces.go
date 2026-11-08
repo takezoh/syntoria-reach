@@ -178,8 +178,15 @@ func (s *Service) reopen(ctx context.Context, id string) {
 // Cleanup removes the workspaces that are completed and have had no
 // activity, in Orca or through Reach, for core.CleanupAfter: their Orca
 // projects and the folders Reach created for them. It returns the IDs of
-// the workspaces removed.
+// the workspaces removed. It also removes the folders Reach created for
+// workspaces whose projects were removed in Orca (see cleanupLeftovers).
 func (s *Service) Cleanup(ctx context.Context, now time.Time) ([]string, error) {
+	removed, err := s.cleanupProjects(ctx, now)
+	return removed, errors.Join(err, s.cleanupLeftovers(ctx, now))
+}
+
+// cleanupProjects removes the completed workspaces that are due.
+func (s *Service) cleanupProjects(ctx context.Context, now time.Time) ([]string, error) {
 	repos, roots, err := s.workspaceProjects(ctx)
 	if err != nil {
 		return nil, err
@@ -243,6 +250,48 @@ func (s *Service) cleanup(ctx context.Context, r *core.Repo, root *core.Worktree
 		}
 	}
 	return true, nil
+}
+
+// cleanupLeftovers removes the folders Reach created for workspaces whose
+// Orca projects are gone, as when a project is removed in Orca, which leaves
+// its folder. A folder goes once nothing in it changed for
+// core.CleanupAfter, so that a folder being created, or one Orca leaves out
+// for a while, stays; a folder any Orca project has, under any name, stays.
+func (s *Service) cleanupLeftovers(ctx context.Context, now time.Time) error {
+	names, err := s.folders.List(s.workspaces)
+	if err != nil {
+		return fmt.Errorf("list the workspace folders: %w", err)
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	repos, err := s.orca.Repos(ctx)
+	if err != nil {
+		return orcaError(err)
+	}
+	inOrca := map[string]bool{}
+	for _, r := range repos {
+		inOrca[filepath.Clean(r.Path)] = true
+	}
+	var errs []error
+	for _, name := range names {
+		path := filepath.Join(s.workspaces, name)
+		if !core.OwnFolder(s.workspaces, path, name) || inOrca[path] {
+			continue
+		}
+		changed, err := s.folders.ChangedSince(path, now.Add(-core.CleanupAfter))
+		if err == nil && !changed {
+			err = s.folders.Remove(path)
+			if err == nil {
+				s.audit(core.AuditRecord{ClientID: "reach", Action: "cleanup_folder", Target: name}, nil)
+				slog.Info("removed the folder of a workspace no longer in Orca", "folder", path)
+			}
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("folder %s: %w", path, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // openTerminals returns the workspaces (repo IDs) with an open terminal in
