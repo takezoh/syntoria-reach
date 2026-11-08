@@ -38,6 +38,7 @@ func (s *Service) StartJob(ctx context.Context, c *Client, req StartJobRequest) 
 		s.audit(rec, err)
 		return nil, err
 	}
+	defer w.release() // until the job is recorded
 	return s.operation(c, "start_job", req.OperationID, req, rec, func() (any, error) {
 		id := s.newID("job_")
 		if err := s.store.CreateJob(&core.Job{ID: id, ClientID: c.ID, WorkspaceID: req.Workspace, Executable: req.Executable}); err != nil {
@@ -164,6 +165,9 @@ type StartAgentSessionRequest struct {
 func (s *Service) StartAgentSession(ctx context.Context, c *Client, req StartAgentSessionRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "start_agent_session", WorkspaceID: req.Workspace, Target: req.Agent, OperationID: req.OperationID}
 	w, err := s.authorize(ctx, c, req.Workspace, core.PermAgentRun)
+	if err == nil {
+		defer w.release() // until the session is recorded
+	}
 	a, known := s.harness[req.Agent]
 	if err == nil && (!known || !slices.Contains(w.agents, req.Agent)) {
 		err = core.Errorf(core.CodePermissionDenied, "agent %q is not allowed on workspace %q", req.Agent, req.Workspace)

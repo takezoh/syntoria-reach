@@ -38,13 +38,15 @@ type Client struct {
 	perms []string
 }
 
-// ws is a workspace Orca reported, which the caller may use.
+// ws is a workspace Orca reported, which the caller may use. The request
+// holds it until release, which keeps cleanup from removing it meanwhile.
 type ws struct {
 	id       string
 	root     string
 	commands []string
 	agents   []string
 	files    Files
+	release  func()
 }
 
 // Service is the Reach application service.
@@ -67,8 +69,9 @@ type Service struct {
 	filesMu sync.Mutex
 	files   map[string]openRoot // open roots of workspaces, by workspace ID
 
-	deletingMu sync.Mutex
-	deleting   map[string]bool // workspaces being deleted
+	useMu    sync.Mutex
+	users    map[string]int  // requests holding a workspace, by workspace ID
+	removing map[string]bool // workspaces cleanup is removing
 }
 
 // openRoot is the open root of a workspace at the path Orca last reported.
@@ -92,7 +95,8 @@ func New(cfg *config.Config, d Deps) *Service {
 		commands:   cfg.Commands,
 		harness:    map[string]config.Agent{},
 		files:      map[string]openRoot{},
-		deleting:   map[string]bool{},
+		users:      map[string]int{},
+		removing:   map[string]bool{},
 	}
 	for _, a := range cfg.Agents {
 		s.harness[a.ID] = a
@@ -146,18 +150,21 @@ func (s *Service) authorize(ctx context.Context, c *Client, workspaceID, perm st
 	if !slices.Contains(c.perms, perm) {
 		return nil, core.Errorf(core.CodePermissionDenied, "%s is not allowed", perm)
 	}
-	if s.isDeleting(workspaceID) {
+	release, ok := s.use(workspaceID)
+	if !ok {
 		return nil, core.Errorf(core.CodeInvalidState, "workspace is being removed")
 	}
 	r, err := s.repo(ctx, workspaceID)
 	if err != nil {
+		release()
 		return nil, err
 	}
 	f, err := s.workspaceFiles(workspaceID, r.Path)
 	if err != nil {
+		release()
 		return nil, internal(err)
 	}
-	return &ws{id: workspaceID, root: r.Path, commands: s.commands, agents: s.agentIDs, files: f}, nil
+	return &ws{id: workspaceID, root: r.Path, commands: s.commands, agents: s.agentIDs, files: f, release: release}, nil
 }
 
 // workspaceFiles returns the open root of a workspace at path, reopening it
@@ -209,6 +216,7 @@ func (s *Service) ListFiles(ctx context.Context, c *Client, req ListFilesRequest
 	if err != nil {
 		return nil, err
 	}
+	defer w.release()
 	entries, truncated, err := w.files.List(req.Path, maxListEntries)
 	if err != nil {
 		return nil, classify(err)
@@ -235,6 +243,7 @@ func (s *Service) ReadFile(ctx context.Context, c *Client, req ReadFileRequest) 
 	if err != nil {
 		return nil, err
 	}
+	defer w.release()
 	if req.Limit == 0 {
 		req.Limit = defaultReadSize
 	}
@@ -267,6 +276,9 @@ type WriteFileResult struct {
 func (s *Service) WriteFile(ctx context.Context, c *Client, req WriteFileRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "write_file", WorkspaceID: req.Workspace, Target: req.Path, OperationID: req.OperationID}
 	w, err := s.authorize(ctx, c, req.Workspace, core.PermFileWrite)
+	if err == nil {
+		defer w.release()
+	}
 	if err == nil && len(req.Content) > maxWriteSize {
 		err = core.Errorf(core.CodeInvalidRequest, "content exceeds %d bytes", maxWriteSize)
 	}
@@ -302,6 +314,7 @@ func (s *Service) RunCommand(ctx context.Context, c *Client, req RunCommandReque
 		s.audit(rec, err)
 		return nil, err
 	}
+	defer w.release()
 	ctx = context.WithoutCancel(ctx)
 	return s.operation(c, "run_command", req.OperationID, req, rec, func() (any, error) {
 		res, err := s.runCommand(ctx, core.CommandSpec{
@@ -319,17 +332,19 @@ func (s *Service) RunCommand(ctx context.Context, c *Client, req RunCommandReque
 }
 
 // authorizeExecutable resolves a workspace on which the client may run
-// executable and the requested timeout.
+// executable and the requested timeout. The caller releases the workspace.
 func (s *Service) authorizeExecutable(ctx context.Context, c *Client, workspaceID, executable string, seconds int, def, max time.Duration) (*ws, time.Duration, error) {
 	w, err := s.authorize(ctx, c, workspaceID, core.PermCommandRun)
 	if err != nil {
 		return nil, 0, err
 	}
 	if !slices.Contains(w.commands, executable) {
+		w.release()
 		return nil, 0, core.Errorf(core.CodePermissionDenied, "executable %q is not allowed on workspace %q", executable, workspaceID)
 	}
 	timeout, err := core.Timeout(seconds, def, max)
 	if err != nil {
+		w.release()
 		return nil, 0, err
 	}
 	return w, timeout, nil

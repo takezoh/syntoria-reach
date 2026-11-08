@@ -303,6 +303,8 @@ func (j *Jobs) ReadOutput(id, stream string, offset int64, limit int) (*core.Job
 type Agents struct {
 	// StartErr, if set, makes Start fail.
 	StartErr error
+	// OnStart, if set, runs at the start of Start, before the session runs.
+	OnStart func()
 
 	mu       sync.Mutex
 	starts   map[string]core.AgentStart
@@ -316,6 +318,9 @@ type fakeSession struct {
 }
 
 func (a *Agents) Start(_ context.Context, id string, s core.AgentStart, events core.AgentEvents) (string, error) {
+	if a.OnStart != nil {
+		a.OnStart()
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.StartErr != nil {

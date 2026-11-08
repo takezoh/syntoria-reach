@@ -219,3 +219,39 @@ func TestCleanup(t *testing.T) {
 		t.Fatalf("second run removed %q %v", removed, err)
 	}
 }
+
+// Cleanup never removes a workspace a request is using: here it runs while
+// a command runs in a workspace that is otherwise due (a command leaves no
+// record that makes the workspace busy).
+func TestCleanupSkipsWorkspacesInUse(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+	f.fakes.Store.Now = func() time.Time { return now.Add(-core.CleanupAfter - time.Hour) }
+	f.svc.UpdateWorkspace(ctx, f.a, service.UpdateWorkspaceRequest{OperationID: "done", Workspace: f.ws, Status: "completed"})
+	f.fakes.Orca.Touch(f.ws, now.Add(-core.CleanupAfter-time.Hour))
+	f.fakes.Store.Now = func() time.Time { return now.Add(-core.CleanupAfter - time.Hour) }
+
+	var during []string
+	f.fakes.Commands.Result = func(core.CommandSpec) (*core.CommandResult, error) {
+		var err error
+		if during, err = f.svc.Cleanup(ctx, now); err != nil {
+			t.Error(err)
+		}
+		return &core.CommandResult{}, nil
+	}
+	if op, err := f.svc.RunCommand(ctx, f.a, service.RunCommandRequest{OperationID: "c", Workspace: f.ws, Executable: "/bin/sh"}); err != nil || op.State != core.StateSucceeded {
+		t.Fatalf("run_command: %+v %v", op, err)
+	}
+	if len(during) != 0 || f.fakes.Orca.Root(f.ws) == nil || !f.fakes.Folders.Exists(f.root) {
+		t.Fatalf("cleanup removed a workspace while a command ran in it: %q", during)
+	}
+	// Once the request is over, the workspace is due again.
+	if removed, err := f.svc.Cleanup(ctx, now); err != nil || len(removed) != 1 {
+		t.Fatalf("after the command: %q %v", removed, err)
+	}
+	// And a request cannot take a workspace being removed: it is gone.
+	if _, err := f.svc.ReadFile(ctx, f.a, service.ReadFileRequest{Workspace: f.ws, Path: "x"}); code(err) != core.CodeNotFound {
+		t.Fatalf("removed workspace: %v", err)
+	}
+}

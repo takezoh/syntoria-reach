@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
@@ -202,10 +203,12 @@ func (s *Service) Cleanup(ctx context.Context, now time.Time) ([]string, error) 
 // cleanup removes one completed workspace if it is due, and reports whether
 // its Orca project was removed.
 func (s *Service) cleanup(ctx context.Context, r *core.Repo, root *core.Worktree, now time.Time) (bool, error) {
-	if !s.markDeleting(r.ID) {
+	// A workspace a request holds is skipped; once marked, no request can
+	// take it, and the jobs and sessions of earlier requests are recorded.
+	if !s.beginRemoval(r.ID) {
 		return false, nil
 	}
-	defer s.unmarkDeleting(r.ID)
+	defer s.endRemoval(r.ID)
 	busy, err := s.store.WorkspaceBusy(r.ID)
 	if err != nil {
 		return false, err
@@ -291,26 +294,43 @@ func (s *Service) workspace(ctx context.Context, id string) (*core.Repo, *core.W
 	return nil, nil, core.Errorf(core.CodeOrcaFailed, "Orca reported no root entry for workspace %q", id)
 }
 
-func (s *Service) markDeleting(id string) bool {
-	s.deletingMu.Lock()
-	defer s.deletingMu.Unlock()
-	if s.deleting[id] {
+// use holds workspace id for a request until the returned release is
+// called. It fails while cleanup is removing the workspace.
+func (s *Service) use(id string) (release func(), ok bool) {
+	s.useMu.Lock()
+	defer s.useMu.Unlock()
+	if s.removing[id] {
+		return nil, false
+	}
+	s.users[id]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.useMu.Lock()
+			defer s.useMu.Unlock()
+			if s.users[id]--; s.users[id] == 0 {
+				delete(s.users, id)
+			}
+		})
+	}, true
+}
+
+// beginRemoval marks workspace id as being removed, unless a request holds
+// it or it is marked already.
+func (s *Service) beginRemoval(id string) bool {
+	s.useMu.Lock()
+	defer s.useMu.Unlock()
+	if s.removing[id] || s.users[id] > 0 {
 		return false
 	}
-	s.deleting[id] = true
+	s.removing[id] = true
 	return true
 }
 
-func (s *Service) unmarkDeleting(id string) {
-	s.deletingMu.Lock()
-	defer s.deletingMu.Unlock()
-	delete(s.deleting, id)
-}
-
-func (s *Service) isDeleting(id string) bool {
-	s.deletingMu.Lock()
-	defer s.deletingMu.Unlock()
-	return s.deleting[id]
+func (s *Service) endRemoval(id string) {
+	s.useMu.Lock()
+	defer s.useMu.Unlock()
+	delete(s.removing, id)
 }
 
 // orcaError classifies a failed Orca call; every failure is orca_failed.
