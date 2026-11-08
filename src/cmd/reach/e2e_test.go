@@ -1,10 +1,12 @@
 package main
 
-// End-to-end test against the real binary: standalone use over the Unix
+// End-to-end tests against the real binary: standalone use over the Unix
 // socket, idempotent resend, survival of a client disconnect, background jobs,
 // an agent session in an Orca terminal (with a fake Orca CLI), and a daemon
 // crash that kills its children and leaves their outcome unknown (never
 // re-executed), while the agent, which Orca runs, keeps its conversation.
+// Without Orca, workspaces are local and the agent is a child of the daemon
+// (a fake agent speaking Claude Code's stream-json), which ends with it.
 
 import (
 	"bytes"
@@ -20,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/takezoh/syntoria-reach/src/internal/agent/agenttest"
 	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
 )
 
@@ -34,9 +37,18 @@ type daemon struct {
 	client *http.Client
 }
 
-// newDaemon builds the daemon and its config. extra holds more top-level
-// config fields, each ending with a comma.
+// newDaemon builds the daemon and its config, on a fake Orca. extra holds
+// more top-level config fields, each ending with a comma. It returns the
+// path the workspace "ws" will have.
 func newDaemon(t *testing.T, extra ...string) (*daemon, string) {
+	t.Helper()
+	return buildDaemon(t, false, extra...)
+}
+
+// buildDaemon builds the daemon and its config, on a fake Orca or, if
+// local, with local workspaces and a fake Claude agent, which writes its PID
+// to agent.pid next to the socket.
+func buildDaemon(t *testing.T, local bool, extra ...string) (*daemon, string) {
 	t.Helper()
 	// Unix socket paths are limited to ~108 bytes, so avoid long temp dirs.
 	dir, err := os.MkdirTemp("/tmp", "reach-e2e-")
@@ -53,18 +65,29 @@ func newDaemon(t *testing.T, extra ...string) (*daemon, string) {
 	if err := os.Mkdir(orcaRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	workspaces := orcaRoot
 	ws := filepath.Join(orcaRoot, "reach-ws") // created by the fake Orca
 	sock := filepath.Join(dir, "reach.sock")
-	agent, _ := json.Marshal(map[string]any{"id": "claude", "command": []string{"/bin/claude", "--model", "claude-opus-5-5", "--effort", "xhigh"}})
+	agent, _ := json.Marshal(map[string]any{"id": "claude", "role": "Writes and reviews code",
+		"command": []string{"/bin/claude", "--model", "claude-opus-5-5", "--effort", "xhigh"}})
 	orca, _ := json.Marshal(orcatest.Command(t, "TestFakeOrca", orcaRoot))
+	backend := `"orca": ` + string(orca) + `,`
+	if local {
+		workspaces = filepath.Join(dir, "workspaces")
+		ws = filepath.Join(workspaces, "reach-ws")
+		cmd, env := agenttest.Agent(t, "claude", "TestFakeAgent")
+		env["REACH_FAKE_PID_FILE"] = filepath.Join(dir, "agent.pid")
+		agent, _ = json.Marshal(map[string]any{"id": "claude", "role": "Writes and reviews code", "protocol": "claude", "command": cmd, "env": env})
+		backend = ""
+	}
 	cfg := fmt.Sprintf(`{
 		%s
 		"socket": %q, "database": %q, "workspaces": %q,
-		"orca": %s,
+		%s
 		"agents": [%s],
 		"commands": ["/bin/sh"],
 		"clients": [{"id": "e2e", "token": %q, "allow": ["workspace.create", "file.read", "file.write", "command.run", "agent.run"]}]
-	}`, strings.Join(extra, "\n"), sock, filepath.Join(dir, "reach.db"), orcaRoot, orca, agent, e2eToken)
+	}`, strings.Join(extra, "\n"), sock, filepath.Join(dir, "reach.db"), workspaces, backend, agent, e2eToken)
 	config := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(config, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -373,8 +396,86 @@ func TestE2E(t *testing.T) {
 	}
 }
 
+// Without Orca, a workspace is a folder Reach records, and an agent is a
+// process of the daemon: its reply is the agent's last message of the turn,
+// and it ends with the daemon, while the workspace stays.
+func TestLocalE2E(t *testing.T) {
+	d, ws := buildDaemon(t, true)
+	d.start()
+
+	caps := d.mustCall("list_capabilities", map[string]any{})
+	if agents, _ := caps["agents"].([]any); len(agents) != 1 || agents[0].(map[string]any)["id"] != "claude" || agents[0].(map[string]any)["role"] != "Writes and reviews code" {
+		t.Fatalf("list_capabilities: %v", caps)
+	}
+	created := d.mustCall("create_workspace", map[string]any{"operation_id": "cw", "name": "ws", "note": "e2e: local workspaces"})
+	wsID := result(created)["workspace"]
+	if created["state"] != "succeeded" || result(created)["path"] != ws || result(created)["status"] != "in-progress" {
+		t.Fatalf("create_workspace: %v", created)
+	}
+	if info, err := os.Stat(ws); err != nil || !info.IsDir() {
+		t.Fatalf("workspace folder: %v", err)
+	}
+	if op := d.mustCall("write_file", map[string]any{"operation_id": "w1", "workspace": wsID, "path": "a.txt", "content": []byte("hello")}); op["state"] != "succeeded" {
+		t.Fatalf("write_file: %v", op)
+	}
+
+	op := d.mustCall("start_agent_session", map[string]any{"operation_id": "s1", "workspace": wsID, "agent": "claude"})
+	sessionID := result(op)["session_id"]
+	if op["state"] != "succeeded" || sessionID == nil || result(op)["workspace"] != wsID || result(op)["state"] != "idle" {
+		t.Fatalf("start_agent_session: %v", op)
+	}
+	agentPID := waitFile(t, filepath.Join(filepath.Dir(d.sock), "agent.pid"))
+	prompt := map[string]any{"operation_id": "p1", "session_id": sessionID, "text": "hi"}
+	if op := d.mustCall("send_agent_prompt", prompt); op["state"] != "succeeded" {
+		t.Fatalf("send_agent_prompt: %v", op)
+	}
+	out := d.poll("read_agent_output", map[string]any{"session_id": sessionID}, func(o map[string]any) bool { return o["state"] != "working" })
+	if out["state"] != "idle" || out["reply"] != "echo hi" {
+		t.Fatalf("read_agent_output: %v", out)
+	}
+	// A resent prompt is not delivered again: the agent stays idle.
+	if op := d.mustCall("send_agent_prompt", prompt); op["state"] != "succeeded" {
+		t.Fatalf("resend: %v", op)
+	}
+	if s := d.mustCall("get_agent_session", map[string]any{"session_id": sessionID}); s["state"] != "idle" || s["agent"] != "claude" {
+		t.Fatalf("get_agent_session: %v", s)
+	}
+
+	// The agent is a child of the daemon and dies with it; the workspace
+	// and its files stay.
+	d.kill()
+	waitDead(t, "agent", agentPID)
+	d.start()
+	status, gone, err := d.call(context.Background(), "get_agent_session", map[string]any{"session_id": sessionID})
+	if err != nil || status != http.StatusNotFound {
+		t.Fatalf("session after the restart: %d %v %v", status, gone, err)
+	}
+	if list := d.callList("list_workspaces"); len(list) != 1 || list[0].(map[string]any)["note"] != "e2e: local workspaces" {
+		t.Fatalf("list_workspaces after restart: %v", list)
+	}
+	if read := d.mustCall("read_file", map[string]any{"workspace": wsID, "path": "a.txt"}); read["data"] != "aGVsbG8=" {
+		t.Fatalf("read_file after restart: %v", read)
+	}
+
+	// A new session in the same workspace, stopped by the caller.
+	op = d.mustCall("start_agent_session", map[string]any{"operation_id": "s2", "workspace": wsID, "agent": "claude"})
+	second := result(op)["session_id"]
+	if op := d.mustCall("stop_agent_session", map[string]any{"operation_id": "x2", "session_id": second}); op["state"] != "succeeded" {
+		t.Fatalf("stop_agent_session: %v", op)
+	}
+	if status, _, _ := d.call(context.Background(), "read_agent_output", map[string]any{"session_id": second}); status != http.StatusNotFound {
+		t.Fatalf("read after stop: %d", status)
+	}
+}
+
 // TestFakeOrca is not a test: it turns the test binary into a fake Orca CLI.
 func TestFakeOrca(t *testing.T) {
 	orcatest.MaybeRun()
+	t.Skip("helper process")
+}
+
+// TestFakeAgent is not a test: it turns the test binary into a fake agent.
+func TestFakeAgent(t *testing.T) {
+	agenttest.MaybeRun()
 	t.Skip("helper process")
 }

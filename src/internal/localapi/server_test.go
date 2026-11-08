@@ -12,6 +12,7 @@ import (
 
 	"github.com/takezoh/syntoria-reach/src/internal/config"
 	"github.com/takezoh/syntoria-reach/src/internal/core"
+	"github.com/takezoh/syntoria-reach/src/internal/localws"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 	"github.com/takezoh/syntoria-reach/src/internal/service/servicetest"
 )
@@ -28,10 +29,11 @@ func start(t *testing.T) *http.Client {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	// The service runs on fakes: this package owns HTTP decoding, peer and
 	// token checks and error mapping, not the operations themselves.
+	f := servicetest.New()
 	svc := service.New(&config.Config{
 		Workspaces: "/w",
 		Clients:    []config.Client{{ID: "a", Token: token, Allow: []string{core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite}}},
-	}, servicetest.New().Deps())
+	}, f.Deps(localws.New("/w", f.Records, f.Folders, f.Agents, servicetest.NewIDs())))
 	t.Cleanup(svc.Close)
 
 	sock := filepath.Join(dir, "reach.sock")

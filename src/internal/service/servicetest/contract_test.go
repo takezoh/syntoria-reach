@@ -19,3 +19,7 @@ func TestFilesFake(t *testing.T) {
 		return f
 	})
 }
+
+func TestRecordsFake(t *testing.T) {
+	RecordsContract(t, func(*testing.T) RecordKeeper { return NewRecords() })
+}

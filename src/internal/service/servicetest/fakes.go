@@ -13,7 +13,9 @@ import (
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 )
 
-// Fakes holds one fake per service port.
+// Fakes holds one fake per service port, and the fakes of the ports of the
+// workspace backends (Orca and Folders for orcaws; Records, Folders and
+// Agents for localws).
 type Fakes struct {
 	Store    *Store
 	Files    *Files
@@ -21,6 +23,8 @@ type Fakes struct {
 	Jobs     *Jobs
 	Orca     *Orca
 	Folders  *Folders
+	Records  *Records
+	Agents   *Agents
 }
 
 // New returns fresh fakes.
@@ -32,26 +36,33 @@ func New() *Fakes {
 		Jobs:     &Jobs{},
 		Orca:     &Orca{},
 		Folders:  &Folders{},
+		Records:  NewRecords(),
+		Agents:   &Agents{},
 	}
 }
 
-// Deps wires the fakes as service dependencies. IDs are prefix + a counter.
-func (f *Fakes) Deps() service.Deps {
-	var mu sync.Mutex
-	n := 0
+// Deps wires the fakes as service dependencies, with workspaces as the
+// workspace backend (built on the fakes by the caller).
+func (f *Fakes) Deps(workspaces service.Workspaces) service.Deps {
 	return service.Deps{
 		Store:      f.Store,
 		OpenFiles:  f.Files.Open,
 		RunCommand: f.Commands.Run,
 		Jobs:       f.Jobs,
-		Orca:       f.Orca,
-		Folders:    f.Folders,
-		NewID: func(prefix string) string {
-			mu.Lock()
-			defer mu.Unlock()
-			n++
-			return fmt.Sprintf("%s%d", prefix, n)
-		},
+		Workspaces: workspaces,
+		NewID:      NewIDs(),
+	}
+}
+
+// NewIDs returns an ID source that gives prefix + a counter.
+func NewIDs() func(prefix string) string {
+	var mu sync.Mutex
+	n := 0
+	return func(prefix string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		return fmt.Sprintf("%s%d", prefix, n)
 	}
 }
 
@@ -294,8 +305,8 @@ func (j *Jobs) ReadOutput(id, stream string, offset int64, limit int) (*core.Job
 	return &core.JobOutput{Data: slices.Clone(data[start:end]), Offset: offset, Size: size}, nil
 }
 
-// Orca keeps projects and their root entries in memory, as Orca reports
-// them. Adding a folder named in FailAdd fails; with FailList set, listing
+// Orca is a fake of the Orca CLI (orcaws.Orca). It keeps projects and their
+// root entries in memory, as Orca reports them. Adding a folder named in FailAdd fails; with FailList set, listing
 // fails as when Orca is down.
 type Orca struct {
 	FailAdd  map[string]bool // by folder name

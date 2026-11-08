@@ -13,7 +13,8 @@ import (
 
 func TestCapabilities(t *testing.T) {
 	f := newFixture(t)
-	if c := f.svc.ListCapabilities(f.a); len(c.Permissions) != 5 || !slices.Equal(c.Commands, []string{"/bin/sh"}) || !slices.Equal(c.Agents, []string{"codex", "dsh"}) {
+	if c := f.svc.ListCapabilities(f.a); len(c.Permissions) != 5 || !slices.Equal(c.Commands, []string{"/bin/sh"}) ||
+		!slices.Equal(c.Agents, []core.AgentInfo{{ID: "codex", Role: "Writes code"}, {ID: "dsh", Role: "Reviews code"}}) {
 		t.Fatalf("capabilities of a = %+v", c)
 	}
 	// Commands and agents are listed only with the permission to run them.
@@ -88,7 +89,8 @@ func TestListWorkspaces(t *testing.T) {
 	if err != nil || len(list) != 2 || list[0].ID != second || list[1].ID != f.ws {
 		t.Fatalf("workspaces = %+v %v", list, err)
 	}
-	if *list[1] != (core.Workspace{ID: f.ws, Name: "reach-ws", Note: "work on ws", Status: "in-progress", Path: f.root}) {
+	if w := *list[1]; w.LastActivity.IsZero() || (core.Workspace{ID: w.ID, Name: w.Name, Note: w.Note, Status: w.Status, Path: w.Path}) !=
+		(core.Workspace{ID: f.ws, Name: "reach-ws", Note: "work on ws", Status: "in-progress", Path: f.root}) {
 		t.Fatalf("workspace = %+v", list[1])
 	}
 	// Workspaces are not owned by the client that made them.

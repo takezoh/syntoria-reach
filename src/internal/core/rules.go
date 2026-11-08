@@ -27,11 +27,17 @@ const MaxNoteLength = 2000
 // argument, which Linux limits to 128 KiB.
 const MaxPromptBytes = 64 << 10
 
-// Workspace statuses Reach itself sets; Orca accepts others too.
+// Workspace statuses. A new workspace is in progress; Orca also accepts the
+// custom statuses configured in it.
 const (
+	WorkspaceTodo       = "todo"
 	WorkspaceInProgress = "in-progress"
+	WorkspaceInReview   = "in-review"
 	WorkspaceCompleted  = "completed"
 )
+
+// WorkspaceStatuses are the statuses every workspace backend knows.
+var WorkspaceStatuses = []string{WorkspaceTodo, WorkspaceInProgress, WorkspaceInReview, WorkspaceCompleted}
 
 // ValidOperationID reports whether id can name an operation.
 func ValidOperationID(id string) bool { return operationIDPattern.MatchString(id) }
@@ -55,6 +61,7 @@ func NewWorkspace(r *Repo, root *Worktree) *Workspace {
 	w := &Workspace{ID: r.ID, Name: r.DisplayName, Path: r.Path}
 	if root != nil {
 		w.Note, w.Status = root.Comment, root.WorkspaceStatus
+		w.LastActivity = time.UnixMilli(root.LastActivityAt)
 	}
 	return w
 }

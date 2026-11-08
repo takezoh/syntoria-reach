@@ -1,8 +1,9 @@
 // Package service implements Reach operations: it authorizes every request,
 // makes side effects idempotent by operation ID, records what happened and
 // writes audit records. Decisions are the pure rules of package core; every
-// side effect goes through the ports in ports.go. Transports (the local API
-// now, remote MCP later) only decode requests and call this package.
+// side effect goes through the ports in ports.go, workspaces and agents
+// through the node's workspace backend. Transports (the local API and the
+// remote connector) only decode requests and call this package.
 package service
 
 import (
@@ -38,13 +39,13 @@ type Client struct {
 	perms []string
 }
 
-// ws is a workspace Orca reported, which the caller may use. The request
-// holds it until release, which keeps cleanup from removing it meanwhile.
+// ws is a workspace the backend reported, which the caller may use. The
+// request holds it until release, which keeps cleanup from removing it
+// meanwhile.
 type ws struct {
-	id       string
+	*core.Workspace
 	root     string
 	commands []string
-	agents   []string
 	files    Files
 	release  func()
 }
@@ -55,15 +56,12 @@ type Service struct {
 	openFiles  OpenFiles
 	runCommand RunCommand
 	jobs       Jobs
-	orca       Orca
-	folders    Folders
+	workspaces Workspaces
 	newID      NewID
 
-	workspaces string   // folder of the workspace folders Reach creates
-	commands   []string // executables run_command and start_job may run
-	agentIDs   []string // agents start_agent_session may start
-	harness    map[string]config.Agent
-	clients    []*Client
+	commands []string     // executables run_command and start_job may run
+	agents   []core.Agent // agents start_agent_session may start, as configured
+	clients  []*Client
 
 	filesMu sync.Mutex
 	files   map[string]openRoot // open roots of workspaces, by workspace ID
@@ -73,7 +71,7 @@ type Service struct {
 	removing map[string]bool // workspaces cleanup is removing
 }
 
-// openRoot is the open root of a workspace at the path Orca last reported.
+// openRoot is the open root of a workspace at the path last reported.
 type openRoot struct {
 	path  string
 	files Files
@@ -86,19 +84,13 @@ func New(cfg *config.Config, d Deps) *Service {
 		openFiles:  d.OpenFiles,
 		runCommand: d.RunCommand,
 		jobs:       d.Jobs,
-		orca:       d.Orca,
-		folders:    d.Folders,
+		workspaces: d.Workspaces,
 		newID:      d.NewID,
-		workspaces: cfg.Workspaces,
 		commands:   cfg.Commands,
-		harness:    map[string]config.Agent{},
+		agents:     cfg.Agents,
 		files:      map[string]openRoot{},
 		users:      map[string]int{},
 		removing:   map[string]bool{},
-	}
-	for _, a := range cfg.Agents {
-		s.harness[a.ID] = a
-		s.agentIDs = append(s.agentIDs, a.ID)
 	}
 	for _, c := range cfg.Clients {
 		s.clients = append(s.clients, &Client{ID: c.ID, token: c.Token, perms: c.Allow})
@@ -143,7 +135,7 @@ func (s *Service) ClientByID(id string) (*Client, bool) {
 }
 
 // authorize resolves a workspace on which the client holds perm, reading it
-// from Orca.
+// from the workspace backend.
 func (s *Service) authorize(ctx context.Context, c *Client, workspaceID, perm string) (*ws, error) {
 	if !slices.Contains(c.perms, perm) {
 		return nil, core.Errorf(core.CodePermissionDenied, "%s is not allowed", perm)
@@ -152,21 +144,21 @@ func (s *Service) authorize(ctx context.Context, c *Client, workspaceID, perm st
 	if !ok {
 		return nil, core.Errorf(core.CodeInvalidState, "workspace is being removed")
 	}
-	r, err := s.repo(ctx, workspaceID)
+	w, err := s.workspace(ctx, workspaceID)
 	if err != nil {
 		release()
 		return nil, err
 	}
-	f, err := s.workspaceFiles(workspaceID, r.Path)
+	f, err := s.workspaceFiles(workspaceID, w.Path)
 	if err != nil {
 		release()
 		return nil, internal(err)
 	}
-	return &ws{id: workspaceID, root: r.Path, commands: s.commands, agents: s.agentIDs, files: f, release: release}, nil
+	return &ws{Workspace: w, root: w.Path, commands: s.commands, files: f, release: release}, nil
 }
 
 // workspaceFiles returns the open root of a workspace at path, reopening it
-// when Orca reports another path than the one opened.
+// when the backend reports another path than the one opened.
 func (s *Service) workspaceFiles(id, path string) (Files, error) {
 	s.filesMu.Lock()
 	defer s.filesMu.Unlock()

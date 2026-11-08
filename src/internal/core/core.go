@@ -1,8 +1,8 @@
 // Package core holds Reach's domain: the records it keeps, their states, the
 // error classes it reports and the pure rules that decide what may happen.
 // It has no side effects and depends only on the standard library; adapters
-// (store, workspace, command, job, agent, orca) and the service share these
-// types.
+// (store, workspace, command, job, agent, orca and the workspace backends)
+// and the service share these types.
 package core
 
 import (
@@ -12,9 +12,8 @@ import (
 	"time"
 )
 
-// Permissions a client can be granted on a project. workspace.create lets
-// the client create (and delete) its own workspaces from the project; the
-// other permissions apply to those workspaces.
+// Permissions a client can be granted. They apply to every workspace;
+// workspace.create lets the client create and update workspaces.
 const (
 	PermWorkspaceCreate = "workspace.create"
 	PermFileRead        = "file.read"
@@ -126,17 +125,20 @@ type Worktree struct {
 	LastActivityAt  int64  `json:"lastActivityAt"` // Unix milliseconds
 }
 
-// Workspace is a Reach workspace: one unit of work, kept by Orca as a project
-// whose name has WorkspacePrefix. Its ID is the Orca project's repo ID, its
-// note the project's comment and its status the project's Orca workspace
-// status (todo, in-progress, in-review, completed or a custom one). Reach
-// keeps nothing about it and reads it from Orca on every request.
+// Workspace is a Reach workspace: one unit of work, a folder of its own
+// named with WorkspacePrefix, with a note saying what the work is and a
+// status (todo, in-progress, in-review, completed, or on Orca a custom one).
+// The node's workspace backend keeps it: Orca as a project (the ID is the
+// project's repo ID, the note and status its root entry's comment and
+// workspace status), or Reach itself as a record of a local workspace.
+// LastActivity is when the backend last saw activity in it.
 type Workspace struct {
-	ID     string `json:"workspace"`
-	Name   string `json:"name"`
-	Note   string `json:"note"`
-	Status string `json:"status"`
-	Path   string `json:"path"`
+	ID           string    `json:"workspace"`
+	Name         string    `json:"name"`
+	Note         string    `json:"note"`
+	Status       string    `json:"status"`
+	Path         string    `json:"path"`
+	LastActivity time.Time `json:"-"`
 }
 
 // OrcaError is a failure reported by Orca.
@@ -284,13 +286,50 @@ const (
 	AgentExited         = "exited"           // no agent runs in the terminal: a shell
 )
 
-// AgentSession is an agent Reach started in an Orca terminal of a
-// workspace. Its ID is the terminal's Orca handle; Reach keeps nothing about
-// it, and it ends when the terminal closes.
+// AgentSession is an agent Reach started in a workspace: in an Orca
+// terminal, whose handle is the session ID and which ends the session when
+// it closes, or as a process of the daemon in a local workspace.
 type AgentSession struct {
 	ID             string `json:"session_id"`
 	Workspace      string `json:"workspace"`
-	Agent          string `json:"agent,omitempty"` // the agent Orca sees running in it, if any
+	Agent          string `json:"agent,omitempty"` // the agent running in it, if any
 	State          string `json:"state"`
 	WaitingOnHuman string `json:"waiting_on_human,omitempty"`
+}
+
+// AgentStatus is a session as its workspace backend observes it and, once
+// the agent waits for a prompt (State is AgentIdle), its last message of
+// the turn: its reply to the last prompt, empty when there is none.
+// ReplyTruncated says the reply was cut at the length the backend keeps.
+type AgentStatus struct {
+	AgentSession
+	Reply          string
+	ReplyTruncated bool
+}
+
+// How Reach talks to an agent it runs as a process in a local workspace.
+const (
+	ProtocolClaude = "claude" // Claude Code stream-json
+	ProtocolCodex  = "codex"  // Codex app-server
+	ProtocolACP    = "acp"    // Agent Client Protocol, such as DSH
+)
+
+// Agent is an agent a node may start in its workspaces, as configured. Role
+// says what it is for; callers choose agents by it. Command[0] is an
+// absolute path. On Orca, Command is typed into a terminal's shell, each
+// argument quoted. In a local workspace, Command runs as a process of the
+// daemon speaking Protocol, with an environment of Env and a fixed PATH,
+// LANG and HOME.
+type Agent struct {
+	ID       string            `json:"id"`
+	Role     string            `json:"role"`
+	Command  []string          `json:"command"`
+	Protocol string            `json:"protocol,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+}
+
+// AgentInfo is what a caller sees of an agent it may start.
+type AgentInfo struct {
+	ID   string `json:"id"`
+	Role string `json:"role"`
 }

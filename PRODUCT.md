@@ -1,7 +1,7 @@
 # Syntoria Reach — Product Definition
 
 - Status: **Direction decided / Stages 1–2 implemented**
-- Updated: 2026-11-01
+- Updated: 2026-11-08
 - Initial OS: **Linux**
 - Connection architecture: **Option B — Cloudflare Workers + Durable Objects + Linux Connector**
 
@@ -32,8 +32,8 @@ The goal is to reduce the effort of remotely operating one's own environment and
 
 ### Case A: Files and commands
 
-1. The user sets up Reach on Linux next to the Orca server, and selects the operations, commands and agents to allow.
-2. The AI uses Reach's MCP tools to check the target node and available capabilities, then continues ongoing work in its workspace or creates a workspace for new work. Reach creates it on the Orca server.
+1. The user sets up Reach on each of their Linux machines (nodes), next to the Orca server or without it, and selects the operations, commands and agents to allow, each agent with its role.
+2. The AI lists the nodes with Reach's MCP tools, with the agents each one can run and their roles, picks the node for the work, then continues ongoing work in its workspace or creates a workspace for new work. Reach creates it on that node (on Orca, as an Orca project).
 3. The AI reads permitted files and runs the commands it needs.
 4. Reach returns operation results and records the caller, target, and result.
 5. The AI makes its next decision or operation as needed.
@@ -53,7 +53,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 ### Case D: DaVinci's execution runtime
 
 1. DaVinci decides the work from the issue's goal and chooses the workspace purpose and which Codex / Claude Code / DSH etc. to run.
-2. DaVinci asks Reach's local API to start an agent session, and Reach starts the agent (for example Claude Code) in an Orca terminal of the workspace, where the user can watch it; the agent sandboxes its own tools.
+2. DaVinci asks Reach's local API to start an agent session, and Reach starts the agent (for example Claude Code) in an Orca terminal of the workspace, where the user can watch it, or, on a node without Orca, as its own process; the agent sandboxes its own tools.
 3. DaVinci sends prompts and judges the meaning of each turn's result. Reach delivers turns, records the agent's events, and tracks process and job state.
 4. DaVinci binds Reach's agent session / job IDs to its own run, supervises progress, and receives verification results.
 5. When DaVinci restarts, it re-fetches Reach's current state and checks for unknown exits and unknown prompt delivery before continuing. DaVinci decides completion of the original issue and PR submission.
@@ -62,29 +62,30 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 
 | Capability | MVP | Description |
 | --- | --- | --- |
-| Node discovery | Yes | Available nodes and their connection state |
-| Workspace management | Yes | One workspace per unit of work: create, list and annotate (note, status) workspaces, each an Orca project named `reach-*` with a folder of its own; Orca holds their state, and completed workspaces are removed after a week without activity |
+| Node discovery | Yes | The person's nodes, their connection state, and the agents each one can run with their roles |
+| Workspace management | Yes | One workspace per unit of work: create, list and annotate (note, status) workspaces, each a folder of its own named `reach-*`, kept by Orca as a project or by Reach as a local workspace; completed workspaces are removed after a week without activity |
 | File access | Yes | List, read, conditional write |
 | Command execution | Yes | Isolated execution of permitted Linux commands |
 | Asynchronous jobs | Yes | Start, get state/output, stop |
-| Agent sessions | Yes | Agents in Orca terminals: start, prompt, read the terminal output, stop. The agent sandboxes its own tools |
+| Agent sessions | Yes | Agents in Orca terminals, or as Reach's processes on nodes without Orca: start, prompt, read the reply, stop. The agent sandboxes its own tools |
 | Authentication and permissions | Yes | Permission per AI client, node, workspace, and operation |
 | Audit | Yes | Records of actor, target, time, and result |
 | Browser / Desktop GUI | Later | Browser and screen operation |
-| Multi-node | Later | Extension to multiple Linux machines and other OSes |
+| Multi-node | Yes (Linux) | One remote MCP endpoint for all of the person's Linux nodes; other OSes later |
 | Agent-specific orchestration | Later | Per-agent planning and conversation management. Starting agents in Orca terminals is supported in the MVP |
 | P2P / WebRTC | Later | Direct communication paths for clients that support them |
 | MCP Events | Later | Asynchronous notifications such as job completion and node state |
 
 ## 5. Core concepts
 
-- **Node**: the computer being operated. Initially one Linux node.
-- **Workspace**: one unit of work: an Orca project named `reach-*` with a folder of its own, a note saying what the work is and Orca's workspace status; the scope of files and operations of a request.
+- **Node**: a computer being operated, a Linux machine running Reach. A person may connect several to one gateway; each has its own workspaces and its own agents.
+- **Workspace**: one unit of work on a node: a folder of its own named `reach-*`, a note saying what the work is and a status, kept as an Orca project or by Reach itself; the scope of files and operations of a request.
 - **Capability**: an ability Reach provides, such as File, Command, or Job.
 - **Client / Connection**: an authenticated AI client and its connection.
 - **Operation**: an individual operation request. It has a unique identifier used to detect resends and duplicates.
 - **Job**: an asynchronous execution and its state, independent of the communication session.
-- **Agent Session**: an agent running in an Orca terminal of a workspace, which a caller prompts and whose terminal output it reads through Reach. Distinct from MCP sessions and from a caller's own run.
+- **Agent**: an agent a node may run, such as a coding agent or DaVinci, registered with its role: what it is for, by which an AI chooses it.
+- **Agent Session**: an agent running in a workspace (in an Orca terminal, or as Reach's process), which a caller prompts and whose replies it reads through Reach. Distinct from MCP sessions and from a caller's own run.
 - **Artifact**: a reference to output logs or generated files.
 - **Permission**: a definition of what is allowed for an actor, target, and operation.
 
@@ -132,7 +133,7 @@ The initial specification does not include an MCP tool that creates P2P connecti
 ## 8. Safety and user control
 
 - Evaluate permissions per node, workspace, capability, and operation.
-- Agents run in Orca terminals with their own sandbox. Commands and jobs run only from the workspace allowlist, without a shell and with a minimal environment.
+- Agents run with their own sandbox, in Orca terminals or as Reach's processes. Commands and jobs run only from the workspace allowlist, without a shell and with a minimal environment.
 - Authentication and operation permissions are verified on Reach's execution side. AI input and external documents are never grounds for permission.
 - Allow requiring additional user approval for important operations.
 - Do not retry commands without limit when the connection drops.
@@ -140,7 +141,7 @@ The initial specification does not include an MCP tool that creates P2P connecti
 
 ## 9. MVP scope and completion criteria
 
-Target: **Linux with systemd, one user, one node.** The minimum Linux distributions and kernel versions are decided by verification.
+Target: **Linux with systemd, one user, one or more nodes.** The minimum Linux distributions and kernel versions are decided by verification.
 
 In the MVP, an MCP client connecting from the cloud can perform file operations and run commands in permitted Linux workspaces. Long-running work becomes jobs and is still managed on Linux after the MCP connection drops. Completion criteria: duplicate execution is prevented by operation ID, access outside permissions is denied, offline state is reported explicitly, and history and results can be retrieved again.
 
@@ -148,7 +149,7 @@ In the MVP, an MCP client connecting from the cloud can perform file operations 
 
 ## 10. Non-goals and evaluation
 
-The initial release does not cover general-purpose AI agent orchestration, LLM hosting, Weave workflow processing, WebRTC P2P, desktop GUI, or automatic scheduling of offline jobs. Reach runs agent sessions (agents in Orca terminals), but prompts, plans, and judging results stay with the caller.
+The initial release does not cover general-purpose AI agent orchestration, LLM hosting, Weave workflow processing, WebRTC P2P, desktop GUI, or automatic scheduling of offline jobs. Reach runs agent sessions (agents in Orca terminals or as its own processes), but prompts, plans, and judging results stay with the caller.
 
 Metrics: execution success rate, unknown-result rate, job reconciliation success rate after disconnects, prevention of duplicate execution, accuracy of permission denials, manual effort required from the user, and compatibility across different AI clients.
 

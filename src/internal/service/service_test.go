@@ -1,9 +1,11 @@
 package service_test
 
-// The service runs against the fakes of its ports. What the adapters do
-// with the operating system, SQLite and Orca is covered by their own tests
-// (including the shared contracts in servicetest) and by the end-to-end test
-// in cmd/reach.
+// The service runs against the fakes of its ports, with the Orca workspace
+// backend (orcaws) on a fake Orca CLI, which covers what Reach does with
+// Orca. What the adapters do with the operating system, SQLite and agent
+// processes, and the local workspace backend, are covered by their own tests
+// (including the shared contracts in servicetest) and by the end-to-end
+// tests in cmd/reach.
 
 import (
 	"context"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/takezoh/syntoria-reach/src/internal/config"
 	"github.com/takezoh/syntoria-reach/src/internal/core"
+	"github.com/takezoh/syntoria-reach/src/internal/orcaws"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 	"github.com/takezoh/syntoria-reach/src/internal/service/servicetest"
 )
@@ -36,8 +39,8 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	cfg := &config.Config{
 		Agents: []config.Agent{
-			{ID: "codex", Command: []string{"/bin/codex", "--model", "gpt x"}},
-			{ID: "dsh", Command: []string{"/bin/dsh"}},
+			{ID: "codex", Role: "Writes code", Command: []string{"/bin/codex", "--model", "gpt x"}},
+			{ID: "dsh", Role: "Reviews code", Command: []string{"/bin/dsh"}},
 		},
 		Workspaces: "/w",
 		Commands:   []string{"/bin/sh"},
@@ -48,7 +51,7 @@ func newFixture(t *testing.T) *fixture {
 		},
 	}
 	fakes := servicetest.New()
-	svc := service.New(cfg, fakes.Deps())
+	svc := service.New(cfg, fakes.Deps(orcaws.New(fakes.Orca, fakes.Folders, cfg.Workspaces)))
 	t.Cleanup(svc.Close)
 	f := &fixture{svc: svc, fakes: fakes}
 	f.a, _ = svc.Authenticate(tokenA)

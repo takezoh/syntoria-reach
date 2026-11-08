@@ -43,6 +43,16 @@ var clock = map[string][]string{"time": {"Now", "Since", "Until", "Sleep", "Afte
 
 var adapter = rule{Internal: []string{"internal/core", "internal/command", "internal/ids"}}
 
+// decider is the rule of a package that decides and keeps every side
+// effect behind ports. It may log.
+func decider(internal ...string) rule {
+	return rule{
+		Internal: append([]string{"internal/core"}, internal...),
+		Std:      slices.DeleteFunc(slices.Clone(sideEffects), func(p string) bool { return p == "log/slog" }),
+		Calls:    clock,
+	}
+}
+
 // rules classifies every package of the module. A new package must be
 // added here before it builds into a passing test run.
 var rules = map[string]rule{
@@ -50,13 +60,15 @@ var rules = map[string]rule{
 	"internal/ids":    {Internal: []string{}},
 	"internal/config": {Internal: []string{"internal/core"}},
 	// The service decides and records; every side effect goes through a
-	// port. It may log.
-	"internal/service": {
-		Internal: []string{"internal/core", "internal/config"},
-		Std:      slices.DeleteFunc(slices.Clone(sideEffects), func(p string) bool { return p == "log/slog" }),
-		Calls:    clock,
-	},
+	// port.
+	"internal/service":             decider("internal/config"),
 	"internal/service/servicetest": {Internal: []string{"internal/core", "internal/service"}},
+	// The workspace backends are the service's Workspaces port: they decide
+	// what a workspace and a session are on Orca and on a node without it,
+	// and reach Orca, folders, records and agent processes through ports
+	// of their own.
+	"internal/orcaws":  decider(),
+	"internal/localws": decider(),
 	// The method table shared by the local API and the remote connector.
 	"internal/api":      {Internal: []string{"internal/core", "internal/service"}},
 	"internal/localapi": {Internal: []string{"internal/core", "internal/service", "internal/api"}},
@@ -69,8 +81,11 @@ var rules = map[string]rule{
 	"internal/job":           adapter,
 	"internal/orca":          adapter,
 	"internal/orca/orcatest": {Internal: []string{}},
-	"internal/archtest":      {Internal: []string{}},
-	"cmd/reach":              {}, // the composition root wires everything
+	// Agent processes of local workspaces.
+	"internal/agent":           adapter,
+	"internal/agent/agenttest": {Internal: []string{}},
+	"internal/archtest":        {Internal: []string{}},
+	"cmd/reach":                {}, // the composition root wires everything
 }
 
 func TestDependencyRules(t *testing.T) {

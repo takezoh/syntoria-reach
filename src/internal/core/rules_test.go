@@ -42,7 +42,8 @@ func TestIsWorkspace(t *testing.T) {
 		}
 	}
 	r := &Repo{ID: "r1", DisplayName: "reach-ws", Path: "/w/reach-ws", Kind: "folder"}
-	if w := NewWorkspace(r, &Worktree{Comment: "fix the docs", WorkspaceStatus: "in-review"}); *w != (Workspace{ID: "r1", Name: "reach-ws", Note: "fix the docs", Status: "in-review", Path: "/w/reach-ws"}) {
+	at := time.UnixMilli(1_762_000_000_000)
+	if w := NewWorkspace(r, &Worktree{Comment: "fix the docs", WorkspaceStatus: "in-review", LastActivityAt: at.UnixMilli()}); *w != (Workspace{ID: "r1", Name: "reach-ws", Note: "fix the docs", Status: "in-review", Path: "/w/reach-ws", LastActivity: at}) {
 		t.Fatalf("NewWorkspace = %+v", w)
 	}
 	if w := NewWorkspace(r, nil); w.Note != "" || w.Status != "" || w.ID != "r1" {

@@ -22,7 +22,7 @@ const valid = `{
   "socket": "/run/reach.sock",
   "database": "/var/reach.db",
   "orca": ["/usr/bin/orca-ide"],
-  "agents": [{"id": "claude", "command": ["/usr/bin/claude", "--model", "claude-opus-5-5", "--effort", "xhigh"]}],
+  "agents": [{"id": "claude", "role": "Writes and reviews code", "command": ["/usr/bin/claude", "--model", "claude-opus-5-5", "--effort", "xhigh"]}],
   "commands": ["/usr/bin/make"],
   "clients": [{"id": "a", "token": "0123456789abcdef0123456789abcdef", "allow": ["workspace.create", "file.read", "command.run"]}]
 }`
@@ -32,8 +32,31 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Commands[0] != "/usr/bin/make" || c.Clients[0].Allow[2] != core.PermCommandRun || c.Workspaces != "/var/workspaces" || c.Agents[0].Command[4] != "xhigh" {
+	if c.Commands[0] != "/usr/bin/make" || c.Clients[0].Allow[2] != core.PermCommandRun || c.Workspaces != "/var/workspaces" || c.Agents[0].Command[4] != "xhigh" ||
+		c.Agents[0].Role != "Writes and reviews code" || c.Orca == nil {
 		t.Fatalf("got %+v", c)
+	}
+}
+
+// Without orca, workspaces are local and agents run as processes: each says
+// how Reach talks to it.
+func TestLoadLocal(t *testing.T) {
+	body := strings.Replace(valid, `"orca": ["/usr/bin/orca-ide"],`, ``, 1)
+	body = strings.Replace(body, `"id": "claude",`, `"id": "claude", "protocol": "claude", "env": {"CLAUDE_CONFIG_DIR": "/home/u/.claude"},`, 1)
+	c, err := Load(writeConfig(t, 0o600, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Orca != nil || c.Agents[0].Protocol != core.ProtocolClaude || c.Agents[0].Env["CLAUDE_CONFIG_DIR"] != "/home/u/.claude" {
+		t.Fatalf("got %+v", c)
+	}
+	for name, b := range map[string]string{
+		"no protocol":      strings.Replace(body, `"protocol": "claude",`, ``, 1),
+		"unknown protocol": strings.Replace(body, `"protocol": "claude"`, `"protocol": "stdio"`, 1),
+	} {
+		if _, err := Load(writeConfig(t, 0o600, b)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }
 
@@ -44,12 +67,17 @@ func TestLoadRejects(t *testing.T) {
 	bad := map[string]string{
 		"relative command":    strings.Replace(valid, `"/usr/bin/make"`, `"make"`, 1),
 		"unknown perm":        strings.Replace(valid, `"command.run"`, `"root"`, 1),
-		"missing orca":        strings.Replace(valid, `"orca": ["/usr/bin/orca-ide"],`, ``, 1),
+		"empty orca":          strings.Replace(valid, `["/usr/bin/orca-ide"]`, `[]`, 1),
+		"relative orca":       strings.Replace(valid, `"/usr/bin/orca-ide"`, `"orca-ide"`, 1),
 		"short token":         strings.Replace(valid, `0123456789abcdef0123456789abcdef`, `short`, 1),
 		"relative workspaces": strings.Replace(valid, `"socket"`, `"workspaces": "ws", "socket"`, 1),
 		"relative agent":      strings.Replace(valid, `"/usr/bin/claude"`, `"claude"`, 1),
-		// An agent runs in an Orca terminal: harness settings are gone.
+		// On Orca an agent runs in a terminal: process settings are wrong.
 		"agent protocol": strings.Replace(valid, `"id": "claude",`, `"id": "claude", "protocol": "claude",`, 1),
+		"agent env":      strings.Replace(valid, `"id": "claude",`, `"id": "claude", "env": {"A": "b"},`, 1),
+		// Callers choose an agent by its role.
+		"no role":    strings.Replace(valid, `"role": "Writes and reviews code", `, ``, 1),
+		"blank role": strings.Replace(valid, `"Writes and reviews code"`, `" "`, 1),
 		// Keys of the earlier format are errors, not silently ignored.
 		"projects": strings.Replace(valid, `"socket"`, `"projects": [], "socket"`, 1),
 		"grants":   strings.Replace(valid, `"allow"`, `"grants": [], "allow"`, 1),

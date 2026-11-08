@@ -1,6 +1,6 @@
 # Syntoria Reach — Technical Architecture
 
-- Status: **Technical overview / Stages 1–2 implemented, Stage 4 in part (remote MCP for workspaces and agent sessions, one node)**
+- Status: **Technical overview / Stages 1–2 implemented, Stage 4 in part (remote MCP for workspaces and agent sessions on multiple nodes)**
 - Updated: 2026-11-08
 - Initial runtime: **Linux / Go**
 - Adopted remote access: **Cloudflare Workers + Durable Objects + outbound Linux WebSocket (Option B)**
@@ -9,11 +9,11 @@
 
 Reach is an independent execution service through which remote AIs and other local services use Linux capabilities via standard MCP or a local API. It places no always-on VM or container in the cloud; the Linux side owns the execution and state of operations, jobs, and agent sessions.
 
-**DaVinci is the first real client service.** DaVinci's development decisions, prompts, judgment of agent output, and GitHub workflow stay in DaVinci; Linux processes, jobs, and agent sessions (agents Reach starts in Orca terminals) are consolidated in Reach. Reach works without DaVinci.
+**DaVinci is the first real client service.** DaVinci's development decisions, prompts, judgment of agent output, and GitHub workflow stay in DaVinci; Linux processes, jobs, and agent sessions (agents Reach starts in Orca terminals, or as its own processes) are consolidated in Reach. Reach works without DaVinci.
 
 **Architectural invariants**
 
-1. Reach starts and works without depending on Weave, Lore, Trace, DaVinci, or a local LLM. Workspaces are provided by the Orca server on the same host (§7); callers reach them only through Reach.
+1. Reach starts and works without depending on Weave, Lore, Trace, DaVinci, or a local LLM. Workspaces are provided by the node's workspace backend: the Orca server on the same host, or Reach's own local workspaces (§7); callers reach them only through Reach.
 2. MCP is an operation contract, separated from the communication path and from the Linux execution implementation.
 3. The cloud handles connectivity, authentication, and forwarding; the source of truth for jobs is on Linux.
 4. Even on an approved connection, the Reach runtime authorizes every operation.
@@ -21,7 +21,7 @@ Reach is an independent execution service through which remote AIs and other loc
 6. A communication failure or timeout is never treated as proof that execution failed.
 7. In the MVP, requests made while a node is offline are not stored in a pending-execution queue.
 8. What is installed on the target Linux machine is a lightweight connector / runtime; an LLM is not required.
-9. Process liveness and jobs are Reach's responsibility. Agents run on Orca: Reach starts each in an Orca terminal of a workspace and relays prompts and replies through Orca; sandboxing an agent's tools is the agent's own responsibility. Reach does not take on the meaning of DaVinci runs or GitHub issues, and does not judge what an agent produces.
+9. Process liveness and jobs are Reach's responsibility. On Orca, Reach starts each agent in an Orca terminal of a workspace and relays prompts and replies through Orca; without Orca, it runs the agent as its own process and talks to it over the agent's protocol. Sandboxing an agent's tools is the agent's own responsibility. Reach does not take on the meaning of DaVinci runs or GitHub issues, and does not judge what an agent produces.
 10. When a client disconnects, the lifecycle of an already accepted command, job, or agent turn does not change implicitly.
 
 ## 2. Overall structure
@@ -39,16 +39,18 @@ flowchart TB
         REACH["Reach Daemon (Go): Connector + Operation Service"]
         LOCAL["Local API (Unix socket)"]
         CAP["Capability adapters: File / Command"]
-        PROC["Agent sessions: agents in Orca terminals"]
+        WS["Workspace backend: Orca (orcaws) or local (localws)"]
+        PROC["Agent sessions: agents in Orca terminals, or agent processes of local workspaces"]
         JOB["Job Manager + OS process supervisor"]
         ST[("SQLite: Operations / Jobs / Audit")]
         ORCA["Orca server: workspaces (projects reach-*)"]
         LOCAL <--> REACH
         REACH --> CAP
         REACH --> JOB
-        REACH --> PROC
+        REACH --> WS
+        WS --> PROC
         REACH <--> ST
-        REACH -->|"Orca CLI"| ORCA
+        WS -->|"Orca CLI"| ORCA
         PROC --> JOB
         JOB --> CAP
     end
@@ -57,23 +59,24 @@ flowchart TB
     DaVinci <-->|"Local execution API"| LOCAL
 ~~~
 
-The standard deployment on Linux is a single Go daemon. The cloud has no resident containers, but unattended remote access requires the Linux connector itself to stay resident.
+The standard deployment on each Linux node is a single Go daemon; one gateway serves all of a person's nodes, each with its own broker. The cloud has no resident containers, but unattended remote access requires the Linux connector itself to stay resident.
 
 ## 3. Components and responsibilities
 
 | Component | Responsibility | Does not hold |
 | --- | --- | --- |
-| Workers MCP Gateway | MCP requests, client authentication/authorization, node resolution, input validation, broker calls | Source of truth for Linux jobs |
-| Durable Object / Node Broker | Accepting and mapping the WSS connection for a node, message delivery, short-lived response correlation | User files, persistent job results |
+| Workers MCP Gateway | MCP requests, client authentication/authorization, the node registry (`NODES`) and the list of nodes with their agents, node resolution, input validation, broker calls | Source of truth for Linux jobs |
+| Durable Object / Node Broker | One per node: accepting the WSS connection of that node, message delivery, short-lived response correlation | User files, persistent job results |
 | Reach Connector (Go) | Outbound WSS to the cloud, receiving authenticated requests, reconnection, transport separation | LLM inference |
 | Local API (Unix socket) | Provides local services such as DaVinci with the same execution operations as the core | Meaning of issues/PRs |
-| Agent sessions | Starting an agent in an Orca terminal of a workspace, typing prompts into it, reading its terminal output through Orca, closing it | Prompts, judging agent output, run semantics; running the agent and sandboxing its tools (Orca and the agent do that) |
+| Workspace backend | The service's Workspaces port: creating, listing, annotating and removing workspaces, and starting, prompting, reading and stopping their agents. `orcaws` does it on the Orca server, `localws` with folders, records in SQLite and agent processes | Authorization, idempotency, audit and cleanup decisions (the Operation Service's) |
+| Agent sessions | On Orca: starting an agent in an Orca terminal of a workspace, typing prompts into it, reading its replies through Orca, closing it. Locally: running the agent's process in the workspace folder over its protocol (Claude Code stream-json, Codex App Server, ACP; ported from DaVinci), one turn at a time | Prompts, judging agent output, run semantics; sandboxing the agent's tools (the agent does that) |
 | Operation Service | Re-validating arguments and permissions, idempotency decisions, accepting synchronous and asynchronous work | Business state of other Syntoria services |
 | Capability Registry | Public contracts of File / Command / Job, required permissions, choice of OS adapter | External AI decisions |
 | Linux Runtime | File operations in workspaces, process start/stop/isolation | MCP protocol details |
-| Orca adapter | Registering, listing, annotating (comment, workspace status) and removing the Orca projects that are workspaces, through the Orca CLI | Agents and commands in those workspaces (Reach runs them) |
+| Orca adapter | The Orca CLI: projects, their entries (comment, workspace status), terminals and agent status, as the Orca backend uses them | What a workspace or session is (the Orca backend decides) |
 | Job Manager | Job state, logs and artifacts, stop, reconciliation after restart | Dependence on MCP connection liveness |
-| SQLite | Local source of truth for operations, jobs, policy, and audit | Data of other Syntoria services |
+| SQLite | Local source of truth for operations, jobs, policy, audit, and the workspaces of the local backend | Data of other Syntoria services |
 
 By design, the MCP Gateway and the Transport Broker are separate components, but they can be operated together as Worker / Durable Object bindings in the same Cloudflare account.
 
@@ -91,15 +94,15 @@ A DaVinci Controller on the same Linux node calls Reach's local API over a Unix 
 
 Local connections also verify the caller's identity and permissions. Unix socket OS permissions are not used as a substitute for global operation permissions; a permission profile for DaVinci limits the workspaces, commands, and agents it may use.
 
-Reach relays prompts to an agent in an Orca terminal and reads its terminal output back through Orca. The caller builds prompts and interprets the agent's output; Reach does not infer the success of an LLM turn or the validity of development results.
+Reach relays prompts to an agent (in an Orca terminal, or a process of its own) and reads its reply back. The caller builds prompts and interprets the agent's output; Reach does not infer the success of an LLM turn or the validity of development results.
 
 ## 4.1 Remote communication and authentication
 
 ### 4.2 Node registration and persistent connection
 
-1. The Linux user registers the node and explicitly issues a connection credential.
-2. The daemon connects to Cloudflare over outbound WSS (no publicly exposed inbound port is needed).
-3. The gateway / broker verifies the credential, the node ID, and the connection's validity.
+1. The Linux user registers the node and explicitly issues a connection credential: an entry of the gateway's `NODES` secret, the node's ID and a token of its own.
+2. The daemon connects to Cloudflare over outbound WSS (no publicly exposed inbound port is needed), with its node's token.
+3. The gateway finds the node whose token it is (every token compared in constant time) and hands the connection to that node's broker.
 4. The broker manages the connection and marks the node offline when the connection drops.
 5. The daemon reconnects with exponential backoff and re-registers the necessary state once the connection is restored.
 
@@ -143,20 +146,20 @@ The initial MCP tools are the following candidates. Formal names and JSON Schema
 
 | Tool | Purpose | Main inputs / results |
 | --- | --- | --- |
-| list_nodes | Query authorized nodes | node_id, online / offline |
-| list_capabilities | Query a node's capabilities: the caller's permissions, commands and agents | node_id, permissions, commands, agents |
-| create_workspace | Create a workspace for one unit of work: a folder registered as an Orca project, with a note | operation_id, name, note → workspace_id, name, note, status, path |
+| list_nodes | Query the person's nodes, with the agents each one can run and their roles | → node_id, online / offline, agents (id, role) |
+| list_capabilities | Query a node's capabilities: the caller's permissions, commands and agents | node_id, permissions, commands, agents (id, role) |
+| create_workspace | Create a workspace for one unit of work: a folder with a note (on Orca, registered as a project) | operation_id, name, note → workspace_id, name, note, status, path |
 | list_workspaces | Every workspace, to find ongoing work | workspace_id, name, note, status, path |
 | update_workspace | Change a workspace's note or Orca workspace status | operation_id, workspace_id, note, status |
 | list_files | File listing within a permitted area | workspace_id, relative_path |
 | read_file | Read a file | workspace_id, relative_path, bounded data |
 | write_file | Conditional file write | operation_id, workspace_id, path, expected_version |
 | start_job | Start an asynchronous command | operation_id, workspace_id, executable, argv, limits |
-| start_agent_session | Start an agent in an Orca terminal of a workspace | operation_id, workspace_id, agent → session_id, terminal |
-| send_agent_prompt | Type a prompt into the agent's terminal; returns once the turn started | operation_id, session_id, text → stages |
-| read_agent_output | Read the agent's state and, once its turn ended, its reply as Orca's agent status reports it | session_id → state, waiting_on_human, reply, reply_truncated |
-| get_agent_session | Query a session as Orca reports it | session_id → workspace, agent, state, waiting_on_human |
-| stop_agent_session | Close the agent's terminal | operation_id, session_id |
+| start_agent_session | Start an agent in a workspace (on Orca, in a terminal of it) | operation_id, workspace_id, agent → session_id, workspace, state |
+| send_agent_prompt | Deliver a prompt to the agent (on Orca, type it into its terminal); returns once the turn started | operation_id, session_id, text → stages |
+| read_agent_output | Read the agent's state and, once its turn ended, its reply | session_id → state, waiting_on_human, reply, reply_truncated |
+| get_agent_session | Query a session as the node observes it | session_id → workspace, agent, state, waiting_on_human |
+| stop_agent_session | End the agent and its session (on Orca, close its terminal) | operation_id, session_id |
 | get_operation | Reconcile an unknown acceptance result | operation_id, admission / final state |
 | get_job | Current state of a job | job_id, status, timestamps |
 | read_job_output | Paged output retrieval | job_id, stream, cursor, limit |
@@ -166,9 +169,9 @@ IDs of jobs and agent sessions are generated on Linux. Start, execution state, a
 
 The agent session tools are also provided to the DaVinci local client, which uses the same execution API. How tools are exposed to AI hosts and how streaming is supported are concerns of the connection adapter; the core defines the meaning of sessions, turns, and events.
 
-**Implemented so far.** The remote MCP endpoint exposes the workspace and agent session tools and `get_operation`, with the names, arguments and results of the local API methods; the daemon serves both from one method table. The endpoint is stateless MCP Streamable HTTP with JSON responses, and Reach errors are tool errors carrying `{"error": {"code", "message"}}`. `list_nodes` and `list_capabilities` wait for multiple nodes; file, command and job tools for a later step.
+**Implemented so far.** The remote MCP endpoint serves all of a person's nodes. `list_nodes` lists the nodes registered in `NODES`, by ID, with whether each is connected and, for a connected node, the agents the remote client may start there with their roles: the gateway asks every node's `list_capabilities` at once, and a node that is not connected is offline. Every other tool is a local API method of one node, with the method's name, arguments and results plus a required `node`, which the gateway removes before it forwards the call to that node's broker; an unknown node is `not_found`, and nothing runs. The tools are `list_capabilities`, the workspace and agent session tools and `get_operation`; the daemon serves them from the method table of the local API. Workspace, session and operation IDs are a node's; the gateway adds no node to them. The endpoint is stateless MCP Streamable HTTP with JSON responses, and Reach errors are tool errors carrying `{"error": {"code", "message"}}`. File, command and job tools wait for a later step.
 
-Between the broker and the daemon, the WSS carries JSON text messages: the broker sends `{"id", "method", "params"}` and the daemon answers `{"id", "result"}` or `{"id", "error"}`. The ID is a relay correlation ID (§4.4). The daemon sends `ping` every 30 s, and the broker answers `pong` without waking from hibernation. A connection with no message for 90 s is replaced, and a new connection from the node replaces the old one. The broker waits 30 s for a reply. A request still in flight when the connection drops, or when the wait runs out, is `result_unknown`; with no connection at all, it is `node_offline`.
+Between a broker and its daemon, the WSS carries JSON text messages: the broker sends `{"id", "method", "params"}` and the daemon answers `{"id", "result"}` or `{"id", "error"}`. The ID is a relay correlation ID (§4.4). The daemon sends `ping` every 30 s, and the broker answers `pong` without waking from hibernation. A connection with no message for 90 s is replaced, and a new connection from the node replaces the old one. The broker waits 30 s for a reply. A request still in flight when the connection drops, or when the wait runs out, is `result_unknown`; with no connection at all, it is `node_offline`.
 
 ## 6. Operations / jobs / idempotency
 
@@ -194,6 +197,10 @@ Commands and jobs run as children of the daemon, each in its own process group, 
 
 ### Agent sessions
 
+The service decides what a caller may do with a session, and the node's workspace backend what a session is: the service authorizes, makes prompts and stops operations, sends a prompt only while the session's state is `idle`, and refuses text that is not a prompt (below); the backend starts the agent, reports its state and reply, delivers the prompt and ends the session. On both backends the states are `idle`, `working`, `waiting_on_human` (Orca only) and `exited`, a reply is the agent's last message of the turn, and an ended session is `not_found`.
+
+**On Orca.**
+
 - An agent session is an agent running in an Orca terminal of a workspace. `start_agent_session` types the agent's configured command (shell-quoted) into a new terminal of the workspace's root entry (`orca terminal create --command`) and returns once Orca sees the agent idle at its prompt (`orca terminal wait --for tui-idle`), or after 15 s, so that it answers within the remote gateway's 30 s; if no agent runs in the terminal by then, it closes the terminal and fails with `harness_unavailable`. The session ID is the terminal's Orca handle, which a client chooses and which reaches the Orca CLI only as `--flag=value`, never as a flag of its own. Reach keeps nothing about sessions; they are read from Orca on every request (`orca terminal show`) and outlive the daemon.
 - A session's state is what Orca observes of its agent: `exited` when Orca sees no agent in the terminal (a shell), `waiting_on_human` while Orca saw it wait for its user (`agentWait` of `terminal show`, from its agent status hooks, the prompt text or the title), cannot tell (no `agentWait`), or sees it stopped at such a prompt while waiting for it (`blockedReason`), `idle` when Orca sees it idle at its prompt within 3 s (`tui-idle`) and its agent status does not report it in a turn, and `working` otherwise. At a permission prompt, `tui-idle` does not become idle and `agentWait` names the hook (checked with Claude Code 2.1.319).
 - A prompt is an operation: Reach types it into the terminal (`orca terminal send --enter`), and the prompt is delivered once Orca observed the agent start its turn (`turn_started`); otherwise it fails with `harness_unavailable`, as when the agent waits for an answer in its terminal. Resending an operation types nothing again.
@@ -204,17 +211,26 @@ Commands and jobs run as children of the daemon, each in its own process group, 
 - The agent runs in the user's login shell in the terminal, with its own settings and sandbox. Claude Code must start without a question to answer: the workspaces folder is trusted in `~/.claude.json` (trust applies to the folders inside) and the auto mode setup prompt is dismissed.
 - Reach does not use Orca's orchestration (Runs, Tasks, Dispatches). A Run needs the terminal of its coordinator, which Reach does not have: without `--from`, Orca guesses it from the terminals it has and fails with `no_active_sender_terminal` unless exactly one fits, and the one it picks may be the user's. Orca then reports each turn the agent ends without `worker_done` to the coordinator by typing a pointer to it into the coordinator's terminal, which would also be the agent's own if it coordinated itself.
 
+**In local workspaces.**
+
+- An agent session is an agent process the daemon runs in the workspace folder, with the agent's `command` and, in its environment, the fixed `PATH`, `LANG` and `HOME` of commands plus the agent's `env`. Reach talks to it over its `protocol`, with the protocol clients and process handling ported from DaVinci (without DaVinci's prompts and output contracts): Claude Code over stream-json (Reach adds `--print`, the stream-json flags and `--session-id`, and checks that the session is the one it asked for), Codex App Server (`thread/start` with approvals off; its sandbox is Codex's own configuration) or the Agent Client Protocol (no file system or terminal offered; permission requests are cancelled). No one answers an agent there: what it may do is its settings'.
+- `start_agent_session` returns once the agent opened its protocol session, or after 15 s with the session `working`; an agent that does not start or open is `harness_unavailable` and leaves no session. The session ID is Reach's (`ses_…`).
+- The state is `exited` once the process ended, `working` while it opens or runs a turn, and `idle` otherwise. A prompt starts a turn and the operation succeeds once it started; the reply is the agent's last message of the turn (Claude's `result`, Codex's last `agentMessage`, ACP's last message chunks), or the failure that ended it, of which Reach keeps the first 64 KiB (`reply_truncated` beyond that).
+- Sessions are kept in memory, in the daemon: the agents are its children (own process group, killed with it), and after a restart their sessions are `not_found`. `stop_agent_session` ends the turn and the protocol session, kills the process group and forgets the session. An open session, even one whose agent exited, keeps its workspace busy. The agent's stderr is kept, bounded, in `agents/<session>.stderr` next to the database until the session is stopped.
+
 ## 7. Linux execution
 
-Initial target: Linux with systemd, single user, single node.
+Initial target: Linux with systemd, single user, one or more nodes.
 
 - Daemon: a non-root systemd user service. Linger is set explicitly when needed.
 - Storage: local SQLite (WAL) and managed log / artifact directories.
-- Workspaces: one workspace per unit of work. A caller creates one with a name and a note saying what the work is; Reach creates the folder `reach-<name>` under its `workspaces` folder and registers it in Orca as a folder project, with the note as the comment of the project's root entry. The workspace starts empty; the work brings in what it needs. Orca is the only record of a workspace: its existence, name, path, note and workspace status are read from Orca on every request, and Reach stores nothing about it, so a project changed or removed in Orca is changed or gone for Reach too. Reach sees only Orca projects whose name starts with `reach-`, and a client's permissions apply to every workspace. Callers do not delete workspaces: they set the status to `completed`, and the daemon, every hour, removes each completed workspace without activity for 7 days and nothing running — activity being Orca's last activity or Reach's latest audit record, agent session or job change for it, and nothing running meaning no active job or agent session and no request using the workspace (a request holds it from authorization until it returns, and cannot take one being removed). It removes the Orca project (with `--force`, which also detaches terminals open in Orca) and the folder, but only a folder it created under `workspaces`. A project removed in Orca, outside Reach, leaves its folder: the daemon also removes a folder `reach-*` under `workspaces` that no Orca project has, under any name, once nothing in it (no file, folder or symlink, which it does not follow) has changed for 7 days, so that a folder being created, or one Orca leaves out of its list for a while, stays. Starting an agent in a completed workspace sets it back to `in-progress`.
+- Workspaces: one workspace per unit of work. A caller creates one with a name and a note saying what the work is; Reach creates the folder `reach-<name>` under its `workspaces` folder. The node's configuration chooses the workspace backend that keeps it: Orca when it names the Orca CLI, local workspaces otherwise.
+- Local workspaces: Reach records the workspace (ID `ws_…`, name, folder, note, status, last change) in SQLite, and the record is the workspace; statuses are todo, in-progress, in-review and completed. Cleanup is the same as on Orca below, with the record's last change as the activity outside Reach; removal forgets the record and removes the folder. A folder `reach-*` under `workspaces` that no record has, as one left by a daemon that stopped while creating it, is removed once nothing in it has changed for 7 days.
+- Workspaces on Orca: Reach registers the folder in Orca as a folder project, with the note as the comment of the project's root entry. The workspace starts empty; the work brings in what it needs. Orca is the only record of a workspace: its existence, name, path, note and workspace status are read from Orca on every request, and Reach stores nothing about it, so a project changed or removed in Orca is changed or gone for Reach too. Reach sees only Orca projects whose name starts with `reach-`, and a client's permissions apply to every workspace. Callers do not delete workspaces: they set the status to `completed`, and the daemon, every hour, removes each completed workspace without activity for 7 days and nothing running — activity being Orca's last activity or Reach's latest audit record, agent session or job change for it, and nothing running meaning no active job or agent session and no request using the workspace (a request holds it from authorization until it returns, and cannot take one being removed). It removes the Orca project (with `--force`, which also detaches terminals open in Orca) and the folder, but only a folder it created under `workspaces`. A project removed in Orca, outside Reach, leaves its folder: the daemon also removes a folder `reach-*` under `workspaces` that no Orca project has, under any name, once nothing in it (no file, folder or symlink, which it does not follow) has changed for 7 days, so that a folder being created, or one Orca leaves out of its list for a while, stays. Starting an agent in a completed workspace sets it back to `in-progress`.
 - Files: take a workspace ID and a relative path, and enforce the boundary with safe path resolution such as openat2. Escapes via symlinks or mounts are also checked.
 - Writes: conditional updates, with temporary files / atomic rename as needed.
 - Commands and jobs: an executable from the configured allowlist plus argv; no implicit shell expansion; a minimal environment (the daemon's environment is not inherited); execution time and output size limits.
-- Agents: run in Orca terminals in the user's login shell; sandboxing of the agent's tools is the agent's own (see §6).
+- Agents: on Orca, in Orca terminals in the user's login shell; in local workspaces, as processes of the daemon. Sandboxing of the agent's tools is the agent's own (see §6).
 
 **Note:** Reach does not isolate commands and jobs itself. Only allowlisted executables run, as the daemon's user, so allowlists should not include executables that can run arbitrary code unless that is intended.
 
@@ -224,13 +240,13 @@ Initial target: Linux with systemd, single user, single node.
 
 Verify external clients' OAuth/OIDC authentication and the binding between Reach users, clients, and nodes. Syntoria Gate can be used as the issuer, but it is not a required runtime dependency of the Reach core. Token issuer / audience / expiry / scopes etc. are verified, and users and nodes are never determined from unverified request parameters.
 
-**Implemented so far (one user, one node).** The gateway is a resource server of Syntoria Gate and holds no OAuth state.
+**Implemented so far (one user, multiple nodes).** The gateway is a resource server of Syntoria Gate and holds no OAuth state.
 - **Clients and approval**: MCP hosts register with Gate dynamically and get Gate's opaque access tokens after the person signs in with GitHub and approves the connection. The gateway's protected-resource metadata names Gate as the authorization server.
 - **Tokens**: every MCP request's token is introspected at Gate with the gateway's resource client credentials, and nothing is cached. The issuer, the audience (the gateway's MCP URL, a resource registered in Gate under its cookie parent), the expiry, Gate's approval and the client are checked, using the bearer verification of Gate's SDK. An invalid token is 401; Gate being unreachable is 503, never a sign-out.
 - **Admission**: only the configured subject (`OWNER_SUBJECT`, `github:<ID>`) is admitted. Any other is 403.
-- **The node**: it authenticates with the node token, a Worker secret.
-- **Authorization on Linux**: every remote request acts as the one Reach client named in the daemon's `remote` config, and the daemon authorizes it with that client's permissions. The gateway asserts no other identity.
-- **Revocation**: revoking a connection on Gate's `/connections` stops it at its next request. Removing `remote` or rotating the node token cuts off all remote access.
+- **Nodes**: the Worker secret `NODES` registers them, a JSON object of node IDs (letters, digits and `._-`, at most 64) and their tokens (at least 32 characters, one per node). A daemon authenticates with its node's token only; the gateway compares it with every node's token in constant time and gives the connection to that node's broker. The gateway refuses connections and MCP requests while `NODES` is missing or malformed.
+- **Authorization on Linux**: every remote request acts as the one Reach client named in the receiving daemon's `remote` config, and that daemon authorizes it with that client's permissions. The gateway asserts no other identity, and a node's agents in `list_nodes` are what that client may start.
+- **Revocation**: revoking a connection on Gate's `/connections` stops it at its next request. Removing a node's `remote`, or its entry or token in `NODES`, cuts that node off.
 
 ### Linux runtime
 
@@ -246,10 +262,12 @@ Record the operation ID, authenticated principal, node, workspace, operation typ
 
 | Store | Contents | Authority |
 | --- | --- | --- |
-| Linux SQLite | operations, jobs, audit_records | **Source of truth for operations / jobs** |
-| Orca server | Projects (`reach-*` are workspaces), their folders' registration, comments (notes) and workspace statuses; agents' terminals and their output | **Source of truth for workspaces and agent sessions** |
+| Linux SQLite | operations, jobs, audit_records; local_workspaces (local workspace backend) | **Source of truth for operations / jobs, and for local workspaces** |
+| Orca server | Projects (`reach-*` are workspaces), their folders' registration, comments (notes) and workspace statuses; agents' terminals and their output | **Source of truth for workspaces and agent sessions on Orca** |
+| Daemon memory | Agent sessions of local workspaces (their processes are the daemon's children) | **Source of truth for local agent sessions**; lost, with the agents, when the daemon stops |
 | Linux files | Job stdout / stderr | **Source of truth for the actual data** |
-| Durable Object | WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
+| Durable Object | One per node: its WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
+| Worker secrets | `NODES`: the node IDs and their tokens; Gate's settings | Node registry and credentials |
 | Workers | Transient processing and forwarding of authenticated requests | Holds no persistent job state |
 
 If a requirement arises to copy data to the Cloudflare side, a separate contract for what is stored, its sensitivity, retention period, and consistency is designed.
@@ -263,7 +281,7 @@ If a requirement arises to copy data to the Cloudflare side, a separate contract
 | Temporary Cloudflare outage | New operations may be unavailable. Linux jobs and results are kept |
 | DO hibernation / recreation | Reconstruct connection metadata and request connector re-registration if needed |
 | HTTP response lost | Return outcome_unknown; query or resend the same operation ID |
-| Daemon crash | Children die with the daemon. Running operations, jobs, and agent sessions become unknown at the next start and are never resumed |
+| Daemon crash | Children die with the daemon. Running operations and jobs become unknown at the next start and are never resumed. Agents on Orca live on; agents of local workspaces die with the daemon, and their sessions are not_found |
 | DaVinci restart | Look up the Reach job / agent session IDs saved in the DaVinci run, and read events from the last sequence it saw |
 | Prompt delivery unknown | Reconcile by the prompt's operation ID (get_operation). Never resend the same prompt under a new ID |
 | Duplicate requests | Prevent double side effects with SQLite unique constraints and argument comparison |
@@ -312,6 +330,7 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 | Orca | Stability of the Orca CLI's JSON results across versions; which base ref new workspaces should start from |
 | DaVinci integration | A migration plan that keeps the existing run / prompt / credential contracts on Reach agent sessions |
 | Agents on Orca | Agents other than Claude Code in Orca terminals; questions an agent asks in its terminal (Orca's `agentWait`); agents that write their conversation only as a full-screen view |
+| Local agents | The real Claude Code, Codex and DSH as processes of the daemon (verified so far against fake agents speaking their protocols); what their settings must allow when no one answers their questions |
 
 These are decided in detailed design and verification on real environments. Design documents do not indicate running functionality or completed production acceptance.
 

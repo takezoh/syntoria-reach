@@ -8,9 +8,9 @@ import (
 )
 
 // The ports below are every side effect the service performs. Adapters
-// implement them (store, workspace, command, job, orca, folders, ids); the
-// composition root (cmd/reach) wires them and tests replace them with the
-// fakes in servicetest.
+// implement them (store, workspace, command, job, the workspace backends
+// orcaws and localws, ids); the composition root (cmd/reach) wires them and
+// tests replace them with the fakes in servicetest.
 
 // Store keeps Reach's records. Conditional updates are part of the
 // contract: they decide races between concurrent requests and late reports.
@@ -27,7 +27,7 @@ type Store interface {
 	Audit(core.AuditRecord) error
 
 	// WorkspaceBusy reports whether a workspace has running jobs.
-	// Workspaces and agent sessions are Orca's; the store keeps neither.
+	// Workspaces and agent sessions are the workspace backend's.
 	WorkspaceBusy(id string) (bool, error)
 	// WorkspaceLastUsed returns when Reach last acted on a workspace (its
 	// audit records and jobs), or the zero time.
@@ -71,60 +71,47 @@ type Jobs interface {
 	ReadOutput(id, stream string, offset int64, limit int) (*core.JobOutput, error)
 }
 
-// Orca owns the projects that are workspaces and everything about them.
-// Failures Orca reports are *core.OrcaError.
-type Orca interface {
-	// AddFolder registers an existing folder as a folder project and
-	// returns its repo ID.
-	AddFolder(ctx context.Context, path string) (string, error)
-	Repos(ctx context.Context) ([]core.Repo, error)
-	// Repo returns one project; core.ErrNotFound if Orca has none.
-	Repo(ctx context.Context, id string) (*core.Repo, error)
-	// Worktrees lists the workspace entries of one project, or of every
-	// project when repoID is empty; core.ErrNotFound for an unknown
-	// project. A partial list is an error.
-	Worktrees(ctx context.Context, repoID string) ([]core.Worktree, error)
-	// SetWorktree changes a workspace entry's comment and workspace
-	// status; an empty value leaves that one unchanged.
-	SetWorktree(ctx context.Context, id, comment, status string) error
-	// DeleteProject removes a project, with its saved details, from Orca;
-	// its folder stays.
-	DeleteProject(ctx context.Context, repoID string) error
+// Workspaces keeps the node's workspaces and runs agents in them. Two
+// backends implement it: orcaws keeps workspaces as projects of the Orca
+// server and runs agents in its terminals; localws keeps them as folders it
+// records itself and runs agents as processes of the daemon.
+//
+// Failures the caller is to see are *core.Error (orca_failed,
+// harness_unavailable, invalid_state, invalid_request); a workspace or
+// session that does not exist is core.ErrNotFound. Other errors are
+// internal.
+type Workspaces interface {
+	// Create makes workspace name (which has core.WorkspacePrefix) with
+	// note: a new, empty folder of that name under the workspaces folder.
+	Create(ctx context.Context, name, note string) (*core.Workspace, error)
+	List(ctx context.Context) ([]*core.Workspace, error)
+	Get(ctx context.Context, id string) (*core.Workspace, error)
+	// Update changes a workspace's note and status; an empty value leaves
+	// that one unchanged.
+	Update(ctx context.Context, id, note, status string) (*core.Workspace, error)
+	// Remove removes workspace w, and its folder if Reach created it.
+	Remove(ctx context.Context, w *core.Workspace) error
+	// Sweep removes the workspace folders Reach created that no workspace
+	// has any more, such as those of projects removed in Orca, once nothing
+	// in them changed since; it returns the names of the folders removed.
+	Sweep(ctx context.Context, since time.Time) ([]string, error)
+	// Busy returns the workspaces in which a session is open.
+	Busy(ctx context.Context) (map[string]bool, error)
 
-	// CreateTerminal opens a terminal in workspace entry worktreeID, types
-	// command into its shell, and returns its handle.
-	CreateTerminal(ctx context.Context, worktreeID, title, command string) (string, error)
-	Terminals(ctx context.Context) ([]core.Terminal, error)
-	// ShowTerminal shows one terminal; core.ErrNotFound if Orca has no
-	// terminal with that handle, as once it closed.
-	ShowTerminal(ctx context.Context, handle string) (*core.TerminalStatus, error)
-	// WaitIdle waits up to timeout for the agent in terminal handle to wait
-	// for a prompt, and reports whether it does. Orca may instead see it
-	// stopped at something only a person can answer: blocked says what.
-	WaitIdle(ctx context.Context, handle string, timeout time.Duration) (idle bool, blocked string, err error)
-	// AgentTurn reads the latest turn of the agent in the terminal whose
-	// pane key is paneKey, as Orca's agent status hooks report it; nil when
-	// Orca reports no agent there.
-	AgentTurn(ctx context.Context, paneKey string) (*core.AgentTurn, error)
-	// SendPrompt types and submits text to the agent in terminal handle and
-	// returns the stages Orca observed (input_accepted, turn_started).
-	SendPrompt(ctx context.Context, handle, text string) ([]string, error)
-	CloseTerminal(ctx context.Context, handle string) error
-}
-
-// Folders creates and removes workspace folders.
-type Folders interface {
-	// Make creates the folder path, which must not exist yet, and its
-	// parents.
-	Make(path string) error
-	// Remove removes the folder path and everything in it.
-	Remove(path string) error
-	// List returns the names of the folders in dir, none when dir does not
-	// exist.
-	List(dir string) ([]string, error)
-	// ChangedSince reports whether the folder path, or anything in it,
-	// changed at or after t.
-	ChangedSince(path string, t time.Time) (bool, error)
+	// StartAgent starts agent a in workspace w and returns the session once
+	// the agent waits for its first prompt, or after a while; an agent that
+	// does not start is harness_unavailable, and leaves no session behind.
+	StartAgent(ctx context.Context, w *core.Workspace, a core.Agent) (*core.AgentSession, error)
+	// Session reads session id with what its agent does, and its reply
+	// once it waits for a prompt.
+	Session(ctx context.Context, id string) (*core.AgentStatus, error)
+	// Prompt delivers text to the agent of session id, which Session found
+	// waiting for a prompt, and returns once the agent started its turn,
+	// with the stages observed; an agent that did not start it is
+	// harness_unavailable.
+	Prompt(ctx context.Context, id, text string) ([]string, error)
+	// Stop ends session id and its agent.
+	Stop(ctx context.Context, id string) error
 }
 
 // NewID returns prefix followed by a unique random suffix.
@@ -136,7 +123,6 @@ type Deps struct {
 	OpenFiles  OpenFiles
 	RunCommand RunCommand
 	Jobs       Jobs
-	Orca       Orca
-	Folders    Folders
+	Workspaces Workspaces
 	NewID      NewID
 }

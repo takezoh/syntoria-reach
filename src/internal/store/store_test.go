@@ -57,8 +57,20 @@ func TestAdmitAndRestart(t *testing.T) {
 	}
 }
 
-// Workspaces are Orca's: the migrations leave no workspace table, also in a
-// database that had one.
+func TestRecordsContract(t *testing.T) {
+	servicetest.RecordsContract(t, func(t *testing.T) servicetest.RecordKeeper {
+		s, err := Open(filepath.Join(t.TempDir(), "reach.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		return s
+	})
+}
+
+// Workspaces on Orca and agent sessions are not recorded: the migrations
+// leave none of the earlier tables, also in a database that had them. Only
+// local workspaces are.
 func TestNoWorkspaceTable(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "reach.db"))
 	if err != nil {

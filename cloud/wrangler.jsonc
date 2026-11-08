@@ -12,6 +12,7 @@
   // is the audience registered with Gate.
   "workers_dev": false,
   "preview_urls": false,
+  // One NodeBroker per node, named by its node ID.
   "durable_objects": {
     "bindings": [{ "name": "NODE", "class_name": "NodeBroker" }]
   },
@@ -22,6 +23,9 @@
   //   GATE_CLIENT_ID      the gateway's resource client ID in GATE_RESOURCES
   //   GATE_CLIENT_SECRET  its client secret, at least 32 characters
   //   OWNER_SUBJECT       the one Gate subject that may use Reach, github:<user ID>
-  //   NODE_TOKEN          the token the Linux daemon connects with, at least 32 characters
-  "secrets": { "required": ["GATE_ISSUER", "GATE_CLIENT_ID", "GATE_CLIENT_SECRET", "OWNER_SUBJECT", "NODE_TOKEN"] }
+  //   NODES               the nodes and the tokens their daemons connect with, as a
+  //                       JSON object {"<node ID>": "<token>"}; node IDs are letters,
+  //                       digits and ._- (at most 64), each token at least 32
+  //                       characters and used by one node only
+  "secrets": { "required": ["GATE_ISSUER", "GATE_CLIENT_ID", "GATE_CLIENT_SECRET", "OWNER_SUBJECT", "NODES"] }
 }

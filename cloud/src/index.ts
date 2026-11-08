@@ -1,16 +1,18 @@
 import { nodeBroker } from "./broker";
 import { createGateVerifier, GateError, type GateVerifier } from "./gate";
 import { mcp } from "./mcp";
-import { bearer, sameSecret, usable } from "./secret";
+import { nodeOf, parseNodes } from "./nodes";
+import { bearer, usable } from "./secret";
 
 export { NodeBroker } from "./broker";
 
 // The Reach gateway: a remote MCP endpoint (/mcp) for Syntoria Gate access
-// tokens, and the endpoint the Linux daemon connects to (/connect).
+// tokens, and the endpoint the Linux daemons of the nodes connect to
+// (/connect).
 //
 //   /mcp        MCP Streamable HTTP; needs a Gate access token of OWNER_SUBJECT
 //   /.well-known/oauth-protected-resource[/mcp]  sends MCP hosts to Gate
-//   /connect    the daemon's WebSocket; needs the node token
+//   /connect    a daemon's WebSocket; needs the token of a node in NODES
 //
 // Gate signs the person in, registers MCP hosts and approves or revokes each
 // connection. The gateway holds no OAuth state: it checks every MCP request
@@ -38,7 +40,7 @@ function verifier(env: Env, resource: string): GateVerifier {
 }
 
 function configured(env: Env): boolean {
-  return !!env.GATE_ISSUER && !!env.GATE_CLIENT_ID && usable(env.GATE_CLIENT_SECRET) && !!env.OWNER_SUBJECT;
+  return !!env.GATE_ISSUER && !!env.GATE_CLIENT_ID && usable(env.GATE_CLIENT_SECRET) && !!env.OWNER_SUBJECT && parseNodes(env.NODES) !== null;
 }
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
@@ -49,7 +51,7 @@ function text(status: number, body: string): Response {
   return new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
 
-const unconfigured = () => text(503, "the gateway's Gate settings are missing\n");
+const unconfigured = () => text(503, "the gateway's Gate or NODES settings are missing or malformed\n");
 
 async function protectedMcp(request: Request, env: Env, origin: string): Promise<Response> {
   if (!configured(env)) {
@@ -71,7 +73,7 @@ async function protectedMcp(request: Request, env: Env, origin: string): Promise
   if (principal.userId !== env.OWNER_SUBJECT) {
     return json(403, { error: "forbidden" });
   }
-  return mcp(request, env);
+  return mcp(request, env, parseNodes(env.NODES)!);
 }
 
 function resourceMetadata(env: Env, origin: string): Response {
@@ -87,17 +89,19 @@ function resourceMetadata(env: Env, origin: string): Response {
   });
 }
 
-// The daemon's outbound WebSocket. Only the node token admits it; the
-// broker then forwards MCP requests over it.
+// A daemon's outbound WebSocket. Only a node's token admits it, as that
+// node; the node's broker then forwards MCP requests over it.
 async function connect(request: Request, env: Env): Promise<Response> {
-  if (!usable(env.NODE_TOKEN)) {
-    return text(503, "NODE_TOKEN is not configured on the gateway\n");
+  const nodes = parseNodes(env.NODES);
+  if (nodes === null) {
+    return text(503, "NODES is not configured on the gateway, or is malformed\n");
   }
   const token = bearer(request);
-  if (token === null || !(await sameSecret(token, env.NODE_TOKEN))) {
+  const node = token === null ? null : await nodeOf(nodes, token);
+  if (node === null) {
     return text(401, "unauthorized\n");
   }
-  return nodeBroker(env).fetch(request);
+  return nodeBroker(env, node).fetch(request);
 }
 
 export default {

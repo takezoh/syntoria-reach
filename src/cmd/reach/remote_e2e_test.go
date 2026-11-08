@@ -2,11 +2,15 @@ package main
 
 // End-to-end test of the remote path: this test is the MCP client. It runs
 // the gateway in workerd (wrangler dev) against a fake Syntoria Gate, which
-// answers OIDC discovery and token introspection, and drives a workspace and
-// an agent session on the real daemon, which reaches the gateway over its
-// outbound WebSocket. It also covers a node going offline and coming back,
-// and the gateway refusing tokens that Gate does not vouch for, tokens of
-// another person, a connection revoked at Gate, and Gate being down.
+// answers OIDC discovery and token introspection, with three nodes: "desk",
+// a real daemon on a fake Orca; "lab", a real daemon with local workspaces
+// and a fake agent; and "away", which never connects. Each daemon reaches
+// the gateway over its outbound WebSocket with its own node token. The test
+// lists the nodes and their agents, drives a workspace and an agent session
+// on each node, and covers a node going offline and coming back while the
+// others work, and the gateway refusing tokens that Gate does not vouch for,
+// tokens of another person, a connection revoked at Gate, and Gate being
+// down.
 //
 // It needs Node.js and the gateway's packages (npm install in cloud/), so it
 // runs only with REACH_E2E_GATEWAY=1.
@@ -34,23 +38,30 @@ import (
 )
 
 const (
-	gatewayNodeToken = "node-token-0123456789abcdef0123456789"
 	gateClientID     = "reach-e2e"
 	gateClientSecret = "gate-secret-0123456789abcdef0123456789"
 	ownerSubject     = "github:1"
 )
+
+// The nodes of the gateway and their tokens.
+var nodeTokens = map[string]string{
+	"desk": "node-token-desk-0123456789abcdef0123456789",
+	"lab":  "node-token-lab-0123456789abcdef01234567890",
+	"away": "node-token-away-0123456789abcdef0123456789",
+}
 
 func TestRemoteE2E(t *testing.T) {
 	if os.Getenv("REACH_E2E_GATEWAY") == "" {
 		t.Skip("set REACH_E2E_GATEWAY=1 to run the gateway with wrangler dev (needs npm install in cloud/)")
 	}
 	gate := newFakeGate(t)
+	nodes, _ := json.Marshal(nodeTokens)
 	base := startGateway(t, "GATE_ISSUER="+gate.URL, "GATE_CLIENT_ID="+gateClientID,
-		"GATE_CLIENT_SECRET="+gateClientSecret, "OWNER_SUBJECT="+ownerSubject, "NODE_TOKEN="+gatewayNodeToken)
+		"GATE_CLIENT_SECRET="+gateClientSecret, "OWNER_SUBJECT="+ownerSubject, "NODES="+string(nodes))
 	resource := base + "/mcp"
 	connectURL := "ws" + strings.TrimPrefix(base, "http") + "/connect"
 
-	// The node token is required to connect.
+	// Only a node's token admits a daemon.
 	if _, resp, err := websocket.Dial(t.Context(), connectURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer wrong-token-0123456789abcdef012345"}},
 	}); err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
@@ -74,8 +85,13 @@ func TestRemoteE2E(t *testing.T) {
 		t.Fatalf("resource metadata: %+v", prm)
 	}
 
-	d, _ := newDaemon(t, fmt.Sprintf(`"remote": {"url": %q, "token": %q, "client": "e2e"},`, connectURL, gatewayNodeToken))
-	d.start()
+	remote := func(node string) string {
+		return fmt.Sprintf(`"remote": {"url": %q, "token": %q, "client": "e2e"},`, connectURL, nodeTokens[node])
+	}
+	desk, _ := newDaemon(t, remote("desk"))
+	desk.start()
+	lab, _ := buildDaemon(t, true, remote("lab"))
+	lab.start()
 
 	// The token Gate issues to an approved MCP host of the owner.
 	gate.issue("tok-owner", ownerSubject, resource)
@@ -85,7 +101,7 @@ func TestRemoteE2E(t *testing.T) {
 	for _, tool := range c.rpc("tools/list", map[string]any{})["tools"].([]any) {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	for _, want := range []string{"list_capabilities", "list_workspaces", "create_workspace", "update_workspace", "start_agent_session", "send_agent_prompt", "read_agent_output", "stop_agent_session", "get_operation"} {
+	for _, want := range []string{"list_nodes", "list_capabilities", "list_workspaces", "create_workspace", "update_workspace", "start_agent_session", "send_agent_prompt", "read_agent_output", "stop_agent_session", "get_operation"} {
 		if !slices.Contains(names, want) {
 			t.Fatalf("tools %v lack %s", names, want)
 		}
@@ -95,57 +111,121 @@ func TestRemoteE2E(t *testing.T) {
 		t.Fatal("the gateway did not introspect the token")
 	}
 
-	// The daemon connects on its own; wait until requests reach it.
-	caps := c.waitTool("list_capabilities", map[string]any{}, func(r any, e *toolError) bool { return e == nil }).(map[string]any)
-	if agents, _ := caps["agents"].([]any); len(agents) != 1 || agents[0] != "claude" {
-		t.Fatalf("list_capabilities: %v", caps)
+	// The daemons connect on their own. list_nodes shows every node, the
+	// ones connected with the agents the caller may start there and their
+	// roles.
+	listed := c.waitTool("list_nodes", map[string]any{}, func(r any, e *toolError) bool {
+		online := 0
+		for _, n := range nodesOf(r) {
+			if n["online"] == true {
+				online++
+			}
+		}
+		return e == nil && online == 2
+	})
+	byNode := map[string]map[string]any{}
+	for _, n := range nodesOf(listed) {
+		byNode[n["node"].(string)] = n
+	}
+	if len(byNode) != 3 || byNode["away"]["online"] != false || byNode["away"]["agents"] != nil {
+		t.Fatalf("list_nodes: %v", listed)
+	}
+	for _, node := range []string{"desk", "lab"} {
+		agents, _ := byNode[node]["agents"].([]any)
+		if len(agents) != 1 || agents[0].(map[string]any)["id"] != "claude" || agents[0].(map[string]any)["role"] != "Writes and reviews code" {
+			t.Fatalf("agents of %s: %v", node, byNode[node])
+		}
 	}
 
-	// A workspace and an agent session, used through MCP.
-	op := c.mustTool("create_workspace", map[string]any{"operation_id": "r-cw", "name": "ws", "note": "remote e2e"}).(map[string]any)
+	// Every other tool needs the node; an unknown node runs nothing.
+	if !c.invalid("list_workspaces", map[string]any{}) {
+		t.Fatal("a tool without its node was accepted")
+	}
+	if _, e := c.tool("list_workspaces", map[string]any{"node": "nowhere"}); e == nil || e.Code != "not_found" {
+		t.Fatalf("unknown node: %v", e)
+	}
+	if _, e := c.tool("list_workspaces", map[string]any{"node": "away"}); e == nil || e.Code != "node_offline" {
+		t.Fatalf("node that never connected: %v", e)
+	}
+
+	// A workspace and an agent session on the Orca node, used through MCP.
+	op := c.mustTool("create_workspace", map[string]any{"node": "desk", "operation_id": "r-cw", "name": "ws", "note": "remote e2e"}).(map[string]any)
 	if op["state"] != "succeeded" || result(op)["note"] != "remote e2e" {
 		t.Fatalf("create_workspace: %v", op)
 	}
 	wsID := result(op)["workspace"]
 	// Ongoing work is found again by its note and status.
-	if op := c.mustTool("update_workspace", map[string]any{"operation_id": "r-uw", "workspace": wsID, "status": "in-review"}).(map[string]any); result(op)["status"] != "in-review" {
+	if op := c.mustTool("update_workspace", map[string]any{"node": "desk", "operation_id": "r-uw", "workspace": wsID, "status": "in-review"}).(map[string]any); result(op)["status"] != "in-review" {
 		t.Fatalf("update_workspace: %v", op)
 	}
-	if list := c.mustTool("list_workspaces", map[string]any{}).([]any); len(list) != 1 || list[0].(map[string]any)["note"] != "remote e2e" {
+	if list := c.mustTool("list_workspaces", map[string]any{"node": "desk"}).([]any); len(list) != 1 || list[0].(map[string]any)["note"] != "remote e2e" {
 		t.Fatalf("list_workspaces: %v", list)
 	}
-	op = c.mustTool("start_agent_session", map[string]any{"operation_id": "r-s", "workspace": wsID, "agent": "claude"}).(map[string]any)
+	op = c.mustTool("start_agent_session", map[string]any{"node": "desk", "operation_id": "r-s", "workspace": wsID, "agent": "claude"}).(map[string]any)
 	sessionID := result(op)["session_id"]
-	prompt := map[string]any{"operation_id": "r-p", "session_id": sessionID, "text": "hi"}
+	prompt := map[string]any{"node": "desk", "operation_id": "r-p", "session_id": sessionID, "text": "hi"}
 	if op := c.mustTool("send_agent_prompt", prompt).(map[string]any); op["state"] != "succeeded" {
 		t.Fatalf("send_agent_prompt: %v", op)
 	}
-	if out := c.mustTool("read_agent_output", map[string]any{"session_id": sessionID}).(map[string]any); out["reply"] != "echo: hi" || out["state"] != "idle" {
+	if out := c.mustTool("read_agent_output", map[string]any{"node": "desk", "session_id": sessionID}).(map[string]any); out["reply"] != "echo: hi" || out["state"] != "idle" {
 		t.Fatalf("read_agent_output: %v", out)
 	}
 	// Resending the prompt with the same operation ID types nothing again.
 	c.mustTool("send_agent_prompt", prompt)
-	if n := strings.Count(orcatest.Calls(t, filepath.Join(filepath.Dir(d.sock), "orca")), "terminal send "); n != 1 {
+	if n := strings.Count(orcatest.Calls(t, filepath.Join(filepath.Dir(desk.sock), "orca")), "terminal send "); n != 1 {
 		t.Fatalf("the prompt was typed %d times", n)
 	}
-	if s := c.mustTool("get_agent_session", map[string]any{"session_id": sessionID}).(map[string]any); s["workspace"] != wsID || s["state"] != "idle" {
+	if s := c.mustTool("get_agent_session", map[string]any{"node": "desk", "session_id": sessionID}).(map[string]any); s["workspace"] != wsID || s["state"] != "idle" {
 		t.Fatalf("get_agent_session: %v", s)
 	}
 	// Errors from the node come back as tool errors with Reach's codes.
-	if _, e := c.tool("get_agent_session", map[string]any{"session_id": "as_nope"}); e == nil || e.Code != "not_found" {
+	if _, e := c.tool("get_agent_session", map[string]any{"node": "desk", "session_id": "as_nope"}); e == nil || e.Code != "not_found" {
 		t.Fatalf("unknown session: %v", e)
 	}
-	c.mustTool("stop_agent_session", map[string]any{"operation_id": "r-x", "session_id": sessionID})
+	c.mustTool("stop_agent_session", map[string]any{"node": "desk", "operation_id": "r-x", "session_id": sessionID})
 
-	// The node goes offline: nothing runs, and the gateway says so. When
-	// it comes back it reconnects by itself.
-	d.kill()
-	c.waitTool("list_capabilities", map[string]any{}, func(r any, e *toolError) bool { return e != nil && e.Code == "node_offline" })
-	d.start()
-	c.waitTool("list_capabilities", map[string]any{}, func(r any, e *toolError) bool { return e == nil })
-	if op := c.mustTool("update_workspace", map[string]any{"operation_id": "r-done", "workspace": wsID, "status": "completed"}).(map[string]any); op["state"] != "succeeded" {
+	// The same on the node with local workspaces; workspaces and
+	// operations belong to their node.
+	op = c.mustTool("create_workspace", map[string]any{"node": "lab", "operation_id": "r-cw", "name": "ws", "note": "remote e2e on lab"}).(map[string]any)
+	labWS := result(op)["workspace"]
+	if op["state"] != "succeeded" || labWS == wsID {
+		t.Fatalf("create_workspace on lab: %v", op)
+	}
+	if op := c.mustTool("update_workspace", map[string]any{"node": "lab", "operation_id": "r-uw2", "workspace": wsID, "note": "x"}).(map[string]any); op["error_code"] != "not_found" {
+		t.Fatalf("update of another node's workspace: %v", op)
+	}
+	if op := c.mustTool("get_operation", map[string]any{"node": "lab", "operation_id": "r-cw"}).(map[string]any); result(op)["workspace"] != labWS {
+		t.Fatalf("the operation r-cw of lab: %v", op)
+	}
+	op = c.mustTool("start_agent_session", map[string]any{"node": "lab", "operation_id": "r-s", "workspace": labWS, "agent": "claude"}).(map[string]any)
+	labSession := result(op)["session_id"]
+	if op := c.mustTool("send_agent_prompt", map[string]any{"node": "lab", "operation_id": "r-p", "session_id": labSession, "text": "hi"}).(map[string]any); op["state"] != "succeeded" {
+		t.Fatalf("send_agent_prompt on lab: %v", op)
+	}
+	out := c.waitTool("read_agent_output", map[string]any{"node": "lab", "session_id": labSession}, func(r any, e *toolError) bool {
+		return e == nil && r.(map[string]any)["state"] != "working"
+	}).(map[string]any)
+	if out["reply"] != "echo hi" || out["state"] != "idle" {
+		t.Fatalf("read_agent_output on lab: %v", out)
+	}
+
+	// One node goes offline: nothing runs there, the gateway says so, and
+	// the other node keeps working. When it comes back it reconnects by
+	// itself.
+	desk.kill()
+	c.waitTool("list_capabilities", map[string]any{"node": "desk"}, func(r any, e *toolError) bool { return e != nil && e.Code == "node_offline" })
+	if n := c.mustTool("list_nodes", map[string]any{}); !online(n, "lab") || online(n, "desk") {
+		t.Fatalf("list_nodes with desk offline: %v", n)
+	}
+	if s := c.mustTool("get_agent_session", map[string]any{"node": "lab", "session_id": labSession}).(map[string]any); s["state"] != "idle" {
+		t.Fatalf("lab while desk is offline: %v", s)
+	}
+	desk.start()
+	c.waitTool("list_capabilities", map[string]any{"node": "desk"}, func(r any, e *toolError) bool { return e == nil })
+	if op := c.mustTool("update_workspace", map[string]any{"node": "desk", "operation_id": "r-done", "workspace": wsID, "status": "completed"}).(map[string]any); op["state"] != "succeeded" {
 		t.Fatalf("complete the workspace: %v", op)
 	}
+	c.mustTool("stop_agent_session", map[string]any{"node": "lab", "operation_id": "r-x", "session_id": labSession})
 
 	// Tokens Gate does not vouch for, or vouches for another resource, are
 	// refused and send the host back to Gate.
@@ -175,6 +255,29 @@ func TestRemoteE2E(t *testing.T) {
 	if status, _ := c.status(); status != http.StatusUnauthorized {
 		t.Fatalf("revoked connection: %d", status)
 	}
+}
+
+// nodesOf returns the nodes of a list_nodes result.
+func nodesOf(r any) []map[string]any {
+	m, _ := r.(map[string]any)
+	list, _ := m["nodes"].([]any)
+	var out []map[string]any
+	for _, n := range list {
+		if n, ok := n.(map[string]any); ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// online reports whether a list_nodes result shows node online.
+func online(r any, node string) bool {
+	for _, n := range nodesOf(r) {
+		if n["node"] == node {
+			return n["online"] == true
+		}
+	}
+	return false
 }
 
 // fakeGate stands in for Syntoria Gate: OIDC discovery, and introspection of
@@ -428,6 +531,24 @@ func (c *mcpClient) tool(name string, args map[string]any) (any, *toolError) {
 		c.t.Fatalf("%s: result %q", name, text)
 	}
 	return v, nil
+}
+
+// invalid reports whether the gateway refused the call's arguments, as an
+// MCP error or a tool error that is not one of Reach's, without running it.
+func (c *mcpClient) invalid(name string, args map[string]any) bool {
+	c.t.Helper()
+	c.id++
+	_, out := c.post(map[string]any{"jsonrpc": "2.0", "id": c.id, "method": "tools/call", "params": map[string]any{"name": name, "arguments": args}})
+	if out["error"] != nil {
+		return true
+	}
+	res, _ := out["result"].(map[string]any)
+	content, _ := res["content"].([]any)
+	if res["isError"] != true || len(content) != 1 {
+		return false
+	}
+	text, _ := content[0].(map[string]any)["text"].(string)
+	return !strings.Contains(text, `"error"`) && strings.Contains(text, "node")
 }
 
 func (c *mcpClient) mustTool(name string, args map[string]any) any {

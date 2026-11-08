@@ -10,12 +10,18 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // Config is the on-disk daemon configuration. It contains client tokens, so the
 // file must not be readable by group or others.
+//
+// Orca chooses the node's workspace backend: with the Orca CLI command set,
+// workspaces are projects of the Orca server and agents run in its
+// terminals; without it, workspaces are local folders Reach records itself
+// and agents run as processes of the daemon.
 type Config struct {
 	Socket     string   `json:"socket"`
 	Database   string   `json:"database"`
@@ -36,14 +42,11 @@ type Remote struct {
 	Client string `json:"client"` // ID of a client in Clients
 }
 
-// Agent is an agent Reach starts in an Orca terminal of a workspace:
-// Command is typed into the terminal's shell, each argument quoted, and
-// Command[0] is an absolute path. Model, effort and permission flags belong
-// in Command.
-type Agent struct {
-	ID      string   `json:"id"`
-	Command []string `json:"command"`
-}
+// Agent is an agent the node may start in its workspaces, with the role
+// callers choose it by (see core.Agent). Model, effort, permission and
+// sandbox flags belong in Command. Protocol and Env apply to local
+// workspaces only, where Protocol is required.
+type Agent = core.Agent
 
 // Client is a caller identified by a bearer token. Allow lists its
 // permissions, which apply to every workspace.
@@ -115,8 +118,8 @@ func (c *Config) Validate() error {
 	if !filepath.IsAbs(c.Socket) || !filepath.IsAbs(c.Database) || !filepath.IsAbs(c.Workspaces) {
 		return errors.New("socket, database and workspaces must be absolute paths")
 	}
-	if len(c.Orca) == 0 || !filepath.IsAbs(c.Orca[0]) {
-		return errors.New("orca must be set to the Orca CLI command, starting with an absolute path")
+	if c.Orca != nil && (len(c.Orca) == 0 || !filepath.IsAbs(c.Orca[0])) {
+		return errors.New("orca must be the Orca CLI command, starting with an absolute path, or left out for local workspaces")
 	}
 	for _, cmd := range c.Commands {
 		if !filepath.IsAbs(cmd) {
@@ -129,8 +132,17 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("agent id %q is empty or duplicated", a.ID)
 		}
 		agents[a.ID] = true
+		if strings.TrimSpace(a.Role) == "" {
+			return fmt.Errorf("agent %s: role must say what the agent is for", a.ID)
+		}
 		if len(a.Command) == 0 || !filepath.IsAbs(a.Command[0]) {
 			return fmt.Errorf("agent %s: command must start with an absolute path", a.ID)
+		}
+		switch {
+		case c.Orca != nil && (a.Protocol != "" || a.Env != nil):
+			return fmt.Errorf("agent %s: protocol and env apply only without orca; on Orca the command runs in a terminal", a.ID)
+		case c.Orca == nil && a.Protocol != core.ProtocolClaude && a.Protocol != core.ProtocolCodex && a.Protocol != core.ProtocolACP:
+			return fmt.Errorf("agent %s: protocol must be %q, %q or %q for local workspaces", a.ID, core.ProtocolClaude, core.ProtocolCodex, core.ProtocolACP)
 		}
 	}
 	clients := map[string]bool{}

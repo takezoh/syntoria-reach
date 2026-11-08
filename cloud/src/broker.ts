@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 
-// The node broker holds the WebSocket the Linux daemon opened and forwards
-// requests over it. It keeps no state of its own beyond that connection:
+// A node broker holds the WebSocket one node's Linux daemon opened and
+// forwards requests over it; there is one Durable Object per node, named by
+// its node ID. It keeps no state of its own beyond that connection:
 // operations, workspaces and sessions live on Linux. A request waiting for a
 // reply exists only in memory; if the reply does not come back, the caller
 // learns that the outcome is unknown and reconciles it by operation ID.
@@ -13,11 +14,8 @@ export type Reply = { result: unknown } | { error: ReachError };
 // caller polls.
 const REPLY_TIMEOUT_MS = 30_000;
 
-// One node per gateway for now.
-const NODE_NAME = "default";
-
-export function nodeBroker(env: Env): DurableObjectStub<NodeBroker> {
-  return env.NODE.get(env.NODE.idFromName(NODE_NAME));
+export function nodeBroker(env: Env, node: string): DurableObjectStub<NodeBroker> {
+  return env.NODE.get(env.NODE.idFromName(node));
 }
 
 export function failure(code: string, message: string): Reply {

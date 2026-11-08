@@ -121,7 +121,7 @@ After Reach Option B's Workers + Durable Objects + outbound WSS has been verifie
 - How DaVinci's output schemas and developer instructions are passed through Reach agent sessions
 - Which agent events DaVinci needs beyond messages, errors, and turn completion (structured output, usage)
 - Authentication, permissions, credential injection, and revocation rules for local connections
-- How much of DaVinci's Git execution moves into Reach capabilities (workspace creation and cleanup are Reach's, through Orca)
+- How much of DaVinci's Git execution moves into Reach capabilities (workspace creation and cleanup are Reach's, through Orca or as local workspaces)
 - How DaVinci's stored runs hold Reach job / session IDs and the last event sequence
 - How to avoid duplicating ownership during cutover and rollback between the current DaVinci and Reach
 

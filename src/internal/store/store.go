@@ -1,5 +1,5 @@
 // Package store keeps Reach's records in SQLite: operations, audit
-// records, jobs, agent sessions and workspaces.
+// records, jobs, and the workspaces of the local workspace backend.
 package store
 
 import (
@@ -100,6 +100,16 @@ var migrations = []string{
 	// Agent sessions run in Orca terminals and are read from Orca.
 	`DROP TABLE agent_events;
 	DROP TABLE agent_sessions;`,
+	// Workspaces of nodes without Orca, which Reach keeps itself.
+	`CREATE TABLE local_workspaces (
+		id         TEXT PRIMARY KEY,
+		name       TEXT NOT NULL,
+		path       TEXT NOT NULL UNIQUE,
+		note       TEXT NOT NULL,
+		status     TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);`,
 }
 
 // Open opens (creating if needed) the database at path and applies migrations.

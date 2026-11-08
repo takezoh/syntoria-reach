@@ -1,5 +1,5 @@
-// Secrets (Gate's resource client secret, the node token) are usable only
-// when long enough to resist guessing, and the node token is compared in
+// Secrets (Gate's resource client secret, the node tokens) are usable only
+// when long enough to resist guessing, and node tokens are compared in
 // constant time.
 
 const MIN_SECRET_LENGTH = 32;

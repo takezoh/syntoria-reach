@@ -1,7 +1,8 @@
 // Command reach is the Syntoria Reach daemon. It serves the local API on a
 // Unix socket and keeps operations and audit records in SQLite. It is the
 // composition root: the only package that wires the adapters to the
-// service.
+// service, and that chooses the workspace backend (Orca when the config
+// names the Orca CLI, local workspaces otherwise).
 package main
 
 import (
@@ -16,13 +17,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/takezoh/syntoria-reach/src/internal/agent"
 	"github.com/takezoh/syntoria-reach/src/internal/api"
 	"github.com/takezoh/syntoria-reach/src/internal/command"
 	"github.com/takezoh/syntoria-reach/src/internal/config"
 	"github.com/takezoh/syntoria-reach/src/internal/ids"
 	"github.com/takezoh/syntoria-reach/src/internal/job"
 	"github.com/takezoh/syntoria-reach/src/internal/localapi"
+	"github.com/takezoh/syntoria-reach/src/internal/localws"
 	"github.com/takezoh/syntoria-reach/src/internal/orca"
+	"github.com/takezoh/syntoria-reach/src/internal/orcaws"
 	"github.com/takezoh/syntoria-reach/src/internal/remote"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
 	"github.com/takezoh/syntoria-reach/src/internal/store"
@@ -54,8 +58,12 @@ func run() error {
 	} else if n > 0 {
 		slog.Warn("operations left running by a previous daemon are now unknown", "count", n)
 	}
-	svc := service.New(cfg, deps(cfg, st))
+	d, agents := deps(cfg, st)
+	svc := service.New(cfg, d)
 	defer svc.Close()
+	if agents != nil {
+		defer agents.Close() // the agents of local workspaces end with the daemon
+	}
 
 	l, err := localapi.Listen(cfg.Socket)
 	if err != nil {
@@ -67,7 +75,7 @@ func run() error {
 	defer stop()
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(l) }()
-	slog.Info("reach listening", "socket", cfg.Socket)
+	slog.Info("reach listening", "socket", cfg.Socket, "workspaces", backendName(cfg))
 
 	go cleanup(ctx, svc)
 
@@ -123,10 +131,19 @@ func cleanup(ctx context.Context, svc *service.Service) {
 	}
 }
 
-// deps wires the production adapters. Job output is kept next to the
-// database.
-func deps(cfg *config.Config, st *store.Store) service.Deps {
+// deps wires the production adapters. Job output, and the logs of the agents
+// of local workspaces, are kept next to the database. The agent runtime is
+// returned for local workspaces, nil on Orca.
+func deps(cfg *config.Config, st *store.Store) (service.Deps, *agent.Runtime) {
 	stateDir := filepath.Dir(cfg.Database)
+	var workspaces service.Workspaces
+	var agents *agent.Runtime
+	if cfg.Orca != nil {
+		workspaces = orcaws.New(&orca.CLI{Command: cfg.Orca}, workspace.Folders{}, cfg.Workspaces)
+	} else {
+		agents = agent.New(filepath.Join(stateDir, "agents"))
+		workspaces = localws.New(cfg.Workspaces, st, workspace.Folders{}, agents, ids.New)
+	}
 	return service.Deps{
 		Store: st,
 		OpenFiles: func(dir string) (service.Files, error) {
@@ -138,10 +155,16 @@ func deps(cfg *config.Config, st *store.Store) service.Deps {
 		},
 		RunCommand: command.Run,
 		Jobs:       job.NewRunner(filepath.Join(stateDir, "jobs")),
-		Orca:       &orca.CLI{Command: cfg.Orca},
-		Folders:    workspace.Folders{},
+		Workspaces: workspaces,
 		NewID:      ids.New,
+	}, agents
+}
+
+func backendName(cfg *config.Config) string {
+	if cfg.Orca != nil {
+		return "orca"
 	}
+	return "local"
 }
 
 func defaultConfigPath() string {
