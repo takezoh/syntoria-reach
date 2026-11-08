@@ -66,6 +66,30 @@ func OwnFolder(base, path, name string) bool {
 	return strings.HasPrefix(name, WorkspacePrefix) && filepath.IsAbs(base) && path == filepath.Join(base, name) && filepath.Base(path) == name
 }
 
+// WorkspaceOfEntry returns the workspace (Orca repo ID) of an Orca
+// workspace entry ID, "<repo ID>::<path>".
+func WorkspaceOfEntry(entryID string) string {
+	id, _, _ := strings.Cut(entryID, "::")
+	return id
+}
+
+// ShellCommand renders argv for a POSIX shell: arguments made only of
+// characters a shell never interprets are left as they are, others are
+// single-quoted.
+func ShellCommand(argv []string) string {
+	out := make([]string, len(argv))
+	for i, a := range argv {
+		if a != "" && shellSafe.MatchString(a) {
+			out[i] = a
+		} else {
+			out[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_./:=@%+,-]+$`)
+
 // CheckNote reports whether note can describe a workspace: not blank, at
 // most MaxNoteLength characters, without NUL bytes.
 func CheckNote(note string) error {
@@ -170,21 +194,6 @@ func JobOutcome(e JobExit) (state, message string) {
 	return JobSucceeded, ""
 }
 
-// Resumable decides whether prev may be continued by a new session in the
-// given workspace and agent, and returns its protocol session ID. Protocol
-// IDs come only from the caller's own records, never from a request.
-func Resumable(prev *AgentSession, workspaceID, agentID string) (string, error) {
-	switch {
-	case prev.WorkspaceID != workspaceID || prev.AgentID != agentID:
-		return "", Errorf(CodeInvalidRequest, "session %q belongs to another workspace or agent", prev.ID)
-	case prev.State == SessionStarting || prev.State == SessionIdle || prev.State == SessionRunning:
-		return "", Errorf(CodeInvalidState, "session %q is still active; stop it first", prev.ID)
-	case prev.ProtocolSessionID == "":
-		return "", Errorf(CodeInvalidState, "session %q never opened a protocol session", prev.ID)
-	}
-	return prev.ProtocolSessionID, nil
-}
-
 // Classify maps an adapter error to an error class. It returns nil for
 // errors that are not expected (internal failures).
 func Classify(err error) *Error {
@@ -203,8 +212,6 @@ func Classify(err error) *Error {
 		return Errorf(CodeNotFound, "%v", err)
 	case errors.Is(err, ErrVersionConflict):
 		return Errorf(CodeVersionConflict, "%v", err)
-	case errors.Is(err, ErrSessionInactive), errors.Is(err, ErrSessionBusy):
-		return Errorf(CodeInvalidState, "%v", err)
 	}
 	return nil
 }

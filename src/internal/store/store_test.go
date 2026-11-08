@@ -66,7 +66,7 @@ func TestNoWorkspaceTable(t *testing.T) {
 	}
 	defer s.Close()
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'workspaces'`).Scan(&n); err != nil || n != 0 {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN ('workspaces', 'agent_sessions', 'agent_events')`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("workspaces tables: %d %v", n, err)
 	}
 }

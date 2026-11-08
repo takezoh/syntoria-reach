@@ -83,7 +83,7 @@ func TestRemoteE2E(t *testing.T) {
 	for _, tool := range c.rpc("tools/list", map[string]any{})["tools"].([]any) {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	for _, want := range []string{"list_capabilities", "list_workspaces", "create_workspace", "update_workspace", "start_agent_session", "send_agent_prompt", "read_agent_events", "stop_agent_session", "get_operation"} {
+	for _, want := range []string{"list_capabilities", "list_workspaces", "create_workspace", "update_workspace", "start_agent_session", "send_agent_prompt", "read_agent_messages", "stop_agent_session", "get_operation"} {
 		if !slices.Contains(names, want) {
 			t.Fatalf("tools %v lack %s", names, want)
 		}
@@ -95,7 +95,7 @@ func TestRemoteE2E(t *testing.T) {
 
 	// The daemon connects on its own; wait until requests reach it.
 	caps := c.waitTool("list_capabilities", map[string]any{}, func(r any, e *toolError) bool { return e == nil }).(map[string]any)
-	if agents, _ := caps["agents"].([]any); len(agents) != 1 || agents[0] != "codex" {
+	if agents, _ := caps["agents"].([]any); len(agents) != 1 || agents[0] != "claude" {
 		t.Fatalf("list_capabilities: %v", caps)
 	}
 
@@ -112,24 +112,23 @@ func TestRemoteE2E(t *testing.T) {
 	if list := c.mustTool("list_workspaces", map[string]any{}).([]any); len(list) != 1 || list[0].(map[string]any)["note"] != "remote e2e" {
 		t.Fatalf("list_workspaces: %v", list)
 	}
-	op = c.mustTool("start_agent_session", map[string]any{"operation_id": "r-s", "workspace": wsID, "agent": "codex"}).(map[string]any)
+	op = c.mustTool("start_agent_session", map[string]any{"operation_id": "r-s", "workspace": wsID, "agent": "claude"}).(map[string]any)
 	sessionID := result(op)["session_id"]
 	prompt := map[string]any{"operation_id": "r-p", "session_id": sessionID, "text": "hi"}
-	if op := c.mustTool("send_agent_prompt", prompt).(map[string]any); result(op)["turn"] != 1.0 {
+	if op := c.mustTool("send_agent_prompt", prompt).(map[string]any); op["state"] != "succeeded" {
 		t.Fatalf("send_agent_prompt: %v", op)
 	}
-	events := c.waitTool("read_agent_events", map[string]any{"session_id": sessionID, "after": 0}, func(r any, e *toolError) bool {
-		return e == nil && r.(map[string]any)["state"] == "idle"
-	}).(map[string]any)
-	ev := events["events"].([]any)
-	if len(ev) != 2 || !strings.HasPrefix(ev[0].(map[string]any)["text"].(string), "echo hi") || ev[1].(map[string]any)["type"] != "turn_completed" {
-		t.Fatalf("events: %v", events)
+	msgs := c.mustTool("read_agent_messages", map[string]any{"session_id": sessionID}).(map[string]any)
+	if m := msgs["messages"].([]any); len(m) != 2 || !strings.Contains(fmt.Sprint(m[1]), "echo: hi") || msgs["activity"] != "done" {
+		t.Fatalf("read_agent_messages: %v", msgs)
 	}
-	// Resending the prompt with the same operation ID starts no second turn.
-	if op := c.mustTool("send_agent_prompt", prompt).(map[string]any); result(op)["turn"] != 1.0 {
-		t.Fatalf("resent prompt: %v", op)
+	// Resending the prompt with the same operation ID types nothing again,
+	// and the cursor reads on from where the last read ended.
+	c.mustTool("send_agent_prompt", prompt)
+	if more := c.mustTool("read_agent_messages", map[string]any{"session_id": sessionID, "cursor": msgs["cursor"]}).(map[string]any); len(more["messages"].([]any)) != 0 {
+		t.Fatalf("resent prompt: %v", more)
 	}
-	if s := c.mustTool("get_agent_session", map[string]any{"session_id": sessionID}).(map[string]any); s["turns"] != 1.0 {
+	if s := c.mustTool("get_agent_session", map[string]any{"session_id": sessionID}).(map[string]any); s["workspace"] != wsID || s["terminal"] == nil {
 		t.Fatalf("get_agent_session: %v", s)
 	}
 	// Errors from the node come back as tool errors with Reach's codes.

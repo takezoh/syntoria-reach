@@ -36,21 +36,13 @@ type Remote struct {
 	Client string `json:"client"` // ID of a client in Clients
 }
 
-// Agent is an agent harness Reach can start (see core.Harness). The
-// harness sandboxes its own tools: Sandbox defaults to "workspace-write" for
-// Codex, and ACP permission requests are denied unless AllowPermissions.
+// Agent is an agent Reach starts in an Orca terminal of a workspace:
+// Command is typed into the terminal's shell, each argument quoted, and
+// Command[0] is an absolute path. Model, effort and permission flags belong
+// in Command.
 type Agent struct {
-	ID               string            `json:"id"`
-	Protocol         string            `json:"protocol"`
-	Command          []string          `json:"command"`
-	Env              map[string]string `json:"env"`
-	Sandbox          string            `json:"sandbox"`
-	AllowPermissions bool              `json:"allow_permissions"`
-}
-
-// Harness returns how to start the agent.
-func (a Agent) Harness() core.Harness {
-	return core.Harness{Protocol: a.Protocol, Command: a.Command, Env: a.Env, Sandbox: a.Sandbox, AllowPermissions: a.AllowPermissions}
+	ID      string   `json:"id"`
+	Command []string `json:"command"`
 }
 
 // Client is a caller identified by a bearer token. Allow lists its
@@ -132,28 +124,13 @@ func (c *Config) Validate() error {
 		}
 	}
 	agents := map[string]bool{}
-	for i := range c.Agents {
-		a := &c.Agents[i]
+	for _, a := range c.Agents {
 		if a.ID == "" || agents[a.ID] {
 			return fmt.Errorf("agent id %q is empty or duplicated", a.ID)
 		}
 		agents[a.ID] = true
-		if a.Protocol != core.ProtocolCodex && a.Protocol != core.ProtocolClaude && a.Protocol != core.ProtocolACP {
-			return fmt.Errorf("agent %s: protocol must be %q, %q or %q", a.ID, core.ProtocolCodex, core.ProtocolClaude, core.ProtocolACP)
-		}
 		if len(a.Command) == 0 || !filepath.IsAbs(a.Command[0]) {
 			return fmt.Errorf("agent %s: command must start with an absolute path", a.ID)
-		}
-		if a.Protocol == core.ProtocolCodex && a.Sandbox == "" {
-			a.Sandbox = "workspace-write"
-		}
-		switch {
-		case a.Protocol != core.ProtocolCodex && a.Sandbox != "":
-			return fmt.Errorf("agent %s: sandbox applies to codex agents only", a.ID)
-		case a.Protocol != core.ProtocolACP && a.AllowPermissions:
-			return fmt.Errorf("agent %s: allow_permissions applies to acp agents only", a.ID)
-		case a.Protocol == core.ProtocolCodex && a.Sandbox != "read-only" && a.Sandbox != "workspace-write" && a.Sandbox != "danger-full-access":
-			return fmt.Errorf("agent %s: unknown codex sandbox %q", a.ID, a.Sandbox)
 		}
 	}
 	clients := map[string]bool{}

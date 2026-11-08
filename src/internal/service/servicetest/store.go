@@ -4,7 +4,6 @@
 package servicetest
 
 import (
-	"cmp"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -25,8 +24,6 @@ type Store struct {
 	audit      []core.AuditRecord
 	auditAt    map[string]time.Time // workspace ID -> time of its latest audit record
 	jobs       map[string]*core.Job
-	sessions   map[string]*core.AgentSession
-	events     map[string][]core.AgentEvent
 }
 
 // NewStore returns an empty store.
@@ -35,8 +32,6 @@ func NewStore() *Store {
 		operations: map[[2]string]*core.Operation{},
 		auditAt:    map[string]time.Time{},
 		jobs:       map[string]*core.Job{},
-		sessions:   map[string]*core.AgentSession{},
-		events:     map[string][]core.AgentEvent{},
 	}
 }
 
@@ -122,11 +117,6 @@ func (s *Store) WorkspaceLastUsed(id string) (time.Time, error) {
 			last = j.UpdatedAt
 		}
 	}
-	for _, a := range s.sessions {
-		if a.WorkspaceID == id && a.UpdatedAt.After(last) {
-			last = a.UpdatedAt
-		}
-	}
 	return last, nil
 }
 
@@ -135,11 +125,6 @@ func (s *Store) WorkspaceBusy(id string) (bool, error) {
 	defer s.mu.Unlock()
 	for _, j := range s.jobs {
 		if j.WorkspaceID == id && j.State == core.JobRunning {
-			return true, nil
-		}
-	}
-	for _, a := range s.sessions {
-		if a.WorkspaceID == id && sessionActive(a.State) {
 			return true, nil
 		}
 	}
@@ -187,68 +172,4 @@ func (s *Store) GetJob(clientID, id string) (*core.Job, error) {
 		c.ExitCode = &code
 	}
 	return &c, nil
-}
-
-func (s *Store) CreateAgentSession(a *core.AgentSession) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.sessions[a.ID]; ok {
-		return fmt.Errorf("agent session %s exists", a.ID)
-	}
-	now := s.now()
-	s.sessions[a.ID] = &core.AgentSession{ID: a.ID, ClientID: a.ClientID, WorkspaceID: a.WorkspaceID, AgentID: a.AgentID,
-		State: core.SessionStarting, CreatedAt: now, UpdatedAt: now}
-	return nil
-}
-
-func sessionActive(state string) bool {
-	return state == core.SessionStarting || state == core.SessionIdle || state == core.SessionRunning
-}
-
-func (s *Store) UpdateAgentSession(id string, u core.AgentSessionUpdate) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a, ok := s.sessions[id]
-	if !ok || !sessionActive(a.State) {
-		return nil
-	}
-	a.State = cmp.Or(u.State, a.State)
-	a.ProtocolSessionID = cmp.Or(u.ProtocolSessionID, a.ProtocolSessionID)
-	a.ErrorMessage = cmp.Or(u.ErrorMessage, a.ErrorMessage)
-	if u.AddTurn {
-		a.Turns++
-	}
-	a.UpdatedAt = s.now()
-	return nil
-}
-
-func (s *Store) GetAgentSession(clientID, id string) (*core.AgentSession, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a, ok := s.sessions[id]
-	if !ok || a.ClientID != clientID {
-		return nil, core.ErrNotFound
-	}
-	c := *a
-	return &c, nil
-}
-
-func (s *Store) AppendAgentEvent(sessionID string, turn int, typ, text string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	events := s.events[sessionID]
-	s.events[sessionID] = append(events, core.AgentEvent{Seq: int64(len(events)) + 1, Turn: turn, Type: typ, Text: text, At: s.now()})
-	return nil
-}
-
-func (s *Store) ListAgentEvents(sessionID string, after int64, limit int) ([]core.AgentEvent, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := []core.AgentEvent{}
-	for _, e := range s.events[sessionID] {
-		if e.Seq > after && len(out) < limit {
-			out = append(out, e)
-		}
-	}
-	return out, nil
 }

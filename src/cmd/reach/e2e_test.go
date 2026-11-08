@@ -2,8 +2,9 @@ package main
 
 // End-to-end test against the real binary: standalone use over the Unix
 // socket, idempotent resend, survival of a client disconnect, background jobs,
-// agent sessions (with a fake Codex app-server), and a daemon crash that
-// kills its children and leaves their outcome unknown (never re-executed).
+// an agent session in an Orca terminal (with a fake Orca CLI), and a daemon
+// crash that kills its children and leaves their outcome unknown (never
+// re-executed), while the agent, which Orca runs, keeps its conversation.
 
 import (
 	"bytes"
@@ -19,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/takezoh/syntoria-reach/src/internal/agent/agenttest"
 	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
 )
 
@@ -55,10 +55,8 @@ func newDaemon(t *testing.T, extra ...string) (*daemon, string) {
 	}
 	ws := filepath.Join(orcaRoot, "reach-ws") // created by the fake Orca
 	sock := filepath.Join(dir, "reach.sock")
-	agentCmd, agentEnv := agenttest.Agent(t, "codex", "TestFakeHarness")
-	agentEnv["REACH_FAKE_PID_FILE"] = filepath.Join(ws, "agent.pid")
-	agent, _ := json.Marshal(map[string]any{"id": "codex", "protocol": "codex", "command": agentCmd, "env": agentEnv})
-	orca, _ := json.Marshal(orcatest.Command(t, "TestFakeHarness", orcaRoot))
+	agent, _ := json.Marshal(map[string]any{"id": "claude", "command": []string{"/bin/claude", "--model", "claude-opus-5-5", "--effort", "xhigh"}})
+	orca, _ := json.Marshal(orcatest.Command(t, "TestFakeOrca", orcaRoot))
 	cfg := fmt.Sprintf(`{
 		%s
 		"socket": %q, "database": %q, "workspaces": %q,
@@ -289,25 +287,28 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("read_job_output: %v", out)
 	}
 
-	// An agent session: one turn, read back as events.
-	op = d.mustCall("start_agent_session", map[string]any{"operation_id": "s1", "workspace": wsID, "agent": "codex"})
-	if result(op)["state"] != "idle" {
+	// An agent session: the agent's command is typed into an Orca terminal
+	// of the workspace, a prompt goes to that terminal, and the conversation
+	// is read back from Orca.
+	op = d.mustCall("start_agent_session", map[string]any{"operation_id": "s1", "workspace": wsID, "agent": "claude"})
+	sessionID := result(op)["session_id"]
+	if op["state"] != "succeeded" || sessionID == nil || result(op)["terminal"] == nil {
 		t.Fatalf("start_agent_session: %v", op)
 	}
-	sessionID := result(op)["session_id"]
-	if op := d.mustCall("send_agent_prompt", map[string]any{"operation_id": "p1", "session_id": sessionID, "text": "hi"}); result(op)["turn"] != 1.0 {
+	if m := d.mustCall("read_agent_messages", map[string]any{"session_id": sessionID}); len(m["messages"].([]any)) != 0 {
+		t.Fatalf("messages before a prompt: %v", m)
+	}
+	if op := d.mustCall("send_agent_prompt", map[string]any{"operation_id": "p1", "session_id": sessionID, "text": "hi"}); op["state"] != "succeeded" {
 		t.Fatalf("send_agent_prompt: %v", op)
 	}
-	events := d.poll("read_agent_events", map[string]any{"session_id": sessionID}, func(e map[string]any) bool { return e["state"] == "idle" })
-	if ev := events["events"].([]any); len(ev) != 2 || !strings.HasPrefix(ev[0].(map[string]any)["text"].(string), "echo hi") {
-		t.Fatalf("events: %v", events)
+	if m := d.mustCall("read_agent_messages", map[string]any{"session_id": sessionID}); len(m["messages"].([]any)) != 2 ||
+		!strings.Contains(fmt.Sprint(m["messages"]), "echo: hi") || m["activity"] != "done" {
+		t.Fatalf("read_agent_messages: %v", m)
 	}
-	d.mustCall("stop_agent_session", map[string]any{"operation_id": "x1", "session_id": sessionID})
-	os.Remove(filepath.Join(ws, "agent.pid"))
 
-	// The daemon crashes while a command, a job and an agent turn are running.
-	// Its children die with it; after restart their outcome is unknown, and
-	// resending does not execute anything again.
+	// The daemon crashes while a command and a job are running. Its children
+	// die with it; after restart their outcome is unknown, and resending does
+	// not execute anything again. The agent runs in Orca and lives on.
 	crash := map[string]any{
 		"operation_id": "c2", "workspace": wsID, "executable": "/bin/sh",
 		"args": []string{"-c", "echo $$ > crash.pid; echo started >> crash.log; exec sleep 30"},
@@ -319,15 +320,10 @@ func TestE2E(t *testing.T) {
 	})
 	crashJob := result(op)["job_id"]
 	jobPID := waitFile(t, filepath.Join(ws, "job.pid"))
-	op = d.mustCall("start_agent_session", map[string]any{"operation_id": "s2", "workspace": wsID, "agent": "codex"})
-	crashSession := result(op)["session_id"]
-	agentPID := waitFile(t, filepath.Join(ws, "agent.pid"))
-	d.mustCall("send_agent_prompt", map[string]any{"operation_id": "p2", "session_id": crashSession, "text": "hang"})
 
 	d.kill()
 	waitDead(t, "command", commandPID)
 	waitDead(t, "job", jobPID)
-	waitDead(t, "agent harness", agentPID)
 
 	d.start()
 	if op := d.waitState("c2", "unknown"); op["error_code"] != "result_unknown" {
@@ -342,8 +338,14 @@ func TestE2E(t *testing.T) {
 	if j := d.mustCall("get_job", map[string]any{"job_id": crashJob}); j["state"] != "unknown" {
 		t.Fatalf("job after crash: %v", j)
 	}
-	if s := d.mustCall("get_agent_session", map[string]any{"session_id": crashSession}); s["state"] != "unknown" {
-		t.Fatalf("agent session after crash: %v", s)
+	if op := d.mustCall("send_agent_prompt", map[string]any{"operation_id": "p2", "session_id": sessionID, "text": "still there?"}); op["state"] != "succeeded" {
+		t.Fatalf("prompt after the restart: %v", op)
+	}
+	if m := d.mustCall("read_agent_messages", map[string]any{"session_id": sessionID}); len(m["messages"].([]any)) != 4 {
+		t.Fatalf("the conversation after the restart: %v", m)
+	}
+	if op := d.mustCall("stop_agent_session", map[string]any{"operation_id": "x1", "session_id": sessionID}); op["state"] != "succeeded" {
+		t.Fatalf("stop_agent_session: %v", op)
 	}
 	// Completed work survives the restart.
 	d.waitState("c1", "succeeded")
@@ -372,10 +374,8 @@ func TestE2E(t *testing.T) {
 	}
 }
 
-// TestFakeHarness is not a test: it turns the test binary into a fake agent
-// harness or a fake Orca CLI.
-func TestFakeHarness(t *testing.T) {
+// TestFakeOrca is not a test: it turns the test binary into a fake Orca CLI.
+func TestFakeOrca(t *testing.T) {
 	orcatest.MaybeRun()
-	agenttest.MaybeRun()
 	t.Skip("helper process")
 }

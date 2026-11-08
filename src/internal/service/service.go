@@ -55,7 +55,6 @@ type Service struct {
 	openFiles  OpenFiles
 	runCommand RunCommand
 	jobs       Jobs
-	agents     Agents
 	orca       Orca
 	folders    Folders
 	newID      NewID
@@ -87,7 +86,6 @@ func New(cfg *config.Config, d Deps) *Service {
 		openFiles:  d.OpenFiles,
 		runCommand: d.RunCommand,
 		jobs:       d.Jobs,
-		agents:     d.Agents,
 		orca:       d.Orca,
 		folders:    d.Folders,
 		newID:      d.NewID,

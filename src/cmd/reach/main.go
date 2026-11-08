@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/takezoh/syntoria-reach/src/internal/agent"
 	"github.com/takezoh/syntoria-reach/src/internal/api"
 	"github.com/takezoh/syntoria-reach/src/internal/command"
 	"github.com/takezoh/syntoria-reach/src/internal/config"
@@ -123,8 +122,8 @@ func cleanup(ctx context.Context, svc *service.Service) {
 	}
 }
 
-// deps wires the production adapters. Job output and harness logs are kept
-// next to the database.
+// deps wires the production adapters. Job output is kept next to the
+// database.
 func deps(cfg *config.Config, st *store.Store) service.Deps {
 	stateDir := filepath.Dir(cfg.Database)
 	return service.Deps{
@@ -138,7 +137,6 @@ func deps(cfg *config.Config, st *store.Store) service.Deps {
 		},
 		RunCommand: command.Run,
 		Jobs:       job.NewRunner(filepath.Join(stateDir, "jobs")),
-		Agents:     agent.New(filepath.Join(stateDir, "agents")),
 		Orca:       &orca.CLI{Command: cfg.Orca},
 		Folders:    workspace.Folders{},
 		NewID:      ids.New,

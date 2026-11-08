@@ -186,12 +186,18 @@ func (s *Service) Cleanup(ctx context.Context, now time.Time) ([]string, error) 
 	}
 	var removed []string
 	var errs []error
+	var open map[string]bool // workspaces with an open terminal in Orca
 	for i := range repos {
 		r, root := &repos[i], roots[repos[i].ID]
 		if root == nil || root.WorkspaceStatus != core.WorkspaceCompleted {
 			continue
 		}
-		if done, err := s.cleanup(ctx, r, root, now); err != nil {
+		if open == nil {
+			if open, err = s.openTerminals(ctx); err != nil {
+				return nil, err
+			}
+		}
+		if done, err := s.cleanup(ctx, r, root, open[r.ID], now); err != nil {
 			errs = append(errs, fmt.Errorf("workspace %s: %w", r.ID, err))
 		} else if done {
 			removed = append(removed, r.ID)
@@ -201,8 +207,9 @@ func (s *Service) Cleanup(ctx context.Context, now time.Time) ([]string, error) 
 }
 
 // cleanup removes one completed workspace if it is due, and reports whether
-// its Orca project was removed.
-func (s *Service) cleanup(ctx context.Context, r *core.Repo, root *core.Worktree, now time.Time) (bool, error) {
+// its Orca project was removed. An open terminal, such as an agent's, makes
+// it busy.
+func (s *Service) cleanup(ctx context.Context, r *core.Repo, root *core.Worktree, terminalOpen bool, now time.Time) (bool, error) {
 	// A workspace a request holds is skipped; once marked, no request can
 	// take it, and the jobs and sessions of earlier requests are recorded.
 	if !s.beginRemoval(r.ID) {
@@ -213,6 +220,7 @@ func (s *Service) cleanup(ctx context.Context, r *core.Repo, root *core.Worktree
 	if err != nil {
 		return false, err
 	}
+	busy = busy || terminalOpen
 	used, err := s.store.WorkspaceLastUsed(r.ID)
 	if err != nil {
 		return false, err
@@ -235,6 +243,22 @@ func (s *Service) cleanup(ctx context.Context, r *core.Repo, root *core.Worktree
 		}
 	}
 	return true, nil
+}
+
+// openTerminals returns the workspaces (repo IDs) with an open terminal in
+// Orca.
+func (s *Service) openTerminals(ctx context.Context) (map[string]bool, error) {
+	terms, err := s.orca.Terminals(ctx)
+	if err != nil {
+		return nil, orcaError(err)
+	}
+	open := map[string]bool{}
+	for _, t := range terms {
+		if t.Connected {
+			open[core.WorkspaceOfEntry(t.WorktreeID)] = true
+		}
+	}
+	return open, nil
 }
 
 // workspaceProjects reads the projects that are workspaces and their root

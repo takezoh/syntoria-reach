@@ -59,8 +59,9 @@ var (
 	ErrVersionConflict = errors.New("version conflict")
 	ErrNotRegular      = errors.New("unexpected file type")
 	ErrJobNotRunning   = errors.New("job is not running")
-	ErrSessionInactive = errors.New("agent session is not active")
-	ErrSessionBusy     = errors.New("a turn is already in progress")
+	// ErrTranscriptUnavailable means Orca cannot read an agent's transcript
+	// yet: the agent has not reported its session.
+	ErrTranscriptUnavailable = errors.New("agent transcript is not available yet")
 )
 
 // Operation states. StateUnknown marks an operation whose outcome could not
@@ -234,95 +235,45 @@ type JobOutput struct {
 	Size   int64  `json:"size"`
 }
 
-// Agent harness protocols.
-const (
-	ProtocolCodex  = "codex"  // Codex app-server
-	ProtocolClaude = "claude" // Claude Code stream-json
-	ProtocolACP    = "acp"    // Agent Client Protocol v1 (e.g. DSH)
-)
-
-// Harness is how to start an agent. Command[0] is an absolute path; Env is
-// added to the minimal child environment. For Claude, Reach appends the
-// stream-json and session flags; permission mode and sandbox flags belong in
-// Command. Sandbox is the Codex sandbox mode; AllowPermissions lets Reach
-// approve ACP permission requests.
-type Harness struct {
-	Protocol         string
-	Command          []string
-	Env              map[string]string
-	Sandbox          string
-	AllowPermissions bool
+// Terminal is an Orca terminal, as Orca reports it. WorktreeID is the ID
+// of the workspace entry it runs in; AgentIdentity names the agent Orca
+// recognizes running in it, empty when there is none (a shell).
+type Terminal struct {
+	Handle        string `json:"handle"`
+	WorktreeID    string `json:"worktreeId"`
+	Connected     bool   `json:"connected"`
+	AgentIdentity string `json:"agentIdentity"`
 }
 
-// AgentStart describes a session to start. Resume is a protocol session ID
-// to continue; Model and Effort apply to Codex and Claude.
-type AgentStart struct {
-	Dir     string
-	Harness Harness
-	Resume  string
-	Model   string
-	Effort  string
+// Dispatch is an Orca orchestration Dispatch, as Orca reports it. Reach
+// adopts the terminal of each agent it starts as a Dispatch, which is how
+// Orca reads the agent's transcript.
+type Dispatch struct {
+	ID             string `json:"dispatchId"`
+	Terminal       string `json:"terminal"`
+	Liveness       string `json:"liveness"`
+	WaitingOnHuman string `json:"waitingOnHuman"`
 }
 
-// AgentEvents receives what happens in a running agent session. The service
-// implements it and records the facts. Calls for one session never overlap.
-type AgentEvents interface {
-	// TurnStarted is called before a prompt is delivered; an error aborts it.
-	TurnStarted(sessionID string, turn int) error
-	// Event reports a normalized event (EventMessage, EventError,
-	// EventTurnCompleted) of a turn.
-	Event(sessionID string, turn int, typ, text string)
-	// TurnEnded is called when a turn finished and the harness is still up.
-	TurnEnded(sessionID string, turn int)
-	// Exited is called when the harness ended without being stopped; turn is
-	// the last turn started (0 if none).
-	Exited(sessionID string, turn int)
+// Transcript is a part of an agent's conversation as Orca reads it: the
+// messages in Orca's form, the cursor to read on from, and the agent's
+// status.
+type Transcript struct {
+	Messages  []json.RawMessage
+	Cursor    string
+	Workspace string // ID of the workspace entry the agent runs in
+	Activity  string // Orca's: done while the agent waits for a prompt
+	Terminal  string // running, exited or unknown
+	Liveness  string
 }
 
-// Agent session states. Active sessions left by a previous daemon become
-// StateUnknown.
-const (
-	SessionStarting = "starting"
-	SessionIdle     = "idle"
-	SessionRunning  = "running"
-	SessionClosed   = "closed"
-	SessionFailed   = "failed"
-)
-
-// Event types recorded for a session.
-const (
-	EventMessage       = "message"        // text the agent sent to the user
-	EventError         = "error"          // an error reported by the harness or Reach
-	EventTurnCompleted = "turn_completed" // text is the stop reason / turn status
-)
-
-// AgentSession is the durable record of an agent harness session.
+// AgentSession is an agent Reach started in an Orca terminal of a
+// workspace. Its ID is the Orca Dispatch ID; Reach keeps nothing about it.
 type AgentSession struct {
-	ID                string    `json:"session_id"`
-	ClientID          string    `json:"-"`
-	WorkspaceID       string    `json:"workspace"`
-	AgentID           string    `json:"agent"`
-	ProtocolSessionID string    `json:"protocol_session_id,omitempty"`
-	State             string    `json:"state"`
-	Turns             int       `json:"turns"`
-	ErrorMessage      string    `json:"error_message,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
-}
-
-// AgentSessionUpdate changes a session; empty fields are left unchanged.
-type AgentSessionUpdate struct {
-	State             string
-	ProtocolSessionID string
-	ErrorMessage      string
-	AddTurn           bool
-}
-
-// AgentEvent is one normalized event of an agent session.
-type AgentEvent struct {
-	Seq  int64     `json:"seq"`
-	Turn int       `json:"turn"`
-	Type string    `json:"type"`
-	Text string    `json:"text"`
-	At   time.Time `json:"at"`
+	ID             string `json:"session_id"`
+	Workspace      string `json:"workspace"`
+	Terminal       string `json:"terminal,omitempty"` // empty once the terminal is closed
+	Agent          string `json:"agent,omitempty"`    // the agent Orca sees running in it, if any
+	Liveness       string `json:"liveness,omitempty"`
+	WaitingOnHuman string `json:"waiting_on_human,omitempty"`
 }

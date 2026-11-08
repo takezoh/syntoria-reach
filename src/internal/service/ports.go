@@ -8,7 +8,7 @@ import (
 )
 
 // The ports below are every side effect the service performs. Adapters
-// implement them (store, workspace, command, job, agent, orca, folders, ids); the
+// implement them (store, workspace, command, job, orca, folders, ids); the
 // composition root (cmd/reach) wires them and tests replace them with the
 // fakes in servicetest.
 
@@ -26,11 +26,11 @@ type Store interface {
 	GetOperation(clientID, operationID string) (*core.Operation, error)
 	Audit(core.AuditRecord) error
 
-	// WorkspaceBusy reports whether a workspace has running jobs or active
-	// agent sessions. Workspaces themselves are Orca's; the store keeps none.
+	// WorkspaceBusy reports whether a workspace has running jobs.
+	// Workspaces and agent sessions are Orca's; the store keeps neither.
 	WorkspaceBusy(id string) (bool, error)
 	// WorkspaceLastUsed returns when Reach last acted on a workspace (its
-	// audit records, agent sessions and jobs), or the zero time.
+	// audit records and jobs), or the zero time.
 	WorkspaceLastUsed(id string) (time.Time, error)
 
 	// CreateJob records j as running.
@@ -39,18 +39,6 @@ type Store interface {
 	// longer running is left unchanged.
 	FinishJob(id, state string, exitCode *int, timedOut, truncated bool, errMessage string) error
 	GetJob(clientID, id string) (*core.Job, error)
-
-	// CreateAgentSession records a in the starting state.
-	CreateAgentSession(a *core.AgentSession) error
-	// UpdateAgentSession applies u to a session that has not ended; closed,
-	// failed and unknown sessions are never changed.
-	UpdateAgentSession(id string, u core.AgentSessionUpdate) error
-	GetAgentSession(clientID, id string) (*core.AgentSession, error)
-	// AppendAgentEvent appends an event with the session's next sequence
-	// number (starting at 1).
-	AppendAgentEvent(sessionID string, turn int, typ, text string) error
-	// ListAgentEvents returns up to limit events with seq > after, in order.
-	ListAgentEvents(sessionID string, after int64, limit int) ([]core.AgentEvent, error)
 }
 
 // Files gives access to one workspace's files, confined to its root.
@@ -83,19 +71,6 @@ type Jobs interface {
 	ReadOutput(id, stream string, offset int64, limit int) (*core.JobOutput, error)
 }
 
-// Agents runs agent harness sessions.
-type Agents interface {
-	// Start launches session id and returns its protocol session ID. Once it
-	// returned, what happens in the session is reported to events.
-	Start(ctx context.Context, id string, s core.AgentStart, events core.AgentEvents) (protocolSessionID string, err error)
-	// Prompt starts a turn and returns its number; core.ErrSessionInactive
-	// or core.ErrSessionBusy when it cannot.
-	Prompt(id, text string) (turn int, err error)
-	// Stop ends the session and returns after its last report;
-	// core.ErrSessionInactive if it is not running.
-	Stop(id string) error
-}
-
 // Orca owns the projects that are workspaces and everything about them.
 // Failures Orca reports are *core.OrcaError.
 type Orca interface {
@@ -115,6 +90,24 @@ type Orca interface {
 	// DeleteProject removes a project, with its saved details, from Orca;
 	// its folder stays.
 	DeleteProject(ctx context.Context, repoID string) error
+
+	// CreateTerminal opens a terminal in workspace entry worktreeID, types
+	// command into its shell, and returns its handle.
+	CreateTerminal(ctx context.Context, worktreeID, title, command string) (string, error)
+	Terminals(ctx context.Context) ([]core.Terminal, error)
+	// SendPrompt types and submits text to the agent in terminal handle and
+	// returns the stages Orca observed (input_accepted, turn_started).
+	SendPrompt(ctx context.Context, handle, text string) ([]string, error)
+	CloseTerminal(ctx context.Context, handle string) error
+	// AdoptTerminal makes a terminal a Dispatch, through which Orca reads
+	// the transcript of the agent in it, and returns the Dispatch ID.
+	AdoptTerminal(ctx context.Context, handle, title string) (string, error)
+	// Dispatch shows a Dispatch; core.ErrNotFound if Orca has none.
+	Dispatch(ctx context.Context, id string) (*core.Dispatch, error)
+	// Transcript reads an agent's conversation from cursor (the start when
+	// empty); core.ErrTranscriptUnavailable until Orca can read it.
+	Transcript(ctx context.Context, id, cursor string, limit int) (*core.Transcript, error)
+	StopDispatch(ctx context.Context, id string) error
 }
 
 // Folders creates and removes workspace folders.
@@ -135,7 +128,6 @@ type Deps struct {
 	OpenFiles  OpenFiles
 	RunCommand RunCommand
 	Jobs       Jobs
-	Agents     Agents
 	Orca       Orca
 	Folders    Folders
 	NewID      NewID

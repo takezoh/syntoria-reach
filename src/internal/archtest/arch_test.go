@@ -62,17 +62,15 @@ var rules = map[string]rule{
 	"internal/localapi": {Internal: []string{"internal/core", "internal/service", "internal/api"}},
 	// The connector is transport only: it hands requests to a handler and
 	// knows nothing of the service.
-	"internal/remote":          {Internal: []string{"internal/core"}},
-	"internal/store":           adapter,
-	"internal/workspace":       adapter,
-	"internal/command":         {Internal: []string{"internal/core"}},
-	"internal/job":             adapter,
-	"internal/agent":           adapter,
-	"internal/orca":            adapter,
-	"internal/agent/agenttest": {Internal: []string{}},
-	"internal/orca/orcatest":   {Internal: []string{}},
-	"internal/archtest":        {Internal: []string{}},
-	"cmd/reach":                {}, // the composition root wires everything
+	"internal/remote":        {Internal: []string{"internal/core"}},
+	"internal/store":         adapter,
+	"internal/workspace":     adapter,
+	"internal/command":       {Internal: []string{"internal/core"}},
+	"internal/job":           adapter,
+	"internal/orca":          adapter,
+	"internal/orca/orcatest": {Internal: []string{}},
+	"internal/archtest":      {Internal: []string{}},
+	"cmd/reach":              {}, // the composition root wires everything
 }
 
 func TestDependencyRules(t *testing.T) {

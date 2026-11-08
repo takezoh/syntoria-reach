@@ -53,7 +53,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 ### Case D: DaVinci's execution runtime
 
 1. DaVinci decides the work from the issue's goal and chooses the workspace purpose and which Codex / Claude Code / DSH etc. to run.
-2. DaVinci asks Reach's local API to start an agent session, and Reach launches the harness (Codex App Server, Claude Code, or an ACP agent such as DSH), which sandboxes its own tools.
+2. DaVinci asks Reach's local API to start an agent session, and Reach starts the agent (for example Claude Code) in an Orca terminal of the workspace, where the user can watch it; the agent sandboxes its own tools.
 3. DaVinci sends prompts and judges the meaning of each turn's result. Reach delivers turns, records the agent's events, and tracks process and job state.
 4. DaVinci binds Reach's agent session / job IDs to its own run, supervises progress, and receives verification results.
 5. When DaVinci restarts, it re-fetches Reach's current state and checks for unknown exits and unknown prompt delivery before continuing. DaVinci decides completion of the original issue and PR submission.
@@ -67,12 +67,12 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 | File access | Yes | List, read, conditional write |
 | Command execution | Yes | Isolated execution of permitted Linux commands |
 | Asynchronous jobs | Yes | Start, get state/output, stop |
-| Agent sessions | Yes | Codex App Server / Claude Code / ACP agents: start, one turn at a time, events, stop. The harness sandboxes its own tools |
+| Agent sessions | Yes | Agents in Orca terminals: start, prompt, read the transcript, stop. The agent sandboxes its own tools |
 | Authentication and permissions | Yes | Permission per AI client, node, workspace, and operation |
 | Audit | Yes | Records of actor, target, time, and result |
 | Browser / Desktop GUI | Later | Browser and screen operation |
 | Multi-node | Later | Extension to multiple Linux machines and other OSes |
-| Agent-specific orchestration | Later | Per-agent planning and conversation management. Starting Codex App Server / Claude Code / ACP agents is supported in the MVP |
+| Agent-specific orchestration | Later | Per-agent planning and conversation management. Starting agents in Orca terminals is supported in the MVP |
 | P2P / WebRTC | Later | Direct communication paths for clients that support them |
 | MCP Events | Later | Asynchronous notifications such as job completion and node state |
 
@@ -84,7 +84,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 - **Client / Connection**: an authenticated AI client and its connection.
 - **Operation**: an individual operation request. It has a unique identifier used to detect resends and duplicates.
 - **Job**: an asynchronous execution and its state, independent of the communication session.
-- **Agent Session**: a running agent harness (Codex App Server, Claude Code, or an ACP agent) and its protocol session, driven one turn at a time. Distinct from MCP sessions and from a caller's own run.
+- **Agent Session**: an agent running in an Orca terminal of a workspace, which a caller prompts and whose transcript it reads through Reach. Distinct from MCP sessions and from a caller's own run.
 - **Artifact**: a reference to output logs or generated files.
 - **Permission**: a definition of what is allowed for an actor, target, and operation.
 
@@ -108,7 +108,7 @@ A Reach job completing does not mean a Weave action has completed. The calling s
 | Item | Reach | DaVinci |
 | --- | --- | --- |
 | Linux processes / jobs | Launch, isolation, state, stop / reconnect / logs | Instructions, interpretation of results |
-| Agent sessions | Harness process, protocol connection (Codex App Server / Claude Code stream-json / ACP), turns and events, ownership | Prompts, output contracts, judging turn results |
+| Agent sessions | Starting the agent in an Orca terminal, relaying prompts, reading its transcript through Orca, stopping it | Prompts, output contracts, judging turn results |
 | Workspace | Permitted areas and runtime mount / path restrictions | Work targets; meaning and management of clones, branches, and results |
 | Authorization | Final enforcement for node / workspace / capability / operation | Managing development requests, execution purposes, and assignees |
 | Development runs | Only the execution facts of jobs / agent sessions | Runs / attempts, issues, sub-issues, PRs, verification and acceptance |
@@ -132,7 +132,7 @@ The initial specification does not include an MCP tool that creates P2P connecti
 ## 8. Safety and user control
 
 - Evaluate permissions per node, workspace, capability, and operation.
-- Agents run inside their harness's sandbox. Commands and jobs run only from the workspace allowlist, without a shell and with a minimal environment.
+- Agents run in Orca terminals with their own sandbox. Commands and jobs run only from the workspace allowlist, without a shell and with a minimal environment.
 - Authentication and operation permissions are verified on Reach's execution side. AI input and external documents are never grounds for permission.
 - Allow requiring additional user approval for important operations.
 - Do not retry commands without limit when the connection drops.
@@ -148,7 +148,7 @@ In the MVP, an MCP client connecting from the cloud can perform file operations 
 
 ## 10. Non-goals and evaluation
 
-The initial release does not cover general-purpose AI agent orchestration, LLM hosting, Weave workflow processing, WebRTC P2P, desktop GUI, or automatic scheduling of offline jobs. Reach runs agent sessions over Codex App Server / Claude Code stream-json / ACP, but prompts, plans, and judging results stay with the caller.
+The initial release does not cover general-purpose AI agent orchestration, LLM hosting, Weave workflow processing, WebRTC P2P, desktop GUI, or automatic scheduling of offline jobs. Reach runs agent sessions (agents in Orca terminals), but prompts, plans, and judging results stay with the caller.
 
 Metrics: execution success rate, unknown-result rate, job reconciliation success rate after disconnects, prevention of duplicate execution, accuracy of permission denials, manual effort required from the user, and compatibility across different AI clients.
 

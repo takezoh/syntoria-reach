@@ -106,69 +106,6 @@ func StoreContract(t *testing.T, open func(t *testing.T) service.Store) {
 			t.Fatalf("finish of an unknown job: %v", err)
 		}
 	})
-
-	t.Run("agent sessions", func(t *testing.T) {
-		s := open(t)
-		if err := s.CreateAgentSession(&core.AgentSession{ID: "as_1", ClientID: "c", WorkspaceID: "ws", AgentID: "codex"}); err != nil {
-			t.Fatal(err)
-		}
-		a, err := s.GetAgentSession("c", "as_1")
-		if err != nil || a.State != core.SessionStarting || a.AgentID != "codex" || a.Turns != 0 {
-			t.Fatalf("get: %+v %v", a, err)
-		}
-		if busy, _ := s.WorkspaceBusy("ws"); !busy {
-			t.Fatal("active session does not make the workspace busy")
-		}
-		s.UpdateAgentSession("as_1", core.AgentSessionUpdate{State: core.SessionIdle, ProtocolSessionID: "thread"})
-		s.UpdateAgentSession("as_1", core.AgentSessionUpdate{State: core.SessionRunning, AddTurn: true})
-		s.UpdateAgentSession("as_1", core.AgentSessionUpdate{ErrorMessage: "note"})
-		a, _ = s.GetAgentSession("c", "as_1")
-		if a.State != core.SessionRunning || a.ProtocolSessionID != "thread" || a.Turns != 1 || a.ErrorMessage != "note" {
-			t.Fatalf("updated: %+v", a)
-		}
-		// An ended session is never changed.
-		s.UpdateAgentSession("as_1", core.AgentSessionUpdate{State: core.SessionFailed, ErrorMessage: "harness exited"})
-		if err := s.UpdateAgentSession("as_1", core.AgentSessionUpdate{State: core.SessionIdle, AddTurn: true}); err != nil {
-			t.Fatal(err)
-		}
-		a, _ = s.GetAgentSession("c", "as_1")
-		if a.State != core.SessionFailed || a.Turns != 1 || a.ErrorMessage != "harness exited" {
-			t.Fatalf("ended session changed: %+v", a)
-		}
-		if busy, _ := s.WorkspaceBusy("ws"); busy {
-			t.Fatal("ended session keeps the workspace busy")
-		}
-		if _, err := s.GetAgentSession("other", "as_1"); !errors.Is(err, core.ErrNotFound) {
-			t.Fatalf("other client: %v", err)
-		}
-		if err := s.UpdateAgentSession("missing", core.AgentSessionUpdate{State: core.SessionIdle}); err != nil {
-			t.Fatalf("update of an unknown session: %v", err)
-		}
-	})
-
-	t.Run("agent events", func(t *testing.T) {
-		s := open(t)
-		if events, err := s.ListAgentEvents("as_1", 0, 10); err != nil || events == nil || len(events) != 0 {
-			t.Fatalf("no events: %#v %v", events, err)
-		}
-		for i, text := range []string{"a", "b", "c"} {
-			if err := s.AppendAgentEvent("as_1", i/2+1, core.EventMessage, text); err != nil {
-				t.Fatal(err)
-			}
-		}
-		s.AppendAgentEvent("as_2", 1, core.EventError, "other session")
-		events, _ := s.ListAgentEvents("as_1", 1, 1)
-		if len(events) != 1 || events[0].Seq != 2 || events[0].Text != "b" || events[0].Turn != 1 || events[0].Type != core.EventMessage {
-			t.Fatalf("page: %+v", events)
-		}
-		events, _ = s.ListAgentEvents("as_1", 0, 10)
-		if len(events) != 3 || events[2].Seq != 3 || events[2].Turn != 2 {
-			t.Fatalf("all: %+v", events)
-		}
-		if events, _ = s.ListAgentEvents("as_2", 0, 10); len(events) != 1 || events[0].Seq != 1 {
-			t.Fatalf("sequences are per session: %+v", events)
-		}
-	})
 }
 
 // FilesContract checks that a service.Files keeps the contract the service

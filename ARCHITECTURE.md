@@ -9,7 +9,7 @@
 
 Reach is an independent execution service through which remote AIs and other local services use Linux capabilities via standard MCP or a local API. It places no always-on VM or container in the cloud; the Linux side owns the execution and state of operations, jobs, and agent sessions.
 
-**DaVinci is the first real client service.** DaVinci's development decisions, prompts, judgment of agent output, and GitHub workflow stay in DaVinci; Linux processes, jobs, and agent sessions over Codex App Server / Claude Code stream-json / ACP are consolidated in Reach. Reach works without DaVinci.
+**DaVinci is the first real client service.** DaVinci's development decisions, prompts, judgment of agent output, and GitHub workflow stay in DaVinci; Linux processes, jobs, and agent sessions (agents Reach starts in Orca terminals) are consolidated in Reach. Reach works without DaVinci.
 
 **Architectural invariants**
 
@@ -21,7 +21,7 @@ Reach is an independent execution service through which remote AIs and other loc
 6. A communication failure or timeout is never treated as proof that execution failed.
 7. In the MVP, requests made while a node is offline are not stored in a pending-execution queue.
 8. What is installed on the target Linux machine is a lightweight connector / runtime; an LLM is not required.
-9. Process liveness, jobs, and agent sessions (launching the harness and speaking its protocol: Codex App Server / Claude Code stream-json / ACP) are Reach's responsibility; sandboxing an agent's tools is the harness's responsibility. Reach does not take on the meaning of DaVinci runs or GitHub issues, and does not judge what an agent produces.
+9. Process liveness and jobs are Reach's responsibility. Agents run on Orca: Reach starts each in an Orca terminal of a workspace and relays prompts and replies through Orca; sandboxing an agent's tools is the agent's own responsibility. Reach does not take on the meaning of DaVinci runs or GitHub issues, and does not judge what an agent produces.
 10. When a client disconnects, the lifecycle of an already accepted command, job, or agent turn does not change implicitly.
 
 ## 2. Overall structure
@@ -39,9 +39,9 @@ flowchart TB
         REACH["Reach Daemon (Go): Connector + Operation Service"]
         LOCAL["Local API (Unix socket)"]
         CAP["Capability adapters: File / Command"]
-        PROC["Agent Session Manager: Codex / Claude / ACP"]
+        PROC["Agent sessions: agents in Orca terminals"]
         JOB["Job Manager + OS process supervisor"]
-        ST[("SQLite: Operations / Workspaces / Jobs / Sessions / Audit")]
+        ST[("SQLite: Operations / Jobs / Audit")]
         ORCA["Orca server: workspaces (projects reach-*)"]
         LOCAL <--> REACH
         REACH --> CAP
@@ -67,7 +67,7 @@ The standard deployment on Linux is a single Go daemon. The cloud has no residen
 | Durable Object / Node Broker | Accepting and mapping the WSS connection for a node, message delivery, short-lived response correlation | User files, persistent job results |
 | Reach Connector (Go) | Outbound WSS to the cloud, receiving authenticated requests, reconnection, transport separation | LLM inference |
 | Local API (Unix socket) | Provides local services such as DaVinci with the same execution operations as the core | Meaning of issues/PRs |
-| Agent Session Manager | Launching agent harnesses, Codex App Server / Claude Code stream-json / ACP sessions, one turn at a time, normalized events, interrupt and stop | Prompts, judging agent output, run semantics; sandboxing the agent's tools (the harness does that) |
+| Agent sessions | Starting an agent in an Orca terminal of a workspace, typing prompts into it, reading its transcript through Orca, closing it | Prompts, judging agent output, run semantics; running the agent and sandboxing its tools (Orca and the agent do that) |
 | Operation Service | Re-validating arguments and permissions, idempotency decisions, accepting synchronous and asynchronous work | Business state of other Syntoria services |
 | Capability Registry | Public contracts of File / Command / Job, required permissions, choice of OS adapter | External AI decisions |
 | Linux Runtime | File operations in workspaces, process start/stop/isolation | MCP protocol details |
@@ -91,7 +91,7 @@ A DaVinci Controller on the same Linux node calls Reach's local API over a Unix 
 
 Local connections also verify the caller's identity and permissions. Unix socket OS permissions are not used as a substitute for global operation permissions; a permission profile for DaVinci limits the workspaces, commands, and agents it may use.
 
-Reach speaks Codex App Server, Claude Code stream-json, and ACP to the harness. DaVinci builds prompts and interprets the agent's output; Reach records turns and events as facts and does not infer the success of an LLM turn or the validity of development results.
+Reach relays prompts to an agent in an Orca terminal and reads its transcript back through Orca. The caller builds prompts and interprets the agent's output; Reach does not infer the success of an LLM turn or the validity of development results.
 
 ## 4.1 Remote communication and authentication
 
@@ -152,11 +152,11 @@ The initial MCP tools are the following candidates. Formal names and JSON Schema
 | read_file | Read a file | workspace_id, relative_path, bounded data |
 | write_file | Conditional file write | operation_id, workspace_id, path, expected_version |
 | start_job | Start an asynchronous command | operation_id, workspace_id, executable, argv, limits |
-| start_agent_session | Start an agent harness and open a protocol session | operation_id, workspace_id, agent, resume_session_id |
-| send_agent_prompt | Start one turn without waiting for it | operation_id, session_id, text → turn |
-| read_agent_events | Read normalized events by sequence | session_id, after, limit |
-| get_agent_session | Query a session | session_id → state, turns, protocol_session_id |
-| stop_agent_session | Interrupt any turn and end the harness | operation_id, session_id |
+| start_agent_session | Start an agent in an Orca terminal of a workspace | operation_id, workspace_id, agent → session_id, terminal |
+| send_agent_prompt | Type a prompt into the agent's terminal; returns once the turn started | operation_id, session_id, text → stages |
+| read_agent_messages | Read the agent's transcript by cursor, as Orca reads it | session_id, cursor, limit → messages, cursor, activity |
+| get_agent_session | Query a session as Orca reports it | session_id → workspace, terminal, liveness |
+| stop_agent_session | Close the agent's terminal | operation_id, session_id |
 | get_operation | Reconcile an unknown acceptance result | operation_id, admission / final state |
 | get_job | Current state of a job | job_id, status, timestamps |
 | read_job_output | Paged output retrieval | job_id, stream, cursor, limit |
@@ -190,17 +190,17 @@ running → cancelling → cancelled / failed / unknown
 
 unknown is used when the result or the OS-side state cannot be confirmed. State transitions, reasons, and the last observation time are stored. Acceptance of a stop request is kept distinct from the fact that the process has stopped.
 
-Commands, jobs, and agent harnesses run as children of the daemon, each in its own process group, and are killed when the daemon dies; under the systemd user unit, the unit's cgroup also removes their descendants. **Work does not survive a daemon restart or a reboot.** Operations, jobs, and agent sessions left running by a previous daemon become unknown at the next start, and they are never re-executed automatically.
+Commands and jobs run as children of the daemon, each in its own process group, and are killed when the daemon dies; under the systemd user unit, the unit's cgroup also removes their descendants. **Commands and jobs do not survive a daemon restart or a reboot.** Operations and jobs left running by a previous daemon become unknown at the next start, and they are never re-executed automatically. Agents run in Orca terminals and survive a daemon restart.
 
-### Agent sessions (required for DaVinci's initial use)
+### Agent sessions
 
-- One agent session corresponds to one harness process owned by Reach and one protocol session (Codex thread / ACP session). Its ID is separate from DaVinci's run.
-- Supported protocols, ported from DaVinci's agent adapters: Codex App Server and ACP v1 (newline-delimited JSON-RPC over stdio), and Claude Code's stream-json interface. For Claude, Reach appends the stream-json flags and `--session-id` / `--resume`. Agents (command, environment) are configured per node and allowed per project.
-- A session runs one turn at a time. A prompt is an operation: resending it never starts a second turn, and a prompt while a turn is running is rejected.
-- Agent messages, errors, and turn completion are recorded as events with a monotonic sequence and read back by cursor, so a transport disconnect loses no output.
-- Disconnects of WSS / MCP / DaVinci are detach; only `stop_agent_session` interrupts the turn and ends the harness.
-- Sandboxing belongs to the harness. Codex runs with its sandbox mode (default `workspace-write`) and approvals disabled. Claude Code runs with the permission mode and sandbox settings of its configured command and settings. ACP agents get no file system or terminal capabilities from Reach, and their permission requests are denied unless the agent's configuration allows them.
-- After a daemon restart, sessions are unknown. A caller can start a new session that continues the conversation of one of its own ended sessions (`resume_session_id`, same workspace and agent); Reach never resumes on its own. Protocol session IDs are never accepted from callers, so no client can attach to another client's conversation.
+- An agent session is an agent running in an Orca terminal of a workspace. `start_agent_session` types the agent's configured command (shell-quoted) into a new terminal of the workspace's root entry (`orca terminal create --command`), and adopts the terminal as the Dispatch of a new Orca orchestration Run and Task (`orca orchestration dispatch`, without injecting anything), through which Orca reads the agent's transcript. The session ID is the Dispatch ID. Reach keeps nothing about sessions; they are read from Orca on every request and outlive the daemon.
+- A prompt is an operation: Reach types it into the terminal (`orca terminal send --enter`), and the prompt is delivered once Orca observed the agent start its turn (`turn_started`); otherwise it fails with `harness_unavailable`, as when the agent waits for an answer in its terminal. Resending an operation types nothing again. A prompt sent during a turn is queued by the agent.
+- Replies are read from the transcript (`orca orchestration worker-read --source transcript`): messages in Orca's form, a cursor to read on from, and the agent's activity (`done` while it waits for a prompt). The transcript is readable once the agent reported its session to Orca, in practice after the first prompt.
+- `stop_agent_session` stops the Dispatch and closes the terminal, which ends the agent. Orca forgets the session the agent reported when its terminal closes, so the transcript and the workspace of the Dispatch are no longer known, and the session is `not_found` from then on, however the terminal closed. Disconnects of WSS / MCP / DaVinci are detach.
+- Reach drives only sessions whose terminal (or, once closed, transcript) belongs to a Reach workspace, so a caller cannot reach other agents in Orca. Sessions are not owned by the client that started them.
+- The agent runs in the user's login shell in the terminal, with its own settings and sandbox. Claude Code must start without a question to answer: the workspaces folder is trusted in `~/.claude.json` (trust applies to the folders inside) and the auto mode setup prompt is dismissed.
+- Orca expects a Dispatch's agent to report `worker_done`; an agent in conversation does not, so Orca leaves a "stopped without reporting" message in the Run's mailbox after each turn. Reach does not read those mailboxes.
 
 ## 7. Linux execution
 
@@ -212,7 +212,7 @@ Initial target: Linux with systemd, single user, single node.
 - Files: take a workspace ID and a relative path, and enforce the boundary with safe path resolution such as openat2. Escapes via symlinks or mounts are also checked.
 - Writes: conditional updates, with temporary files / atomic rename as needed.
 - Commands and jobs: an executable from the configured allowlist plus argv; no implicit shell expansion; a minimal environment (the daemon's environment is not inherited); execution time and output size limits.
-- Agents: sandboxing of the agent's tools is delegated to the agent harness (see §6).
+- Agents: run in Orca terminals in the user's login shell; sandboxing of the agent's tools is the agent's own (see §6).
 
 **Note:** Reach does not isolate commands and jobs itself. Only allowlisted executables run, as the daemon's user, so allowlists should not include executables that can run arbitrary code unless that is intended.
 
@@ -244,9 +244,9 @@ Record the operation ID, authenticated principal, node, workspace, operation typ
 
 | Store | Contents | Authority |
 | --- | --- | --- |
-| Linux SQLite | operations, jobs, agent_sessions, agent_events, audit_records | **Source of truth for operations / jobs / agent sessions** |
-| Orca server | Projects (`reach-*` are workspaces), their folders' registration, comments (notes) and workspace statuses | **Source of truth for workspaces** |
-| Linux files | Job stdout / stderr, harness stderr logs | **Source of truth for the actual data** |
+| Linux SQLite | operations, jobs, audit_records | **Source of truth for operations / jobs** |
+| Orca server | Projects (`reach-*` are workspaces), their folders' registration, comments (notes) and workspace statuses; agents' terminals, Dispatches and transcripts | **Source of truth for workspaces and agent sessions** |
+| Linux files | Job stdout / stderr | **Source of truth for the actual data** |
 | Durable Object | WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
 | Workers | Transient processing and forwarding of authenticated requests | Holds no persistent job state |
 
@@ -275,7 +275,7 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 ## 11. MVP build order
 
 1. **Local Core**: Go daemon, SQLite, workspaces (Orca), File / Command API, operation IDs / audit.
-2. **Linux Execution**: asynchronous jobs, **agent sessions over Codex App Server / Claude Code stream-json / ACP** (sandboxing delegated to the harness), stop and ownership, reconciliation after restart.
+2. **Linux Execution**: asynchronous jobs, **agent sessions in Orca terminals** (sandboxing is the agent's), stop, reconciliation after restart.
 3. **DaVinci local integration**: move DaVinci's agent execution onto Reach agent sessions while keeping its prompts and development workflow. Verify a local E2E.
 4. **Remote MCP**: Workers MCP Gateway, OAuth, node registration, DO WebSocket broker, connector WSS.
 5. **Acceptance / rollout**: verification on real Linux / hosted Cloudflare / multiple MCP hosts, plus staged cutover and recovery tests for the existing DaVinci.
@@ -291,7 +291,7 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 - Jobs can be queried after DO hibernation / recreation or connector reconnection.
 - Work that was not accepted while the node was offline is not executed on its own after recovery.
 - Production OAuth, node credential revocation, and permission changes take effect.
-- DaVinci starts Codex / ACP agents through Reach, sends multiple turns to the same session, and re-reads the events in order.
+- DaVinci starts agents through Reach, sends multiple turns to the same session, and re-reads the transcript by cursor.
 - The meaning and state of DaVinci runs / agent turns / GitHub issues / draft PRs are not confused with Reach jobs.
 - DaVinci Controller restarts, duplicate prompts, session stop, and provider credential separation are verified with real processes.
 - The mapping between Reach job / agent session IDs and DaVinci run IDs is stored in DaVinci and can be reconciled after recovery.
@@ -303,13 +303,13 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 | Remote MCP | Compatibility of target MCP hosts and the chosen SDK with 2026-07-28 / 2025-11-25 |
 | Authentication | Connection registration, revocation, and permission mapping when using an OAuth issuer / Gate |
 | Node credential | Issuance, secret storage, expiry, revocation, re-registration |
-| Harness sandbox | What Codex sandbox modes, Claude Code permission and sandbox settings, and ACP agents' permission handling actually confine on the target Linux |
+| Agent sandbox | What Claude Code's permission and sandbox settings actually confine for an agent in an Orca terminal on the target Linux |
 | Broker | WebSocket restoration after DO hibernation, concurrent requests, correlation on disconnect |
 | MCP responses | Tool timeouts, job acceptance ACKs, reconciliation on unknown results |
-| Data | Retention and deletion of operations, events, job output, and logs |
+| Data | Retention and deletion of operations, job output, and logs; Orca's Runs and Dispatches left by agent sessions |
 | Orca | Stability of the Orca CLI's JSON results across versions; which base ref new workspaces should start from |
 | DaVinci integration | A migration plan that keeps the existing run / prompt / credential contracts on Reach agent sessions |
-| Agent events | Which harness events (tool calls, usage, plans) to record beyond messages, errors, and turn completion |
+| Agents on Orca | Agents other than Claude Code in Orca terminals; questions an agent asks in its terminal (Orca's `waitingOnHuman`) |
 
 These are decided in detailed design and verification on real environments. Design documents do not indicate running functionality or completed production acceptance.
 

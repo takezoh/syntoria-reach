@@ -221,38 +221,6 @@ func TestJobOutcome(t *testing.T) {
 	}
 }
 
-func TestResumable(t *testing.T) {
-	prev := func(state, proto string) *AgentSession {
-		return &AgentSession{ID: "as_1", WorkspaceID: "ws", AgentID: "codex", State: state, ProtocolSessionID: proto}
-	}
-	if id, err := Resumable(prev(SessionClosed, "thread"), "ws", "codex"); err != nil || id != "thread" {
-		t.Fatalf("closed session: %q %v", id, err)
-	}
-	for _, state := range []string{SessionFailed, StateUnknown} {
-		if id, err := Resumable(prev(state, "thread"), "ws", "codex"); err != nil || id != "thread" {
-			t.Errorf("%s session: %q %v", state, id, err)
-		}
-	}
-	cases := []struct {
-		name          string
-		prev          *AgentSession
-		workspace, ag string
-		code          string
-	}{
-		{"other workspace", prev(SessionClosed, "thread"), "ws2", "codex", CodeInvalidRequest},
-		{"other agent", prev(SessionClosed, "thread"), "ws", "claude", CodeInvalidRequest},
-		{"starting", prev(SessionStarting, ""), "ws", "codex", CodeInvalidState},
-		{"idle", prev(SessionIdle, "thread"), "ws", "codex", CodeInvalidState},
-		{"running", prev(SessionRunning, "thread"), "ws", "codex", CodeInvalidState},
-		{"never opened", prev(SessionFailed, ""), "ws", "codex", CodeInvalidState},
-	}
-	for _, c := range cases {
-		if _, err := Resumable(c.prev, c.workspace, c.ag); Classify(err) == nil || Classify(err).Code != c.code {
-			t.Errorf("%s: %v", c.name, err)
-		}
-	}
-}
-
 func TestClassify(t *testing.T) {
 	cases := map[error]string{
 		Errorf(CodeOperationConflict, "x"):                  CodeOperationConflict,
@@ -263,8 +231,6 @@ func TestClassify(t *testing.T) {
 		ErrOutside:         CodePermissionDenied,
 		ErrNotFound:        CodeNotFound,
 		ErrVersionConflict: CodeVersionConflict,
-		ErrSessionInactive: CodeInvalidState,
-		ErrSessionBusy:     CodeInvalidState,
 	}
 	for err, want := range cases {
 		if got := Classify(err); got == nil || got.Code != want {
@@ -300,5 +266,21 @@ func TestAuditOutcome(t *testing.T) {
 		if outcome, code := AuditOutcome(c.err, c.replayed, c.fails, c.failCode); outcome != c.outcome || code != c.code {
 			t.Errorf("AuditOutcome(%v, %v, %v) = %s, %s", c.err, c.replayed, c.fails, outcome, code)
 		}
+	}
+}
+
+func TestShellCommand(t *testing.T) {
+	for want, argv := range map[string][]string{
+		"/bin/claude --model claude-opus-5-5 --effort xhigh": {"/bin/claude", "--model", "claude-opus-5-5", "--effort", "xhigh"},
+		`/bin/x 'a b' '$HOME' 'it'\''s' ''`:                  {"/bin/x", "a b", "$HOME", "it's", ""},
+		"/bin/x --opt=v,w a@b%c":                             {"/bin/x", "--opt=v,w", "a@b%c"},
+		`/bin/x ';rm -rf ~' '$(id)' '*'`:                     {"/bin/x", ";rm -rf ~", "$(id)", "*"},
+	} {
+		if got := ShellCommand(argv); got != want {
+			t.Errorf("ShellCommand(%q) = %s, want %s", argv, got, want)
+		}
+	}
+	if WorkspaceOfEntry("repo-1::/w/reach-ws") != "repo-1" || WorkspaceOfEntry("repo-1") != "repo-1" {
+		t.Fatal("WorkspaceOfEntry")
 	}
 }

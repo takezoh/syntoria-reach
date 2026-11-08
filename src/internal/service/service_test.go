@@ -36,8 +36,8 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	cfg := &config.Config{
 		Agents: []config.Agent{
-			{ID: "codex", Protocol: core.ProtocolCodex, Command: []string{"/bin/codex", "app-server"}, Env: map[string]string{"K": "V"}, Sandbox: "workspace-write"},
-			{ID: "dsh", Protocol: core.ProtocolACP, Command: []string{"/bin/dsh"}},
+			{ID: "codex", Command: []string{"/bin/codex", "--model", "gpt x"}},
+			{ID: "dsh", Command: []string{"/bin/dsh"}},
 		},
 		Workspaces: "/w",
 		Commands:   []string{"/bin/sh"},

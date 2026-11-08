@@ -22,6 +22,7 @@ const valid = `{
   "socket": "/run/reach.sock",
   "database": "/var/reach.db",
   "orca": ["/usr/bin/orca-ide"],
+  "agents": [{"id": "claude", "command": ["/usr/bin/claude", "--model", "claude-opus-5-5", "--effort", "xhigh"]}],
   "commands": ["/usr/bin/make"],
   "clients": [{"id": "a", "token": "0123456789abcdef0123456789abcdef", "allow": ["workspace.create", "file.read", "command.run"]}]
 }`
@@ -31,7 +32,7 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Commands[0] != "/usr/bin/make" || c.Clients[0].Allow[2] != core.PermCommandRun || c.Workspaces != "/var/workspaces" {
+	if c.Commands[0] != "/usr/bin/make" || c.Clients[0].Allow[2] != core.PermCommandRun || c.Workspaces != "/var/workspaces" || c.Agents[0].Command[4] != "xhigh" {
 		t.Fatalf("got %+v", c)
 	}
 }
@@ -46,6 +47,9 @@ func TestLoadRejects(t *testing.T) {
 		"missing orca":        strings.Replace(valid, `"orca": ["/usr/bin/orca-ide"],`, ``, 1),
 		"short token":         strings.Replace(valid, `0123456789abcdef0123456789abcdef`, `short`, 1),
 		"relative workspaces": strings.Replace(valid, `"socket"`, `"workspaces": "ws", "socket"`, 1),
+		"relative agent":      strings.Replace(valid, `"/usr/bin/claude"`, `"claude"`, 1),
+		// An agent runs in an Orca terminal: harness settings are gone.
+		"agent protocol": strings.Replace(valid, `"id": "claude",`, `"id": "claude", "protocol": "claude",`, 1),
 		// Keys of the earlier format are errors, not silently ignored.
 		"projects": strings.Replace(valid, `"socket"`, `"projects": [], "socket"`, 1),
 		"grants":   strings.Replace(valid, `"allow"`, `"grants": [], "allow"`, 1),

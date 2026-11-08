@@ -1,8 +1,12 @@
-// Package orcatest provides a fake Orca CLI for tests. It keeps projects and
-// their root workspace entries in <root>/state.json and answers in Orca's
-// JSON format, with the behavior observed of the real CLI: an unknown project
-// is repo_not_found, a project with saved details (a comment) is removed only
-// with --force, and removing a project leaves its folder on disk.
+// Package orcatest provides a fake Orca CLI for tests. It keeps projects,
+// their root workspace entries, terminals and Dispatches in
+// <root>/state.json and answers in Orca's JSON format, with the behavior
+// observed of the real CLI: an unknown project is repo_not_found, a project
+// with saved details (a comment) is removed only with --force, removing a
+// project leaves its folder on disk, and an agent's transcript is readable
+// only from when it reported its session (here: its first prompt) until its
+// terminal closes. The
+// agent in every terminal answers a prompt with "echo: <prompt>".
 package orcatest
 
 import (
@@ -53,10 +57,21 @@ type worktree struct {
 	LastActivityAt  int64  `json:"lastActivityAt"`
 }
 
+// terminal is a terminal whose agent echoes every prompt.
+type terminal struct {
+	Handle   string            `json:"handle"`
+	Worktree string            `json:"worktreeId"`
+	Command  string            `json:"command"`
+	Open     bool              `json:"open"`
+	Messages []json.RawMessage `json:"messages"`
+}
+
 type state struct {
-	Next      int         `json:"next"`
-	Repos     []*repo     `json:"repos"`
-	Worktrees []*worktree `json:"worktrees"`
+	Next       int                  `json:"next"`
+	Repos      []*repo              `json:"repos"`
+	Worktrees  []*worktree          `json:"worktrees"`
+	Terminals  map[string]*terminal `json:"terminals"`
+	Dispatches map[string]string    `json:"dispatches"` // dispatch ID -> terminal handle
 }
 
 // MaybeRun acts as the fake Orca CLI and exits if the process was started by
@@ -150,6 +165,90 @@ func MaybeRun() {
 		st.Worktrees = slices.DeleteFunc(st.Worktrees, func(w *worktree) bool { return w.RepoID == r.ID })
 		save(root, st)
 		ok(map[string]any{"result": map[string]any{"repo": r}})
+	case "terminal create":
+		st.Next++
+		t := &terminal{Handle: fmt.Sprintf("term_%d", st.Next), Worktree: strings.TrimPrefix(flag(args, "--worktree"), "id:"), Command: flag(args, "--command"), Open: true}
+		st.Terminals[t.Handle] = t
+		save(root, st)
+		ok(map[string]any{"terminal": map[string]any{"handle": t.Handle, "title": flag(args, "--title")}})
+	case "terminal list":
+		list := []map[string]any{}
+		for _, t := range st.Terminals {
+			if t.Open {
+				list = append(list, map[string]any{"handle": t.Handle, "worktreeId": t.Worktree, "connected": true, "agentIdentity": "claude"})
+			}
+		}
+		ok(map[string]any{"terminals": list, "totalCount": len(list), "truncated": false})
+	case "terminal send":
+		t := st.Terminals[flag(args, "--terminal")]
+		if t == nil || !t.Open {
+			fail("terminal_not_found", flag(args, "--terminal"))
+		}
+		text := flag(args, "--text")
+		n := len(t.Messages)
+		for _, m := range []map[string]any{
+			{"id": fmt.Sprintf("m%d", n+1), "role": "user", "blocks": []map[string]string{{"type": "text", "text": text}}},
+			{"id": fmt.Sprintf("m%d", n+2), "role": "assistant", "blocks": []map[string]string{{"type": "text", "text": "echo: " + text}}},
+		} {
+			b, _ := json.Marshal(m)
+			t.Messages = append(t.Messages, b)
+		}
+		save(root, st)
+		ok(map[string]any{"send": map[string]any{"handle": t.Handle, "accepted": true, "prompt": map[string]any{"stages": []string{"input_accepted", "turn_started"}}}})
+	case "terminal close":
+		if t := st.Terminals[flag(args, "--terminal")]; t != nil {
+			t.Open = false
+		}
+		save(root, st)
+		ok(map[string]any{"closed": true})
+	case "orchestration run-create":
+		st.Next++
+		save(root, st)
+		ok(map[string]any{"runId": fmt.Sprintf("run_%d", st.Next), "objective": flag(args, "--objective")})
+	case "orchestration task-create":
+		st.Next++
+		save(root, st)
+		ok(map[string]any{"taskId": fmt.Sprintf("task_%d", st.Next), "status": "ready"})
+	case "orchestration dispatch":
+		h := flag(args, "--to")
+		if st.Terminals[h] == nil {
+			fail("terminal_not_found", h)
+		}
+		st.Next++
+		id := fmt.Sprintf("ctx_%d", st.Next)
+		st.Dispatches[id] = h
+		save(root, st)
+		ok(map[string]any{"dispatch": map[string]any{"id": id, "assignee_handle": h}, "injected": false})
+	case "orchestration worker-show":
+		id := flag(args, "--dispatch")
+		h, found := st.Dispatches[id]
+		if !found {
+			fail("dispatch_not_found", id)
+		}
+		ok(map[string]any{"dispatchId": id, "terminal": h, "liveness": "live", "waitingOnHuman": "no"})
+	case "orchestration worker-read":
+		id := flag(args, "--dispatch")
+		h, found := st.Dispatches[id]
+		if !found {
+			fail("dispatch_not_found", id)
+		}
+		t := st.Terminals[h]
+		if len(t.Messages) == 0 || !t.Open {
+			fail("transcript_required", "Structured output is unavailable: session_not_reported.")
+		}
+		from, _ := strconv.Atoi(flag(args, "--cursor"))
+		from = min(from, len(t.Messages))
+		to := len(t.Messages)
+		if limit, _ := strconv.Atoi(flag(args, "--limit")); limit > 0 {
+			to = min(to, from+limit)
+		}
+		ok(map[string]any{
+			"transcript": map[string]any{"messages": t.Messages[from:to], "nextCursor": strconv.Itoa(to)},
+			"status":     map[string]any{"terminal": "running", "liveness": "live"},
+			"projection": map[string]any{"workspace": map[string]any{"id": t.Worktree}, "stage": map[string]any{"activity": "done"}},
+		})
+	case "orchestration worker-stop":
+		ok(map[string]any{"stopped": true})
 	default:
 		fail("unknown_command", strings.Join(args, " "))
 	}
@@ -200,6 +299,9 @@ func load(root string) *state {
 		if err := json.Unmarshal(b, st); err != nil {
 			panic(err)
 		}
+	}
+	if st.Terminals == nil {
+		st.Terminals, st.Dispatches = map[string]*terminal{}, map[string]string{}
 	}
 	return st
 }

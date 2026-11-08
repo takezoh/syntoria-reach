@@ -39,30 +39,28 @@ Collect every missing prerequisite, then report them all at once. Stop if any of
   - Find the CLI's absolute path with `command -v orca-ide` or `command -v orca`.
   - `<orca> status --json` shows that the runtime is reachable.
   - `<orca> repo list --json` lists the registered projects.
-- **Agents.** Find the absolute path of each agent CLI the user may want: `codex` (protocol `codex`), `claude` (protocol `claude`), and any ACP agent (protocol `acp`).
+- **Agents.** Find the absolute path of each agent CLI the user may want, for example `claude`. Reach starts an agent by typing its command into an Orca terminal, so the CLI must be the interactive one Orca recognizes.
 - **Existing install.** Check whether `~/.local/bin/reach`, `~/.config/reach/config.json` and `~/.config/systemd/user/reach.service` exist, and whether `systemctl --user is-active reach.service` reports active. If any of them exists, this is an update: keep the config, and skip what is already right.
 
 ## 2. Agree on the configuration
 
 Propose a configuration from what you found, then let the user decide:
 
-- **Agents.** Which agents may be started; every agent may be started in every workspace.
+- **Agents.** Which agents may be started, each as an `id` and the `command` to type into a terminal, for example `["<claude>", "--model", "claude-opus-5-5", "--effort", "xhigh"]`. Every agent may be started in every workspace.
 - **Commands.** Which executables `run_command` and `start_job` may run, as absolute paths.
 - **Clients.** The callers: one client per caller, for example `davinci`, or `local` for manual use. Each client has an `id`, a token, and in `allow` its permissions from `workspace.create`, `file.read`, `file.write`, `command.run` and `agent.run`, which apply to every workspace.
-- **Socket, database and workspaces.** Leave `socket`, `database` and `workspaces` unset unless the user asks; they then default to `$XDG_RUNTIME_DIR/reach/reach.sock`, `$XDG_STATE_HOME/reach/reach.db` (`~/.local/state/reach/reach.db` when `XDG_STATE_HOME` is unset in the systemd user manager) and `workspaces` next to the database. Reach creates each workspace's folder in `workspaces` and registers it in Orca; job output and harness logs go next to the database; the paths below assume the default.
+- **Socket, database and workspaces.** Leave `socket`, `database` and `workspaces` unset unless the user asks; they then default to `$XDG_RUNTIME_DIR/reach/reach.sock`, `$XDG_STATE_HOME/reach/reach.db` (`~/.local/state/reach/reach.db` when `XDG_STATE_HOME` is unset in the systemd user manager) and `workspaces` next to the database. Reach creates each workspace's folder in `workspaces` and registers it in Orca; job output goes next to the database; the paths below assume the default.
 
 The configuration names no repositories or Orca projects: a workspace is an Orca project Reach creates, named `reach-*`.
 
-**Child environment.** Commands, jobs and agents do not inherit the daemon's environment. They get exactly `PATH=/usr/local/bin:/usr/bin:/bin`, `LANG=C.UTF-8` and `HOME`, plus the agent's `env`. (Only the Orca CLI gets the daemon's environment.)
+**Child environment.** Commands and jobs do not inherit the daemon's environment. They get exactly `PATH=/usr/local/bin:/usr/bin:/bin`, `LANG=C.UTF-8` and `HOME`. Commands cannot get an extra `PATH`: list the real executables, and tell the user that the scripts they start see only the fixed `PATH`. (The Orca CLI gets the daemon's environment.)
 
-- **Agent CLIs.** Check that each agent CLI starts with that environment:
+**Agents in Orca.** An agent runs in an Orca terminal of the workspace, in the user's login shell, so it gets the user's own environment. Claude Code must start there without a question to answer:
 
-  ```sh
-  env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 HOME="$HOME" <agent> --version
-  ```
+- In `~/.claude.json`, `projects."<workspaces folder>".hasTrustDialogAccepted` is `true`. Claude Code applies a parent folder's trust to the folders inside it, so this covers every workspace.
+- In `~/.claude.json`, `autoModeEnvSetup.dismissed` is `true`, so the auto mode setup prompt does not appear after the first turn.
 
-  Use another harmless flag if the agent has no `--version`. If it does not start (for example, a Node script whose `node` is elsewhere), set `PATH` in that agent's `env` to explicit directories. Do the same when the agent's own tools must find toolchains that are not in `/usr/local/bin:/usr/bin:/bin`. A `PATH` in `env` replaces the fixed one.
-- **Commands.** Commands cannot get an extra `PATH`. List the real executables, and tell the user that the scripts they start see only the fixed `PATH`.
+The `agent-claude` module of Agent Environments sets both. If the host does not use it, tell the user and ask before you change `~/.claude.json`; do it while no Claude Code runs, since it rewrites that file.
 
 Show the user the complete config, with tokens redacted, and wait for their approval.
 
@@ -125,9 +123,9 @@ The answer is the client's `permissions`, with the `commands` and `agents` it ma
 **Smoke test (optional).** Only with the user's consent, and with a client that has `workspace.create` and `agent.run`. Use unique `operation_id`s, and a name such as `reach-smoke-<yyyymmdd>` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`).
 
 1. `create_workspace` with `{"operation_id", "name", "note"}`, the note saying it is the smoke test. The operation's `state` is `succeeded`, and its `result.workspace` is the workspace ID; Orca now lists the project `reach-<name>`. A failure names Orca's error in `error_message`.
-2. `start_agent_session` with `{"operation_id", "workspace", "agent"}`. The `result.session_id` is the session. If the harness does not start, the operation fails with `harness_failed`. Its stderr is the newest file in `~/.local/state/reach/agents/`.
-3. `send_agent_prompt` with `{"operation_id", "session_id", "text": "Reply with OK and nothing else."}`.
-4. Call `read_agent_events` with `{"session_id", "after": 0}` every few seconds until an event of type `turn_completed` arrives; its `text` is the turn status. Show the user the `message` events.
+2. `start_agent_session` with `{"operation_id", "workspace", "agent"}`. The `result.session_id` is the session, and Orca shows the agent in a terminal of the workspace.
+3. `send_agent_prompt` with `{"operation_id", "session_id", "text": "Reply with OK and nothing else."}`. If it fails with `harness_unavailable`, the agent did not start a turn: look at its terminal in Orca, for example for a trust prompt.
+4. Call `read_agent_messages` with `{"session_id", "cursor"}` every few seconds, passing the cursor of the last read, until the assistant's reply arrived and `activity` is `done`. Show the user the messages.
 5. `stop_agent_session`, then `update_workspace` with `{"operation_id", "workspace", "status": "completed"}`. The daemon removes the workspace, Orca project and folder, after 7 days without activity.
 
 ## 7. Remote MCP (optional)
@@ -187,7 +185,7 @@ Ask the user whether remote MCP clients (claude.ai, ChatGPT, Claude Code elsewhe
 Tell the user:
 
 - The commit installed, and whether the tree was clean.
-- The paths: binary, config, unit, socket, and state directory (database, job output, harness logs).
+- The paths: binary, config, unit, socket, and state directory (database, job output, workspace folders).
 - The service state.
 - Which checks and tests passed, which failed, and which you could not run, and why.
 - For each client: its ID, and that its token is in the config at `.clients[] | select(.id == "<id>") | .token`. Do not include the token.

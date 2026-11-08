@@ -47,13 +47,13 @@ func Call(ctx context.Context, svc *service.Service, c *service.Client, method s
 	case "start_agent_session":
 		return call(body, func(req service.StartAgentSessionRequest) (any, error) { return svc.StartAgentSession(ctx, c, req) })
 	case "send_agent_prompt":
-		return call(body, func(req service.SendAgentPromptRequest) (any, error) { return svc.SendAgentPrompt(c, req) })
+		return call(body, func(req service.SendAgentPromptRequest) (any, error) { return svc.SendAgentPrompt(ctx, c, req) })
 	case "get_agent_session":
-		return call(body, func(req service.AgentSessionRequest) (any, error) { return svc.GetAgentSession(c, req) })
-	case "read_agent_events":
-		return call(body, func(req service.ReadAgentEventsRequest) (any, error) { return svc.ReadAgentEvents(c, req) })
+		return call(body, func(req service.AgentSessionRequest) (any, error) { return svc.GetAgentSession(ctx, c, req) })
+	case "read_agent_messages":
+		return call(body, func(req service.ReadAgentMessagesRequest) (any, error) { return svc.ReadAgentMessages(ctx, c, req) })
 	case "stop_agent_session":
-		return call(body, func(req service.StopAgentSessionRequest) (any, error) { return svc.StopAgentSession(c, req) })
+		return call(body, func(req service.StopAgentSessionRequest) (any, error) { return svc.StopAgentSession(ctx, c, req) })
 	}
 	return nil, &core.Error{Code: core.CodeNotFound, Message: "unknown method " + method}
 }
