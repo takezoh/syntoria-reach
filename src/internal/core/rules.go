@@ -122,6 +122,17 @@ func CheckPrompt(text string) error {
 	return nil
 }
 
+// CheckCursor reports whether a caller's cursor can be passed to Orca to
+// read terminal output: empty for the start, or a cursor Orca returned,
+// which counts lines and is a decimal number. Anything else, such as text
+// starting with "-", is never handed to Orca's command line.
+func CheckCursor(cursor string) error {
+	if len(cursor) > 18 || strings.ContainsFunc(cursor, func(r rune) bool { return r < '0' || r > '9' }) {
+		return Errorf(CodeInvalidRequest, "cursor must be empty or one that read_agent_output returned")
+	}
+	return nil
+}
+
 // ValidWorkspaceStatus reports whether status can name an Orca workspace
 // status; Orca decides whether it exists.
 func ValidWorkspaceStatus(status string) bool { return workspaceStatusPattern.MatchString(status) }

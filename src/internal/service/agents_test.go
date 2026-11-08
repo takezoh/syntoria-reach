@@ -144,6 +144,10 @@ func TestAgentConversation(t *testing.T) {
 	if _, err := f.svc.ReadAgentOutput(ctx, f.a, service.ReadAgentOutputRequest{SessionID: s.ID, Limit: 1001}); code(err) != core.CodeInvalidRequest {
 		t.Fatalf("limit over the maximum: %v", err)
 	}
+	// A cursor is one Orca returned, never text for Orca's command line.
+	if _, err := f.svc.ReadAgentOutput(ctx, f.a, service.ReadAgentOutputRequest{SessionID: s.ID, Cursor: "--terminal=term-9"}); code(err) != core.CodeInvalidRequest {
+		t.Fatalf("cursor that looks like a flag: %v", err)
+	}
 	if _, err := f.svc.SendAgentPrompt(ctx, f.a, service.SendAgentPromptRequest{OperationID: "p2", SessionID: s.ID, Text: " "}); code(err) != core.CodeInvalidRequest {
 		t.Fatalf("empty prompt: %v", err)
 	}

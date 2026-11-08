@@ -179,6 +179,9 @@ func (s *Service) ReadAgentOutput(ctx context.Context, c *Client, req ReadAgentO
 	case req.Limit < 0 || req.Limit > maxAgentOutputLines:
 		return nil, core.Errorf(core.CodeInvalidRequest, "limit must be between 0 and %d", maxAgentOutputLines)
 	}
+	if err := core.CheckCursor(req.Cursor); err != nil {
+		return nil, err
+	}
 	t, release, err := s.useSession(ctx, req.SessionID)
 	if err != nil {
 		return nil, err

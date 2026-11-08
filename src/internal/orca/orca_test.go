@@ -158,15 +158,19 @@ func TestAgentTerminal(t *testing.T) {
 	if _, err := cli.ReadTerminal(ctx, h, "0", 0); !errors.Is(err, core.ErrNotFound) {
 		t.Fatalf("read a closed terminal: %v", err)
 	}
+	// A handle that looks like a flag stays the handle.
+	if _, err := cli.ShowTerminal(ctx, "--environment=elsewhere"); !errors.Is(err, core.ErrNotFound) {
+		t.Fatalf("show a handle that looks like a flag: %v", err)
+	}
 	calls := orcatest.Calls(t, root)
 	for _, want := range []string{
 		"terminal create --worktree id:" + entry + " --title reach claude --command /bin/claude --model 'opus x' --json",
-		"terminal show --terminal " + h + " --json",
-		"terminal wait --terminal " + h + " --for tui-idle --timeout-ms 3000 --json",
-		"terminal read --terminal " + h + " --cursor 0 --json",
-		"terminal read --terminal " + h + " --cursor 0 --limit 1 --json",
-		"terminal send --terminal " + h + " --text=--hello --enter --wait-submit 30 --json",
-		"terminal close --terminal " + h + " --json",
+		"terminal show --terminal=" + h + " --json",
+		"terminal wait --terminal=" + h + " --for tui-idle --timeout-ms 3000 --json",
+		"terminal read --terminal=" + h + " --cursor=0 --json",
+		"terminal read --terminal=" + h + " --cursor=0 --limit 1 --json",
+		"terminal send --terminal=" + h + " --text=--hello --enter --wait-submit 30 --json",
+		"terminal close --terminal=" + h + " --json",
 	} {
 		if !strings.Contains(calls, want) {
 			t.Errorf("missing call %q in:\n%s", want, calls)

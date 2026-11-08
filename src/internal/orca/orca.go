@@ -153,7 +153,7 @@ func (c *CLI) SendPrompt(ctx context.Context, handle, text string) ([]string, er
 			} `json:"prompt"`
 		} `json:"send"`
 	}
-	if err := c.run(ctx, &res, "terminal", "send", "--terminal", handle, "--text="+text, "--enter", "--wait-submit", fmt.Sprint(promptSubmitWait)); err != nil {
+	if err := c.run(ctx, &res, "terminal", "send", "--terminal="+handle, "--text="+text, "--enter", "--wait-submit", fmt.Sprint(promptSubmitWait)); err != nil {
 		return nil, err
 	}
 	if !res.Send.Accepted {
@@ -165,7 +165,7 @@ func (c *CLI) SendPrompt(ctx context.Context, handle, text string) ([]string, er
 // CloseTerminal closes a terminal and ends what runs in it.
 func (c *CLI) CloseTerminal(ctx context.Context, handle string) error {
 	var res struct{}
-	return c.run(ctx, &res, "terminal", "close", "--terminal", handle)
+	return c.run(ctx, &res, "terminal", "close", "--terminal="+handle)
 }
 
 // ShowTerminal shows one terminal; core.ErrNotFound once Orca no longer has
@@ -178,7 +178,7 @@ func (c *CLI) ShowTerminal(ctx context.Context, handle string) (*core.TerminalSt
 			AgentWait json.RawMessage `json:"agentWait"`
 		} `json:"terminal"`
 	}
-	if err := c.run(ctx, &res, "terminal", "show", "--terminal", handle); err != nil {
+	if err := c.run(ctx, &res, "terminal", "show", "--terminal="+handle); err != nil {
 		return nil, terminalGone(err)
 	}
 	t := &core.TerminalStatus{Terminal: res.Terminal.Terminal}
@@ -210,7 +210,7 @@ func (c *CLI) WaitIdle(ctx context.Context, handle string, timeout time.Duration
 			BlockedReason string `json:"blockedReason"`
 		} `json:"wait"`
 	}
-	err := c.run(ctx, &res, "terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", fmt.Sprint(timeout.Milliseconds()))
+	err := c.run(ctx, &res, "terminal", "wait", "--terminal="+handle, "--for", "tui-idle", "--timeout-ms", fmt.Sprint(timeout.Milliseconds()))
 	var oe *core.OrcaError
 	if errors.As(err, &oe) && oe.Code == "timeout" {
 		return false, "", nil
@@ -228,7 +228,7 @@ func (c *CLI) ReadTerminal(ctx context.Context, handle, cursor string, limit int
 	if cursor == "" {
 		cursor = "0"
 	}
-	args := []string{"terminal", "read", "--terminal", handle, "--cursor", cursor}
+	args := []string{"terminal", "read", "--terminal=" + handle, "--cursor=" + cursor}
 	if limit > 0 {
 		args = append(args, "--limit", fmt.Sprint(limit))
 	}
@@ -276,6 +276,9 @@ func notFound(err error) error {
 	return err
 }
 
+// run runs the Orca CLI with args and decodes its result into out. A value
+// a client chose, such as a terminal handle or a cursor, is passed as
+// --flag=value, so that Orca never reads it as a flag of its own.
 func (c *CLI) run(ctx context.Context, out any, args ...string) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
