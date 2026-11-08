@@ -83,7 +83,7 @@ func TestRemoteE2E(t *testing.T) {
 	for _, tool := range c.rpc("tools/list", map[string]any{})["tools"].([]any) {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	for _, want := range []string{"list_projects", "create_workspace", "start_agent_session", "send_agent_prompt", "read_agent_events", "stop_agent_session", "get_operation"} {
+	for _, want := range []string{"list_capabilities", "list_workspaces", "create_workspace", "update_workspace", "start_agent_session", "send_agent_prompt", "read_agent_events", "stop_agent_session", "get_operation"} {
 		if !slices.Contains(names, want) {
 			t.Fatalf("tools %v lack %s", names, want)
 		}
@@ -94,17 +94,24 @@ func TestRemoteE2E(t *testing.T) {
 	}
 
 	// The daemon connects on its own; wait until requests reach it.
-	projects := c.waitTool("list_projects", map[string]any{}, func(r any, e *toolError) bool { return e == nil })
-	if p := projects.([]any); len(p) != 1 || p[0].(map[string]any)["project"] != "proj" {
-		t.Fatalf("list_projects: %v", projects)
+	caps := c.waitTool("list_capabilities", map[string]any{}, func(r any, e *toolError) bool { return e == nil }).(map[string]any)
+	if agents, _ := caps["agents"].([]any); len(agents) != 1 || agents[0] != "codex" {
+		t.Fatalf("list_capabilities: %v", caps)
 	}
 
 	// A workspace and an agent session, used through MCP.
-	op := c.mustTool("create_workspace", map[string]any{"operation_id": "r-cw", "project": "proj", "name": "ws"}).(map[string]any)
-	if op["state"] != "succeeded" {
+	op := c.mustTool("create_workspace", map[string]any{"operation_id": "r-cw", "name": "ws", "note": "remote e2e"}).(map[string]any)
+	if op["state"] != "succeeded" || result(op)["note"] != "remote e2e" {
 		t.Fatalf("create_workspace: %v", op)
 	}
 	wsID := result(op)["workspace"]
+	// Ongoing work is found again by its note and status.
+	if op := c.mustTool("update_workspace", map[string]any{"operation_id": "r-uw", "workspace": wsID, "status": "in-review"}).(map[string]any); result(op)["status"] != "in-review" {
+		t.Fatalf("update_workspace: %v", op)
+	}
+	if list := c.mustTool("list_workspaces", map[string]any{}).([]any); len(list) != 1 || list[0].(map[string]any)["note"] != "remote e2e" {
+		t.Fatalf("list_workspaces: %v", list)
+	}
 	op = c.mustTool("start_agent_session", map[string]any{"operation_id": "r-s", "workspace": wsID, "agent": "codex"}).(map[string]any)
 	sessionID := result(op)["session_id"]
 	prompt := map[string]any{"operation_id": "r-p", "session_id": sessionID, "text": "hi"}
@@ -134,11 +141,11 @@ func TestRemoteE2E(t *testing.T) {
 	// The node goes offline: nothing runs, and the gateway says so. When
 	// it comes back it reconnects by itself.
 	d.kill()
-	c.waitTool("list_projects", map[string]any{}, func(r any, e *toolError) bool { return e != nil && e.Code == "node_offline" })
+	c.waitTool("list_capabilities", map[string]any{}, func(r any, e *toolError) bool { return e != nil && e.Code == "node_offline" })
 	d.start()
-	c.waitTool("list_projects", map[string]any{}, func(r any, e *toolError) bool { return e == nil })
-	if op := c.mustTool("delete_workspace", map[string]any{"operation_id": "r-dw", "workspace": wsID}).(map[string]any); op["state"] != "succeeded" {
-		t.Fatalf("delete_workspace: %v", op)
+	c.waitTool("list_capabilities", map[string]any{}, func(r any, e *toolError) bool { return e == nil })
+	if op := c.mustTool("update_workspace", map[string]any{"operation_id": "r-done", "workspace": wsID, "status": "completed"}).(map[string]any); op["state"] != "succeeded" {
+		t.Fatalf("complete the workspace: %v", op)
 	}
 
 	// Tokens Gate does not vouch for, or vouches for another resource, are

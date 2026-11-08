@@ -9,54 +9,65 @@ import { nodeBroker, type Reply, unknownOutcome } from "./broker";
 // arguments, to the Linux node, which authorizes and runs it. The gateway
 // decides nothing about the request beyond who may call it.
 
-const INSTRUCTIONS = `Reach runs work on the user's Linux machine.
+const INSTRUCTIONS = `Reach runs work on the user's Linux machine, in workspaces kept by the Orca server there.
 
-To have an agent do a task: list_projects, then create_workspace from a project (a Git worktree with its own branch), start_agent_session in it with one of the project's agents, send_agent_prompt with the task, and call read_agent_events (passing the last seq you saw as "after") until an event of type "turn_completed" arrives. Send the next prompt to the same session for a follow-up. stop_agent_session when done; delete_workspace removes the worktree once its changes are committed or no longer wanted.
+One workspace is one unit of work: a folder of its own, with a note saying what the work is and a status (todo, in-progress, in-review, completed). Before starting, call list_workspaces.
+- Work already in progress: continue in its workspace.
+- New work: create_workspace with a note that says what the work is, so that you or another AI can find it again. The workspace starts empty; put in it what the work needs (for example, clone a repository).
+Keep the note current with update_workspace as the work moves on. When the work is done, set the status to in-review, or to completed when nothing is left; a completed workspace is removed after a week without activity.
+
+To have an agent do a task in a workspace: start_agent_session with one of your agents (list_capabilities), send_agent_prompt with the task, and call read_agent_events (passing the last seq you saw as "after") until an event of type "turn_completed" arrives. Send the next prompt to the same session for a follow-up, and stop_agent_session when done.
 
 Tools that change something take an operation_id that you choose, unique per action (for example "create-ws-docs-1"). If a call fails with result_unknown, the request may have run: call get_operation with the same operation_id, or resend the same call with the same operation_id. Never retry with a new operation_id. node_offline means the machine is not connected and nothing ran.`;
 
 const operationId = z.string().min(1).max(128).describe("An ID you choose, unique per action. Resending the same call with the same ID never runs it twice.");
 const workspace = z.string().describe("Workspace ID from create_workspace or list_workspaces.");
+const note = z.string().min(1).max(2000).describe("What the work is, for whoever continues it: the goal, and what is done or next.");
 const sessionId = z.string().describe("Session ID from start_agent_session.");
 
 type Shape = Record<string, z.ZodType>;
 
 const tools: { name: string; description: string; input: Shape; readOnly: boolean }[] = [
   {
-    name: "list_projects",
-    description: "Projects you may create workspaces from, with your permissions, commands and agents.",
+    name: "list_capabilities",
+    description: "Your permissions, and the commands and agents you may run in a workspace.",
     input: {},
     readOnly: true,
   },
   {
     name: "list_workspaces",
-    description: "Your workspaces, with their paths and branches.",
+    description: "Every workspace, with its note, status and path. Look here before creating a workspace: continue ongoing work in its workspace.",
     input: {},
     readOnly: true,
   },
   {
     name: "create_workspace",
-    description: "Creates a workspace: a Git worktree and branch named `name`, from the project's default base (e.g. origin/main). Returns an operation whose result.workspace is the workspace ID.",
+    description: "Creates a workspace for one new unit of work: an empty folder of its own, kept by Orca as the project reach-<name>, with a note saying what the work is. Returns an operation whose result.workspace is the workspace ID.",
     input: {
       operation_id: operationId,
-      project: z.string().describe("Project ID from list_projects."),
-      name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).describe("Worktree and branch name."),
+      name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,57}$/).describe("Short name for the work; Reach prepends reach-."),
+      note,
     },
     readOnly: false,
   },
   {
-    name: "delete_workspace",
-    description: "Removes one of your workspaces (worktree and, if merged, branch). Refused while it has uncommitted changes, running jobs or active agent sessions.",
-    input: { operation_id: operationId, workspace },
+    name: "update_workspace",
+    description: "Changes a workspace's note, its status (todo, in-progress, in-review, completed), or both. A completed workspace is removed after a week without activity. Returns an operation whose result is the workspace.",
+    input: {
+      operation_id: operationId,
+      workspace,
+      note: note.optional(),
+      status: z.string().optional().describe("todo, in-progress, in-review or completed."),
+    },
     readOnly: false,
   },
   {
     name: "start_agent_session",
-    description: "Starts an agent harness in a workspace and opens a session. Returns an operation whose result.session_id is the session. Pass resume_session_id (one of your ended sessions in the same workspace and agent) to continue its conversation.",
+    description: "Starts an agent harness in a workspace and opens a session; a completed workspace is set back in progress. Returns an operation whose result.session_id is the session. Pass resume_session_id (one of your ended sessions in the same workspace and agent) to continue its conversation.",
     input: {
       operation_id: operationId,
       workspace,
-      agent: z.string().describe("Agent ID from the project's agents in list_projects."),
+      agent: z.string().describe("Agent ID from list_capabilities."),
       resume_session_id: z.string().optional(),
       model: z.string().optional().describe("Model for codex and claude agents."),
       effort: z.string().optional().describe("Reasoning effort for codex and claude agents."),

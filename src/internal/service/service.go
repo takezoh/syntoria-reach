@@ -30,14 +30,15 @@ const (
 	outputLimit     = 1 << 20
 )
 
-// Client is an authenticated caller.
+// Client is an authenticated caller. Its permissions apply to every
+// workspace.
 type Client struct {
 	ID    string
 	token string
-	perms map[string][]string // project ID -> permissions
+	perms []string
 }
 
-// ws is a resolved, ready workspace the caller may use.
+// ws is a workspace Orca reported, which the caller may use.
 type ws struct {
 	id       string
 	root     string
@@ -54,14 +55,26 @@ type Service struct {
 	jobs       Jobs
 	agents     Agents
 	orca       Orca
+	folders    Folders
 	newID      NewID
 
-	projects map[string]config.Project
-	harness  map[string]config.Agent
-	clients  []*Client
+	workspaces string   // folder of the workspace folders Reach creates
+	commands   []string // executables run_command and start_job may run
+	agentIDs   []string // agents start_agent_session may start
+	harness    map[string]config.Agent
+	clients    []*Client
 
 	filesMu sync.Mutex
-	files   map[string]Files // open roots of ready workspaces
+	files   map[string]openRoot // open roots of workspaces, by workspace ID
+
+	deletingMu sync.Mutex
+	deleting   map[string]bool // workspaces being deleted
+}
+
+// openRoot is the open root of a workspace at the path Orca last reported.
+type openRoot struct {
+	path  string
+	files Files
 }
 
 // New returns the service for cfg using the adapters in d.
@@ -73,23 +86,20 @@ func New(cfg *config.Config, d Deps) *Service {
 		jobs:       d.Jobs,
 		agents:     d.Agents,
 		orca:       d.Orca,
+		folders:    d.Folders,
 		newID:      d.NewID,
-		projects:   map[string]config.Project{},
+		workspaces: cfg.Workspaces,
+		commands:   cfg.Commands,
 		harness:    map[string]config.Agent{},
-		files:      map[string]Files{},
+		files:      map[string]openRoot{},
+		deleting:   map[string]bool{},
 	}
 	for _, a := range cfg.Agents {
 		s.harness[a.ID] = a
-	}
-	for _, p := range cfg.Projects {
-		s.projects[p.ID] = p
+		s.agentIDs = append(s.agentIDs, a.ID)
 	}
 	for _, c := range cfg.Clients {
-		cl := &Client{ID: c.ID, token: c.Token, perms: map[string][]string{}}
-		for _, g := range c.Grants {
-			cl.perms[g.Project] = append(cl.perms[g.Project], g.Allow...)
-		}
-		s.clients = append(s.clients, cl)
+		s.clients = append(s.clients, &Client{ID: c.ID, token: c.Token, perms: c.Allow})
 	}
 	return s
 }
@@ -98,8 +108,8 @@ func New(cfg *config.Config, d Deps) *Service {
 func (s *Service) Close() {
 	s.filesMu.Lock()
 	defer s.filesMu.Unlock()
-	for id, f := range s.files {
-		f.Close()
+	for id, r := range s.files {
+		r.files.Close()
 		delete(s.files, id)
 	}
 }
@@ -120,7 +130,7 @@ func (s *Service) Authenticate(token string) (*Client, error) {
 
 // ClientByID returns the configured client with that ID. The remote
 // connector acts as one configured client: the gateway has authenticated
-// the remote caller, and the client's grants bound what it may do.
+// the remote caller, and the client's permissions bound what it may do.
 func (s *Service) ClientByID(id string) (*Client, bool) {
 	for _, c := range s.clients {
 		if c.ID == id {
@@ -130,48 +140,51 @@ func (s *Service) ClientByID(id string) (*Client, bool) {
 	return nil, false
 }
 
-// authorize resolves one of the client's ready workspaces on which the
-// client holds perm (through the workspace's project).
-func (s *Service) authorize(c *Client, workspaceID, perm string) (*ws, error) {
-	// Unknown, foreign and forbidden workspaces are indistinguishable.
-	denied := core.Errorf(core.CodePermissionDenied, "%s is not allowed on workspace %q", perm, workspaceID)
-	rec, err := s.store.GetWorkspace(c.ID, workspaceID)
-	if errors.Is(err, core.ErrNotFound) {
-		return nil, denied
+// authorize resolves a workspace on which the client holds perm, reading it
+// from Orca.
+func (s *Service) authorize(ctx context.Context, c *Client, workspaceID, perm string) (*ws, error) {
+	if !slices.Contains(c.perms, perm) {
+		return nil, core.Errorf(core.CodePermissionDenied, "%s is not allowed", perm)
 	}
+	if s.isDeleting(workspaceID) {
+		return nil, core.Errorf(core.CodeInvalidState, "workspace is being removed")
+	}
+	r, err := s.repo(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	f, err := s.workspaceFiles(workspaceID, r.Path)
 	if err != nil {
 		return nil, internal(err)
 	}
-	p, known := s.projects[rec.ProjectID]
-	if !core.WorkspaceAccess(rec, known, c.perms[rec.ProjectID], perm) {
-		return nil, denied
-	}
-	f, err := s.workspaceFiles(rec)
-	if err != nil {
-		return nil, internal(err)
-	}
-	return &ws{id: rec.ID, root: rec.Path, commands: p.Commands, agents: p.Agents, files: f}, nil
+	return &ws{id: workspaceID, root: r.Path, commands: s.commands, agents: s.agentIDs, files: f}, nil
 }
 
-func (s *Service) workspaceFiles(rec *core.Workspace) (Files, error) {
+// workspaceFiles returns the open root of a workspace at path, reopening it
+// when Orca reports another path than the one opened.
+func (s *Service) workspaceFiles(id, path string) (Files, error) {
 	s.filesMu.Lock()
 	defer s.filesMu.Unlock()
-	if f, ok := s.files[rec.ID]; ok {
-		return f, nil
+	if r, ok := s.files[id]; ok {
+		if r.path == path {
+			return r.files, nil
+		}
+		r.files.Close()
+		delete(s.files, id)
 	}
-	f, err := s.openFiles(rec.Path)
+	f, err := s.openFiles(path)
 	if err != nil {
-		return nil, fmt.Errorf("open workspace %s: %w", rec.ID, err)
+		return nil, fmt.Errorf("open workspace %s: %w", id, err)
 	}
-	s.files[rec.ID] = f
+	s.files[id] = openRoot{path: path, files: f}
 	return f, nil
 }
 
 func (s *Service) closeFiles(id string) {
 	s.filesMu.Lock()
 	defer s.filesMu.Unlock()
-	if f, ok := s.files[id]; ok {
-		f.Close()
+	if r, ok := s.files[id]; ok {
+		r.files.Close()
 		delete(s.files, id)
 	}
 }
@@ -189,10 +202,10 @@ type ListFilesResult struct {
 }
 
 // ListFiles lists a directory in a workspace.
-func (s *Service) ListFiles(c *Client, req ListFilesRequest) (res *ListFilesResult, err error) {
+func (s *Service) ListFiles(ctx context.Context, c *Client, req ListFilesRequest) (res *ListFilesResult, err error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "list_files", WorkspaceID: req.Workspace, Target: req.Path}
 	defer func() { s.audit(rec, err) }()
-	w, err := s.authorize(c, req.Workspace, core.PermFileRead)
+	w, err := s.authorize(ctx, c, req.Workspace, core.PermFileRead)
 	if err != nil {
 		return nil, err
 	}
@@ -215,10 +228,10 @@ type ReadFileRequest struct {
 }
 
 // ReadFile reads a bounded part of a file.
-func (s *Service) ReadFile(c *Client, req ReadFileRequest) (res *core.FileChunk, err error) {
+func (s *Service) ReadFile(ctx context.Context, c *Client, req ReadFileRequest) (res *core.FileChunk, err error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "read_file", WorkspaceID: req.Workspace, Target: req.Path}
 	defer func() { s.audit(rec, err) }()
-	w, err := s.authorize(c, req.Workspace, core.PermFileRead)
+	w, err := s.authorize(ctx, c, req.Workspace, core.PermFileRead)
 	if err != nil {
 		return nil, err
 	}
@@ -251,9 +264,9 @@ type WriteFileResult struct {
 }
 
 // WriteFile writes a file once per operation ID.
-func (s *Service) WriteFile(c *Client, req WriteFileRequest) (*core.Operation, error) {
+func (s *Service) WriteFile(ctx context.Context, c *Client, req WriteFileRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "write_file", WorkspaceID: req.Workspace, Target: req.Path, OperationID: req.OperationID}
-	w, err := s.authorize(c, req.Workspace, core.PermFileWrite)
+	w, err := s.authorize(ctx, c, req.Workspace, core.PermFileWrite)
 	if err == nil && len(req.Content) > maxWriteSize {
 		err = core.Errorf(core.CodeInvalidRequest, "content exceeds %d bytes", maxWriteSize)
 	}
@@ -284,7 +297,7 @@ type RunCommandRequest struct {
 // The command keeps running if the caller disconnects.
 func (s *Service) RunCommand(ctx context.Context, c *Client, req RunCommandRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "run_command", WorkspaceID: req.Workspace, Target: req.Executable, OperationID: req.OperationID}
-	w, timeout, err := s.authorizeExecutable(c, req.Workspace, req.Executable, req.TimeoutSeconds, defaultTimeout, maxTimeout)
+	w, timeout, err := s.authorizeExecutable(ctx, c, req.Workspace, req.Executable, req.TimeoutSeconds, defaultTimeout, maxTimeout)
 	if err != nil {
 		s.audit(rec, err)
 		return nil, err
@@ -307,8 +320,8 @@ func (s *Service) RunCommand(ctx context.Context, c *Client, req RunCommandReque
 
 // authorizeExecutable resolves a workspace on which the client may run
 // executable and the requested timeout.
-func (s *Service) authorizeExecutable(c *Client, workspaceID, executable string, seconds int, def, max time.Duration) (*ws, time.Duration, error) {
-	w, err := s.authorize(c, workspaceID, core.PermCommandRun)
+func (s *Service) authorizeExecutable(ctx context.Context, c *Client, workspaceID, executable string, seconds int, def, max time.Duration) (*ws, time.Duration, error) {
+	w, err := s.authorize(ctx, c, workspaceID, core.PermCommandRun)
 	if err != nil {
 		return nil, 0, err
 	}

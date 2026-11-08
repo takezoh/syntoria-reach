@@ -57,9 +57,9 @@ So far, **Stages 1 (Local Core) and 2 (Linux Execution) of ARCHITECTURE.md §11 
 
 ## Running Reach (Stages 1–2)
 
-A single Go daemon, `reach`. It serves the local API as HTTP/JSON over a Unix socket and stores operations, workspaces, jobs, agent sessions, and audit records in SQLite. Job output and harness logs are kept next to the database.
+A single Go daemon, `reach`. It serves the local API as HTTP/JSON over a Unix socket and stores operations, jobs, agent sessions, and audit records in SQLite. Job output and harness logs are kept next to the database.
 
-Workspaces live on the [Orca](https://www.onorca.dev/) server of the same host. A caller creates a workspace from a project (a repository registered in Orca); Reach creates it as an Orca worktree through the Orca CLI, and only that caller can use and delete it. Callers never talk to Orca or to the agent protocols themselves: they use Reach's methods, and Reach drives Orca and the agents.
+Workspaces live on the [Orca](https://www.onorca.dev/) server of the same host. A workspace is one unit of work: a folder of its own under `workspaces`, registered in Orca as a folder project named `reach-<name>`, with a note saying what the work is (the comment of the project's root entry) and Orca's workspace status (todo, in-progress, in-review, completed). It starts empty; the work brings in what it needs. Orca is its only record: Reach keeps nothing about workspaces, reads them from Orca on every request, and sees only Orca projects whose name starts with `reach-`. Its ID is the Orca project's repo ID, and a client's permissions apply to every workspace. A workspace that is `completed` and has had no activity (in Orca, or through Reach) for 7 days is removed, Orca project and folder, by the daemon, which checks every hour; callers do not delete workspaces. Callers never talk to Orca or to the agent protocols themselves: they use Reach's methods, and Reach drives Orca and the agents.
 
 The implementation lives in `src/` (Go module `github.com/takezoh/syntoria-reach/src`). To install it as a systemd user service, give [INSTALL.md](INSTALL.md) to a coding agent on the host; it is a prompt that checks the prerequisites, agrees on the configuration with you, and installs and verifies the service. The manual steps are:
 
@@ -78,24 +78,22 @@ reach -config ~/.config/reach/config.json      # systemd user unit: deploy/syste
      "env": {"DISABLE_AUTOUPDATER": "1"}},
     {"id": "dsh", "protocol": "acp", "command": ["/path/to/acp-agent"], "allow_permissions": false}
   ],
-  "projects": [{"id": "app", "repo": "/home/me/src/app",
-                "commands": ["/usr/bin/make", "/usr/bin/go"], "agents": ["codex", "claude", "dsh"]}],
+  "commands": ["/usr/bin/make", "/usr/bin/go", "/usr/bin/git"],
   "clients": [{"id": "davinci", "token": "<random string of at least 32 characters>",
-               "grants": [{"project": "app",
-                           "allow": ["workspace.create", "file.read", "file.write", "command.run", "agent.run"]}]}]
+               "allow": ["workspace.create", "file.read", "file.write", "command.run", "agent.run"]}]
 }
 ~~~
 
-`socket` defaults to `$XDG_RUNTIME_DIR/reach/reach.sock` and `database` defaults to `$XDG_STATE_HOME/reach/reach.db`. `repo` must already be registered in Orca (`orca-ide repo add`). Grants apply to the workspaces the client creates from the project; `workspace.create` allows creating and deleting them.
+`socket` defaults to `$XDG_RUNTIME_DIR/reach/reach.sock`, `database` to `$XDG_STATE_HOME/reach/reach.db`, and `workspaces`, the folder holding the workspace folders, to `workspaces` next to the database. A client's `allow` applies to every workspace; `workspace.create` allows creating and updating them. `commands` are the executables `run_command` and `start_job` may run, and every agent may be started in every workspace. The configuration names no repositories or projects: workspaces are Orca's.
 
 Requests are JSON sent to `POST /v1/<method>` with `Authorization: Bearer <token>`. The caller must run as the same UID as the daemon (checked with SO_PEERCRED).
 
 | method | Description |
 | --- | --- |
-| `list_projects` | Projects you may create workspaces from, with your permissions and their commands and agents |
-| `create_workspace` | `operation_id`, `project`, `name`. Creates an Orca worktree (and branch) named `name` from the project; returns the `workspace` ID and path |
-| `list_workspaces` | Your workspaces |
-| `delete_workspace` | `operation_id`, `workspace`. Removes the worktree from Orca and Git and deletes its branch if Orca can prove it is merged. Refused while jobs or agent sessions run, or (by Orca) with uncommitted changes |
+| `list_capabilities` | Your permissions, and the commands and agents you may run (with the permission to run them) |
+| `create_workspace` | `operation_id`, `name`, `note`. Creates the folder `reach-<name>` and registers it in Orca as a folder project with the note; returns the workspace (`workspace` ID, `name`, `note`, `status`, `path`) |
+| `list_workspaces` | Every workspace, by name |
+| `update_workspace` | `operation_id`, `workspace`, `note` and/or `status`. Changes the Orca comment and workspace status; `completed` makes the workspace due for removal after 7 days without activity |
 | `list_files` | Directory listing for `workspace`, `path` |
 | `read_file` | `workspace`, `path`, `offset`, `limit`. Returns `data` (base64) and `version` |
 | `write_file` | `operation_id`, `workspace`, `path`, `content` (base64), `expected_version` (empty means create only). Replaces the file by atomic rename |
@@ -105,7 +103,7 @@ Requests are JSON sent to `POST /v1/<method>` with `Authorization: Bearer <token
 | `get_job` | `job_id`. State (`running`, `succeeded`, `failed`, `cancelled`, `unknown`), exit code |
 | `read_job_output` | `job_id`, `stream` (`stdout`/`stderr`), `offset`, `limit`. `eof` is true once the job ended and the end was read |
 | `cancel_job` | `operation_id`, `job_id`. Kills the job's process group |
-| `start_agent_session` | `operation_id`, `workspace`, `agent`, optional `resume_session_id` (one of your ended sessions in the same workspace and agent; its conversation continues), `model`, `effort` (Codex, Claude). Starts the harness and opens a session |
+| `start_agent_session` | `operation_id`, `workspace`, `agent`, optional `resume_session_id` (one of your ended sessions in the same workspace and agent; its conversation continues), `model`, `effort` (Codex, Claude). Starts the harness and opens a session; a `completed` workspace is set back to `in-progress` |
 | `send_agent_prompt` | `operation_id`, `session_id`, `text`. Starts one turn and returns its number without waiting |
 | `read_agent_events` | `session_id`, `after` (sequence), `limit`. Events are `message`, `error`, `turn_completed` |
 | `get_agent_session` | `session_id`. State (`idle`, `running`, `closed`, `failed`, `unknown`), turns, protocol session ID |
@@ -114,7 +112,6 @@ Requests are JSON sent to `POST /v1/<method>` with `Authorization: Bearer <token
 - Requests with side effects are recorded as operations. Resending the same `operation_id` with the same arguments returns the existing result; different arguments return `operation_conflict`.
 - Commands, jobs, and agent harnesses are children of the daemon and die with it. Operations, jobs, and sessions that were running when the daemon stopped become `unknown` at the next start. They are never re-executed or resumed automatically.
 - Sandboxing: agents rely on their harness. Codex runs with its `sandbox` mode (default `workspace-write`) and approvals disabled; Claude Code runs with the permission mode and sandbox settings of its configured command and settings (Reach appends only the stream-json and session flags); ACP agents get no file system or terminal capabilities from Reach, and permission requests are denied unless `allow_permissions` is set. Reach does not sandbox commands and jobs: they run as the daemon's user, restricted to the allowlist and a minimal environment.
-- Orca creates new workspaces from the repository's default base (e.g. `origin/main`); unpushed local commits are not included.
 
 ## Remote MCP (Stage 4, in part)
 
@@ -124,9 +121,9 @@ The gateway in `cloud/` is a Cloudflare Worker: a remote MCP endpoint (MCP Strea
 "remote": {"url": "wss://reach-api.<parent>/connect", "token": "<node token>", "client": "remote"}
 ~~~
 
-- **Tools**: `list_projects`, `list_workspaces`, `create_workspace`, `delete_workspace`, `start_agent_session`, `send_agent_prompt`, `read_agent_events`, `get_agent_session`, `stop_agent_session`, `get_operation`. Their arguments and results are those of the local API methods; Reach errors come back as tool errors (`{"error": {"code", "message"}}`).
+- **Tools**: `list_capabilities`, `list_workspaces`, `create_workspace`, `update_workspace`, `start_agent_session`, `send_agent_prompt`, `read_agent_events`, `get_agent_session`, `stop_agent_session`, `get_operation`. Their arguments and results are those of the local API methods; Reach errors come back as tool errors (`{"error": {"code", "message"}}`).
 - **Who may connect**: Gate signs the person in with GitHub, registers each MCP host (dynamic client registration) and has the person approve its connection; `/connections` on Gate revokes one. The gateway's MCP URL is a resource registered in Gate, so the gateway lives under Gate's cookie parent (`reach-api.<parent>`). It checks every request's token with Gate (introspection, nothing cached) and admits only the configured person, `OWNER_SUBJECT`.
-- **What they may do**: every remote request acts as the configured `client`, and the daemon authorizes it with that client's grants, as for the local API. Give that client only what remote AIs should do.
+- **What they may do**: every remote request acts as the configured `client`, and the daemon authorizes it with that client's permissions, as for the local API. Give that client only what remote AIs should do.
 - **Node**: one node per gateway. The daemon authenticates with the node token (a Worker secret), pings every 30 s and reconnects with backoff. A new connection replaces the old one.
 - **Failures**: `node_offline` when the daemon is not connected (nothing ran). `result_unknown` when the connection dropped or the node did not answer within 30 s: the request may have run, so check it with `get_operation` or resend it with the same `operation_id`. Long work is a session or job the caller polls; a disconnect never stops it.
 - The gateway stores nothing but the Durable Object's connection. Workspaces, sessions and events stay on Linux.

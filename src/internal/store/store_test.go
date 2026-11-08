@@ -56,3 +56,17 @@ func TestAdmitAndRestart(t *testing.T) {
 		t.Fatalf("state = %s", op.State)
 	}
 }
+
+// Workspaces are Orca's: the migrations leave no workspace table, also in a
+// database that had one.
+func TestNoWorkspaceTable(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "reach.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'workspaces'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("workspaces tables: %d %v", n, err)
+	}
+}

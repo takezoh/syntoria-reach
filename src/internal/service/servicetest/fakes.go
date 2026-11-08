@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
@@ -20,6 +21,7 @@ type Fakes struct {
 	Jobs     *Jobs
 	Agents   *Agents
 	Orca     *Orca
+	Folders  *Folders
 }
 
 // New returns fresh fakes.
@@ -30,7 +32,8 @@ func New() *Fakes {
 		Commands: &Commands{},
 		Jobs:     &Jobs{},
 		Agents:   &Agents{},
-		Orca:     &Orca{Root: "/orca"},
+		Orca:     &Orca{},
+		Folders:  &Folders{},
 	}
 }
 
@@ -45,6 +48,7 @@ func (f *Fakes) Deps() service.Deps {
 		Jobs:       f.Jobs,
 		Agents:     f.Agents,
 		Orca:       f.Orca,
+		Folders:    f.Folders,
 		NewID: func(prefix string) string {
 			mu.Lock()
 			defer mu.Unlock()
@@ -418,51 +422,153 @@ func (a *Agents) Stop(id string) error {
 	return nil
 }
 
-// Orca keeps worktrees in memory under Root. A worktree in FailCreate
-// cannot be created and one in FailRemove cannot be removed.
+// Orca keeps projects and their root entries in memory, as Orca reports
+// them. Adding a folder named in FailAdd fails; with FailList set, listing
+// fails as when Orca is down.
 type Orca struct {
-	Root       string
-	FailCreate map[string]bool // by name
-	FailRemove map[string]bool // by name
+	FailAdd  map[string]bool // by folder name
+	FailList bool
+	// Now is the clock for last activity; it defaults to time.Now.
+	Now func() time.Time
 
-	mu        sync.Mutex
-	worktrees map[string]*core.Worktree // by ID
-	calls     []string
+	mu    sync.Mutex
+	repos []core.Repo
+	roots map[string]*core.Worktree // repo ID -> root entry
+	next  int
+	calls []string
 }
 
-func (o *Orca) CreateWorktree(_ context.Context, repoPath, name string) (*core.Worktree, error) {
+func (o *Orca) AddFolder(_ context.Context, p string) (string, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.calls = append(o.calls, "create "+repoPath+" "+name)
-	if o.FailCreate[name] {
-		return nil, &core.OrcaError{Code: "git_failed", Message: "cannot create worktree"}
+	o.calls = append(o.calls, "add "+p)
+	if o.FailAdd[path.Base(p)] {
+		return "", &core.OrcaError{Code: "add_failed", Message: "cannot add " + p}
 	}
-	id := repoPath + "::" + name
-	if _, ok := o.worktrees[id]; ok {
-		return nil, &core.OrcaError{Code: "worktree_exists", Message: name}
-	}
-	if o.worktrees == nil {
-		o.worktrees = map[string]*core.Worktree{}
-	}
-	wt := &core.Worktree{ID: id, Path: path.Join(o.Root, name), Branch: "refs/heads/" + name}
-	o.worktrees[id] = wt
-	c := *wt
-	return &c, nil
+	o.next++
+	id := fmt.Sprintf("repo-%d", o.next)
+	o.add(core.Repo{ID: id, DisplayName: path.Base(p), Path: p, Kind: "folder"})
+	return id, nil
 }
 
-func (o *Orca) RemoveWorktree(_ context.Context, id string) error {
+// AddRepo registers a project as if someone added it in Orca, outside Reach.
+func (o *Orca) AddRepo(r core.Repo) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.calls = append(o.calls, "remove "+id)
-	wt, ok := o.worktrees[id]
+	o.add(r)
+}
+
+func (o *Orca) add(r core.Repo) {
+	if o.roots == nil {
+		o.roots = map[string]*core.Worktree{}
+	}
+	now := time.Now
+	if o.Now != nil {
+		now = o.Now
+	}
+	o.repos = append(o.repos, r)
+	o.roots[r.ID] = &core.Worktree{ID: r.ID + "::" + r.Path, RepoID: r.ID, Path: r.Path, WorkspaceStatus: "in-progress",
+		IsMainWorktree: true, LastActivityAt: now().UnixMilli()}
+}
+
+func (o *Orca) Repos(context.Context) ([]core.Repo, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, "repos")
+	if o.FailList {
+		return nil, &core.OrcaError{Code: "runtime_unavailable", Message: "Orca is not running"}
+	}
+	return slices.Clone(o.repos), nil
+}
+
+func (o *Orca) Repo(_ context.Context, id string) (*core.Repo, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, "repo "+id)
+	if o.FailList {
+		return nil, &core.OrcaError{Code: "runtime_unavailable", Message: "Orca is not running"}
+	}
+	for _, r := range o.repos {
+		if r.ID == id {
+			return &r, nil
+		}
+	}
+	return nil, core.ErrNotFound
+}
+
+func (o *Orca) Worktrees(_ context.Context, repoID string) ([]core.Worktree, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, "worktrees "+repoID)
+	if o.FailList {
+		return nil, &core.OrcaError{Code: "runtime_unavailable", Message: "Orca is not running"}
+	}
+	var out []core.Worktree
+	for _, r := range o.repos {
+		if repoID == "" || r.ID == repoID {
+			out = append(out, *o.roots[r.ID])
+		}
+	}
+	if repoID != "" && out == nil {
+		return nil, core.ErrNotFound
+	}
+	return out, nil
+}
+
+func (o *Orca) SetWorktree(_ context.Context, id, comment, status string) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, "set "+id+" "+comment+" "+status)
+	var root *core.Worktree
+	for _, w := range o.roots {
+		if w.ID == id {
+			root = w
+		}
+	}
 	switch {
-	case !ok:
-		return &core.OrcaError{Code: "worktree_not_found", Message: id}
-	case o.FailRemove[path.Base(wt.Path)]:
-		return &core.OrcaError{Code: "worktree_dirty", Message: "worktree has uncommitted changes"}
+	case root == nil:
+		return &core.OrcaError{Code: "selector_not_found", Message: id}
+	case status != "" && !slices.Contains([]string{"todo", "in-progress", "in-review", "completed"}, status):
+		return &core.OrcaError{Code: "invalid_workspace_status", Message: status}
 	}
-	delete(o.worktrees, id)
+	if comment != "" {
+		root.Comment = comment
+	}
+	if status != "" {
+		root.WorkspaceStatus = status
+	}
 	return nil
+}
+
+func (o *Orca) DeleteProject(_ context.Context, repoID string) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, "delete "+repoID)
+	i := slices.IndexFunc(o.repos, func(r core.Repo) bool { return r.ID == repoID })
+	if i < 0 {
+		return &core.OrcaError{Code: "repo_not_found", Message: repoID}
+	}
+	o.repos = slices.Delete(o.repos, i, i+1)
+	delete(o.roots, repoID)
+	return nil
+}
+
+// Root returns a copy of a project's root entry, or nil.
+func (o *Orca) Root(repoID string) *core.Worktree {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if w, ok := o.roots[repoID]; ok {
+		c := *w
+		return &c
+	}
+	return nil
+}
+
+// Touch sets a project's last activity in Orca.
+func (o *Orca) Touch(repoID string, at time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.roots[repoID].LastActivityAt = at.UnixMilli()
 }
 
 // Calls returns the Orca calls so far.
@@ -472,14 +578,35 @@ func (o *Orca) Calls() []string {
 	return slices.Clone(o.calls)
 }
 
-// Worktrees returns the IDs of the existing worktrees.
-func (o *Orca) Worktrees() []string {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	var ids []string
-	for id := range o.worktrees {
-		ids = append(ids, id)
+// Folders keeps the set of existing folders in memory.
+type Folders struct {
+	mu   sync.Mutex
+	dirs map[string]bool
+}
+
+func (f *Folders) Make(p string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dirs[p] {
+		return fmt.Errorf("mkdir %s: file exists", p)
 	}
-	slices.Sort(ids)
-	return ids
+	if f.dirs == nil {
+		f.dirs = map[string]bool{}
+	}
+	f.dirs[p] = true
+	return nil
+}
+
+func (f *Folders) Remove(p string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.dirs, p)
+	return nil
+}
+
+// Exists reports whether the folder p exists.
+func (f *Folders) Exists(p string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dirs[p]
 }

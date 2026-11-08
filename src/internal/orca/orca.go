@@ -1,5 +1,5 @@
-// Package orca creates and removes workspaces (Git worktrees) on the Orca
-// server of this host through the Orca CLI's JSON output.
+// Package orca registers, lists, annotates and removes the Orca projects that
+// are Reach workspaces, through the Orca CLI's JSON output on this host.
 package orca
 
 import (
@@ -24,34 +24,95 @@ type CLI struct {
 	Command []string
 }
 
-// CreateWorktree creates a new worktree of the registered repo at repoPath.
-// Repo setup hooks and agent launches are skipped; Reach starts agents itself.
-func (c *CLI) CreateWorktree(ctx context.Context, repoPath, name string) (*core.Worktree, error) {
+// listLimit is the most worktrees Reach reads at once; a longer list is an
+// error rather than a silently partial answer.
+const listLimit = 1000
+
+// AddFolder registers the existing folder at path as an Orca folder project
+// and returns its repo ID.
+func (c *CLI) AddFolder(ctx context.Context, path string) (string, error) {
 	var res struct {
-		Worktree core.Worktree `json:"worktree"`
+		Repo core.Repo `json:"repo"`
 	}
-	if err := c.run(ctx, &res, "worktree", "create", "--repo", "path:"+repoPath, "--name", name, "--no-parent", "--setup", "skip"); err != nil {
-		return nil, err
+	if err := c.run(ctx, &res, "repo", "add", "--path", path, "--kind", "folder"); err != nil {
+		return "", err
 	}
-	if res.Worktree.ID == "" || res.Worktree.Path == "" {
-		return nil, errors.New("orca: worktree create returned no worktree")
+	if res.Repo.ID == "" {
+		return "", errors.New("orca: repo add returned no repo")
 	}
-	return &res.Worktree, nil
+	return res.Repo.ID, nil
 }
 
-// RemoveWorktree removes a worktree from Orca and Git and deletes its branch
-// when Orca can prove it is merged. Uncommitted changes make it fail.
-func (c *CLI) RemoveWorktree(ctx context.Context, id string) error {
+// Repos lists the projects registered in Orca.
+func (c *CLI) Repos(ctx context.Context) ([]core.Repo, error) {
 	var res struct {
-		Removed bool `json:"removed"`
+		Repos []core.Repo `json:"repos"`
 	}
-	if err := c.run(ctx, &res, "worktree", "rm", "--worktree", "id:"+id, "--delete-branch"); err != nil {
-		return err
+	if err := c.run(ctx, &res, "repo", "list"); err != nil {
+		return nil, err
 	}
-	if !res.Removed {
-		return errors.New("orca: worktree rm did not confirm removal")
+	return res.Repos, nil
+}
+
+// Repo returns one project; core.ErrNotFound if Orca has none with that ID.
+func (c *CLI) Repo(ctx context.Context, id string) (*core.Repo, error) {
+	var res struct {
+		Repo core.Repo `json:"repo"`
 	}
-	return nil
+	if err := c.run(ctx, &res, "repo", "show", "--repo", "id:"+id); err != nil {
+		return nil, notFound(err)
+	}
+	return &res.Repo, nil
+}
+
+// Worktrees lists the workspace entries of one project, or of every project
+// when repoID is empty; core.ErrNotFound if Orca has no such project.
+func (c *CLI) Worktrees(ctx context.Context, repoID string) ([]core.Worktree, error) {
+	var res struct {
+		Worktrees []core.Worktree `json:"worktrees"`
+		Truncated bool            `json:"truncated"`
+	}
+	args := []string{"worktree", "list"}
+	if repoID != "" {
+		args = append(args, "--repo", "id:"+repoID)
+	}
+	if err := c.run(ctx, &res, append(args, "--limit", fmt.Sprint(listLimit))...); err != nil {
+		return nil, notFound(err)
+	}
+	if res.Truncated {
+		return nil, fmt.Errorf("orca: more than %d worktrees", listLimit)
+	}
+	return res.Worktrees, nil
+}
+
+// SetWorktree changes a workspace entry's comment and workspace status; an
+// empty value leaves that one unchanged.
+func (c *CLI) SetWorktree(ctx context.Context, id, comment, status string) error {
+	args := []string{"worktree", "set", "--worktree", "id:" + id}
+	if comment != "" {
+		args = append(args, "--comment="+comment)
+	}
+	if status != "" {
+		args = append(args, "--workspace-status", status)
+	}
+	var res struct{}
+	return c.run(ctx, &res, args...)
+}
+
+// DeleteProject removes a project from Orca, with its saved workspace
+// details, and detaches its open terminals. Its folder stays on disk.
+func (c *CLI) DeleteProject(ctx context.Context, repoID string) error {
+	var res struct{}
+	return c.run(ctx, &res, "project", "setup-delete", "--setup", repoID, "--force")
+}
+
+// notFound turns Orca's answer for an unknown project into core.ErrNotFound.
+func notFound(err error) error {
+	var oe *core.OrcaError
+	if errors.As(err, &oe) && oe.Code == "repo_not_found" {
+		return core.ErrNotFound
+	}
+	return err
 }
 
 func (c *CLI) run(ctx context.Context, out any, args ...string) error {

@@ -53,7 +53,7 @@ func newDaemon(t *testing.T, extra ...string) (*daemon, string) {
 	if err := os.Mkdir(orcaRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ws := filepath.Join(orcaRoot, "ws") // created by the fake Orca
+	ws := filepath.Join(orcaRoot, "reach-ws") // created by the fake Orca
 	sock := filepath.Join(dir, "reach.sock")
 	agentCmd, agentEnv := agenttest.Agent(t, "codex", "TestFakeHarness")
 	agentEnv["REACH_FAKE_PID_FILE"] = filepath.Join(ws, "agent.pid")
@@ -61,13 +61,12 @@ func newDaemon(t *testing.T, extra ...string) (*daemon, string) {
 	orca, _ := json.Marshal(orcatest.Command(t, "TestFakeHarness", orcaRoot))
 	cfg := fmt.Sprintf(`{
 		%s
-		"socket": %q, "database": %q,
+		"socket": %q, "database": %q, "workspaces": %q,
 		"orca": %s,
 		"agents": [%s],
-		"projects": [{"id": "proj", "repo": "/repo", "commands": ["/bin/sh"], "agents": ["codex"]}],
-		"clients": [{"id": "e2e", "token": %q,
-			"grants": [{"project": "proj", "allow": ["workspace.create", "file.read", "file.write", "command.run", "agent.run"]}]}]
-	}`, strings.Join(extra, "\n"), sock, filepath.Join(dir, "reach.db"), orca, agent, e2eToken)
+		"commands": ["/bin/sh"],
+		"clients": [{"id": "e2e", "token": %q, "allow": ["workspace.create", "file.read", "file.write", "command.run", "agent.run"]}]
+	}`, strings.Join(extra, "\n"), sock, filepath.Join(dir, "reach.db"), orcaRoot, orca, agent, e2eToken)
 	config := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(config, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -222,11 +221,17 @@ func TestE2E(t *testing.T) {
 	d, ws := newDaemon(t)
 	d.start()
 
-	// Workspaces are created on the Orca server through Reach.
-	created := d.mustCall("create_workspace", map[string]any{"operation_id": "cw", "project": "proj", "name": "ws"})
+	// Workspaces are created on the Orca server through Reach, with a note
+	// that Orca keeps as the worktree's comment.
+	created := d.mustCall("create_workspace", map[string]any{"operation_id": "cw", "name": "ws", "note": "e2e: exercise the local API"})
 	wsID := result(created)["workspace"]
-	if created["state"] != "succeeded" || result(created)["path"] != ws {
+	if created["state"] != "succeeded" || wsID == "" || result(created)["name"] != "reach-ws" || result(created)["path"] != ws ||
+		result(created)["note"] != "e2e: exercise the local API" || result(created)["status"] != "in-progress" {
 		t.Fatalf("create_workspace: %v", created)
+	}
+	updated := d.mustCall("update_workspace", map[string]any{"operation_id": "uw", "workspace": wsID, "status": "in-review"})
+	if updated["state"] != "succeeded" || result(updated)["status"] != "in-review" || result(updated)["note"] != "e2e: exercise the local API" {
+		t.Fatalf("update_workspace: %v", updated)
 	}
 
 	// Standalone use: write, then read back with the returned version.
@@ -247,11 +252,23 @@ func TestE2E(t *testing.T) {
 		"operation_id": "c1", "workspace": wsID, "executable": "/bin/sh",
 		"args": []string{"-c", "sleep 0.5; echo ran >> runs.log"},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	if _, _, err := d.call(ctx, "run_command", run); err == nil {
-		t.Fatal("expected the client to give up before the command finished")
+	ctx, cancel := context.WithCancel(context.Background())
+	gaveUp := make(chan error, 1)
+	go func() { _, _, err := d.call(ctx, "run_command", run); gaveUp <- err }()
+	// Disconnect once the operation is admitted and running (resolving the
+	// workspace in Orca comes first).
+	for i := 0; ; i++ {
+		if _, op, _ := d.call(context.Background(), "get_operation", map[string]any{"operation_id": "c1"}); op["state"] == "running" {
+			break
+		} else if i == 200 {
+			t.Fatalf("run_command was never admitted: %v", op)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
+	if err := <-gaveUp; err == nil {
+		t.Fatal("expected the client to give up before the command finished")
+	}
 	d.waitState("c1", "succeeded")
 	// Resending the same operation returns the stored result without rerunning.
 	if op := d.mustCall("run_command", run); op["state"] != "succeeded" {
@@ -335,15 +352,23 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("finished job after restart: %v", j)
 	}
 
-	// The workspace survives the restart and is deleted through Reach.
-	if list := d.callList("list_workspaces"); len(list) != 1 {
+	// The workspace lives in Orca, so it survives the restart. Completed and
+	// idle for long enough, the daemon removes it, folder and all, when it
+	// starts.
+	if list := d.callList("list_workspaces"); len(list) != 1 || list[0].(map[string]any)["status"] != "in-review" {
 		t.Fatalf("list_workspaces after restart: %v", list)
 	}
-	if op := d.mustCall("delete_workspace", map[string]any{"operation_id": "dw", "workspace": wsID}); op["state"] != "succeeded" {
-		t.Fatalf("delete_workspace: %v", op)
+	if op := d.mustCall("update_workspace", map[string]any{"operation_id": "done", "workspace": wsID, "status": "completed"}); op["state"] != "succeeded" {
+		t.Fatalf("complete: %v", op)
 	}
-	if _, err := os.Stat(ws); !os.IsNotExist(err) {
-		t.Fatal("worktree still exists after delete_workspace")
+	d.kill()
+	orcatest.Age(t, filepath.Join(filepath.Dir(d.sock), "orca"), 8*24*time.Hour)
+	d.start()
+	if list := d.callList("list_workspaces"); len(list) != 1 {
+		t.Fatalf("a workspace used through Reach within a week was removed: %v", list)
+	}
+	if _, err := os.Stat(ws); err != nil {
+		t.Fatalf("workspace folder: %v", err)
 	}
 }
 

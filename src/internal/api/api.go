@@ -18,26 +18,26 @@ import (
 // arguments ignore it. An unknown method is a not_found error.
 func Call(ctx context.Context, svc *service.Service, c *service.Client, method string, body []byte) (any, error) {
 	switch method {
-	case "list_projects":
-		return svc.ListProjects(c), nil
+	case "list_capabilities":
+		return svc.ListCapabilities(c), nil
 	case "list_workspaces":
-		return svc.ListWorkspaces(c)
+		return svc.ListWorkspaces(ctx, c)
 	case "create_workspace":
 		return call(body, func(req service.CreateWorkspaceRequest) (any, error) { return svc.CreateWorkspace(ctx, c, req) })
-	case "delete_workspace":
-		return call(body, func(req service.WorkspaceRequest) (any, error) { return svc.DeleteWorkspace(ctx, c, req) })
+	case "update_workspace":
+		return call(body, func(req service.UpdateWorkspaceRequest) (any, error) { return svc.UpdateWorkspace(ctx, c, req) })
 	case "list_files":
-		return call(body, func(req service.ListFilesRequest) (any, error) { return svc.ListFiles(c, req) })
+		return call(body, func(req service.ListFilesRequest) (any, error) { return svc.ListFiles(ctx, c, req) })
 	case "read_file":
-		return call(body, func(req service.ReadFileRequest) (any, error) { return svc.ReadFile(c, req) })
+		return call(body, func(req service.ReadFileRequest) (any, error) { return svc.ReadFile(ctx, c, req) })
 	case "write_file":
-		return call(body, func(req service.WriteFileRequest) (any, error) { return svc.WriteFile(c, req) })
+		return call(body, func(req service.WriteFileRequest) (any, error) { return svc.WriteFile(ctx, c, req) })
 	case "run_command":
 		return call(body, func(req service.RunCommandRequest) (any, error) { return svc.RunCommand(ctx, c, req) })
 	case "get_operation":
 		return call(body, func(req service.GetOperationRequest) (any, error) { return svc.GetOperation(c, req) })
 	case "start_job":
-		return call(body, func(req service.StartJobRequest) (any, error) { return svc.StartJob(c, req) })
+		return call(body, func(req service.StartJobRequest) (any, error) { return svc.StartJob(ctx, c, req) })
 	case "get_job":
 		return call(body, func(req service.JobRequest) (any, error) { return svc.GetJob(c, req) })
 	case "read_job_output":

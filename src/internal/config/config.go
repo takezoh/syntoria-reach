@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,18 +17,19 @@ import (
 // Config is the on-disk daemon configuration. It contains client tokens, so the
 // file must not be readable by group or others.
 type Config struct {
-	Socket   string    `json:"socket"`
-	Database string    `json:"database"`
-	Orca     []string  `json:"orca"` // Orca CLI command; Command[0] is absolute
-	Agents   []Agent   `json:"agents"`
-	Projects []Project `json:"projects"`
-	Clients  []Client  `json:"clients"`
-	Remote   *Remote   `json:"remote"`
+	Socket     string   `json:"socket"`
+	Database   string   `json:"database"`
+	Workspaces string   `json:"workspaces"` // folder of the workspace folders Reach creates
+	Orca       []string `json:"orca"`       // Orca CLI command; Command[0] is absolute
+	Agents     []Agent  `json:"agents"`
+	Commands   []string `json:"commands"` // absolute paths of the executables run_command and start_job may run
+	Clients    []Client `json:"clients"`
+	Remote     *Remote  `json:"remote"`
 }
 
 // Remote connects the daemon to the Reach gateway (Cloudflare) so that remote
 // MCP clients reach it. Every request that arrives through the gateway acts
-// as the client named Client, with that client's grants.
+// as the client named Client, with that client's permissions.
 type Remote struct {
 	URL    string `json:"url"`    // the gateway's connect endpoint: wss://, or ws:// to a loopback host
 	Token  string `json:"token"`  // the node token the gateway expects
@@ -51,28 +53,12 @@ func (a Agent) Harness() core.Harness {
 	return core.Harness{Protocol: a.Protocol, Command: a.Command, Env: a.Env, Sandbox: a.Sandbox, AllowPermissions: a.AllowPermissions}
 }
 
-// Project is a repository registered in the Orca server from which clients
-// create workspaces (Orca worktrees). Repo is its absolute path. Commands
-// lists the absolute paths of executables and Agents the agent IDs allowed in
-// its workspaces.
-type Project struct {
-	ID       string   `json:"id"`
-	Repo     string   `json:"repo"`
-	Commands []string `json:"commands"`
-	Agents   []string `json:"agents"`
-}
-
-// Client is a caller identified by a bearer token.
+// Client is a caller identified by a bearer token. Allow lists its
+// permissions, which apply to every workspace.
 type Client struct {
-	ID     string  `json:"id"`
-	Token  string  `json:"token"`
-	Grants []Grant `json:"grants"`
-}
-
-// Grant gives a client permissions on one project.
-type Grant struct {
-	Project string   `json:"project"`
-	Allow   []string `json:"allow"`
+	ID    string   `json:"id"`
+	Token string   `json:"token"`
+	Allow []string `json:"allow"`
 }
 
 // Load reads and validates the configuration at path. Defaults come from
@@ -90,7 +76,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields() // a key from an older format must not be silently ignored
+	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	home, _ := os.UserHomeDir()
@@ -123,17 +111,25 @@ func (c *Config) ApplyDefaults(getenv func(string) string, home string) error {
 		}
 		c.Database = filepath.Join(dir, "reach", "reach.db")
 	}
+	if c.Workspaces == "" {
+		c.Workspaces = filepath.Join(filepath.Dir(c.Database), "workspaces")
+	}
 	return nil
 }
 
 // Validate checks the configuration and fills agent defaults. It has no
 // side effects beyond c.
 func (c *Config) Validate() error {
-	if !filepath.IsAbs(c.Socket) || !filepath.IsAbs(c.Database) {
-		return errors.New("socket and database must be absolute paths")
+	if !filepath.IsAbs(c.Socket) || !filepath.IsAbs(c.Database) || !filepath.IsAbs(c.Workspaces) {
+		return errors.New("socket, database and workspaces must be absolute paths")
 	}
-	if len(c.Projects) > 0 && (len(c.Orca) == 0 || !filepath.IsAbs(c.Orca[0])) {
+	if len(c.Orca) == 0 || !filepath.IsAbs(c.Orca[0]) {
 		return errors.New("orca must be set to the Orca CLI command, starting with an absolute path")
+	}
+	for _, cmd := range c.Commands {
+		if !filepath.IsAbs(cmd) {
+			return fmt.Errorf("command %q must be an absolute path", cmd)
+		}
 	}
 	agents := map[string]bool{}
 	for i := range c.Agents {
@@ -160,26 +156,6 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("agent %s: unknown codex sandbox %q", a.ID, a.Sandbox)
 		}
 	}
-	projects := map[string]bool{}
-	for _, p := range c.Projects {
-		if p.ID == "" || projects[p.ID] {
-			return fmt.Errorf("project id %q is empty or duplicated", p.ID)
-		}
-		projects[p.ID] = true
-		if !filepath.IsAbs(p.Repo) {
-			return fmt.Errorf("project %s: repo must be an absolute path", p.ID)
-		}
-		for _, cmd := range p.Commands {
-			if !filepath.IsAbs(cmd) {
-				return fmt.Errorf("project %s: command %q must be an absolute path", p.ID, cmd)
-			}
-		}
-		for _, a := range p.Agents {
-			if !agents[a] {
-				return fmt.Errorf("project %s: unknown agent %q", p.ID, a)
-			}
-		}
-	}
 	clients := map[string]bool{}
 	tokens := map[string]bool{}
 	for _, cl := range c.Clients {
@@ -194,16 +170,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("client %s: token is shared with another client", cl.ID)
 		}
 		tokens[cl.Token] = true
-		for _, g := range cl.Grants {
-			if !projects[g.Project] {
-				return fmt.Errorf("client %s: unknown project %q", cl.ID, g.Project)
-			}
-			for _, p := range g.Allow {
-				switch p {
-				case core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite, core.PermCommandRun, core.PermAgentRun:
-				default:
-					return fmt.Errorf("client %s: unknown permission %q", cl.ID, p)
-				}
+		for _, p := range cl.Allow {
+			switch p {
+			case core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite, core.PermCommandRun, core.PermAgentRun:
+			default:
+				return fmt.Errorf("client %s: unknown permission %q", cl.ID, p)
 			}
 		}
 	}

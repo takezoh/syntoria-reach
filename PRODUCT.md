@@ -32,8 +32,8 @@ The goal is to reduce the effort of remotely operating one's own environment and
 
 ### Case A: Files and commands
 
-1. The user sets up Reach on Linux next to the Orca server, and selects the projects (repositories registered in Orca) and the operations to allow.
-2. The AI uses Reach's MCP tools to check the target node and available capabilities, and creates a workspace from a project. Reach creates it on the Orca server.
+1. The user sets up Reach on Linux next to the Orca server, and selects the operations, commands and agents to allow.
+2. The AI uses Reach's MCP tools to check the target node and available capabilities, then continues ongoing work in its workspace or creates a workspace for new work. Reach creates it on the Orca server.
 3. The AI reads permitted files and runs the commands it needs.
 4. Reach returns operation results and records the caller, target, and result.
 5. The AI makes its next decision or operation as needed.
@@ -63,7 +63,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 | Capability | MVP | Description |
 | --- | --- | --- |
 | Node discovery | Yes | Available nodes and their connection state |
-| Workspace management | Yes | Create and delete workspaces as Orca worktrees; each belongs to the caller that created it |
+| Workspace management | Yes | One workspace per unit of work: create, list and annotate (note, status) workspaces, each an Orca project named `reach-*` with a folder of its own; Orca holds their state, and completed workspaces are removed after a week without activity |
 | File access | Yes | List, read, conditional write |
 | Command execution | Yes | Isolated execution of permitted Linux commands |
 | Asynchronous jobs | Yes | Start, get state/output, stop |
@@ -79,8 +79,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 ## 5. Core concepts
 
 - **Node**: the computer being operated. Initially one Linux node.
-- **Project**: a repository registered in the Orca server that the user opens to AI, with the commands and agents allowed in it.
-- **Workspace**: an Orca workspace (Git worktree) created through Reach from a project; the scope of files and operations for the caller that created it.
+- **Workspace**: one unit of work: an Orca project named `reach-*` with a folder of its own, a note saying what the work is and Orca's workspace status; the scope of files and operations of a request.
 - **Capability**: an ability Reach provides, such as File, Command, or Job.
 - **Client / Connection**: an authenticated AI client and its connection.
 - **Operation**: an individual operation request. It has a unique identifier used to detect resends and duplicates.

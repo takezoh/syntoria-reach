@@ -254,3 +254,18 @@ func typeOf(m fs.FileMode) string {
 	}
 	return "other"
 }
+
+// Folders creates and removes workspace folders.
+type Folders struct{}
+
+// Make creates the folder path, which must not exist yet, and its parents.
+func (Folders) Make(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.Mkdir(path, 0o755)
+}
+
+// Remove removes the folder path and everything in it. Symlinks, including
+// path itself, are removed rather than followed.
+func (Folders) Remove(path string) error { return os.RemoveAll(path) }

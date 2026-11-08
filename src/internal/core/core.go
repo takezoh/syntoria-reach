@@ -99,35 +99,46 @@ type AuditRecord struct {
 	ErrorCode   string
 }
 
-// Workspace states.
-const (
-	WorkspaceCreating = "creating"
-	WorkspaceReady    = "ready"
-	WorkspaceDeleting = "deleting"
-	WorkspaceDeleted  = "deleted"
-	WorkspaceFailed   = "failed"
-)
+// WorkspacePrefix starts the name of every Orca project Reach creates as a
+// workspace. Reach sees only projects whose name has it.
+const WorkspacePrefix = "reach-"
 
-// Workspace is an Orca workspace created by a client through Reach.
-type Workspace struct {
-	ID           string    `json:"workspace"`
-	ClientID     string    `json:"-"`
-	ProjectID    string    `json:"project"`
-	Name         string    `json:"name"`
-	State        string    `json:"state"`
-	OrcaID       string    `json:"-"`
-	Path         string    `json:"path,omitempty"`
-	Branch       string    `json:"branch,omitempty"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+// CleanupAfter is how long a completed workspace stays after its last
+// activity before Reach removes it.
+const CleanupAfter = 7 * 24 * time.Hour
+
+// Repo is a project registered in Orca, as Orca reports it.
+type Repo struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+	Path        string `json:"path"`
+	Kind        string `json:"kind"`
 }
 
-// Worktree is a workspace as Orca reports it.
+// Worktree is a workspace entry of an Orca project, as Orca reports it. A
+// project's root entry (IsMainWorktree) carries its comment and workspace
+// status.
 type Worktree struct {
-	ID     string `json:"id"`
+	ID              string `json:"id"`
+	RepoID          string `json:"repoId"`
+	Path            string `json:"path"`
+	Comment         string `json:"comment"`
+	WorkspaceStatus string `json:"workspaceStatus"`
+	IsMainWorktree  bool   `json:"isMainWorktree"`
+	LastActivityAt  int64  `json:"lastActivityAt"` // Unix milliseconds
+}
+
+// Workspace is a Reach workspace: one unit of work, kept by Orca as a project
+// whose name has WorkspacePrefix. Its ID is the Orca project's repo ID, its
+// note the project's comment and its status the project's Orca workspace
+// status (todo, in-progress, in-review, completed or a custom one). Reach
+// keeps nothing about it and reads it from Orca on every request.
+type Workspace struct {
+	ID     string `json:"workspace"`
+	Name   string `json:"name"`
+	Note   string `json:"note"`
+	Status string `json:"status"`
 	Path   string `json:"path"`
-	Branch string `json:"branch"`
 }
 
 // OrcaError is a failure reported by Orca.

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,11 +18,92 @@ func TestValidNames(t *testing.T) {
 			t.Errorf("ValidOperationID(%q) != %v", id, want)
 		}
 	}
-	for name, want := range map[string]bool{
-		"ws": true, "feature.x-1": true, "": false, "-x": false, ".x": false, "../x": false, "a/b": false,
+}
+
+func TestWorkspaceName(t *testing.T) {
+	for name, want := range map[string]string{
+		"ws": "reach-ws", "feature.x-1": "reach-feature.x-1", "reach-ws": "reach-ws", "-x": "reach--x",
 	} {
-		if ValidWorkspaceName(name) != want {
-			t.Errorf("ValidWorkspaceName(%q) != %v", name, want)
+		if got, ok := WorkspaceName(name); !ok || got != want {
+			t.Errorf("WorkspaceName(%q) = %q, %v; want %q", name, got, ok, want)
+		}
+	}
+	for _, name := range []string{"", "reach-", "../x", "a/b", "x y", strings.Repeat("a", 64)} {
+		if got, ok := WorkspaceName(name); ok {
+			t.Errorf("WorkspaceName(%q) = %q accepted", name, got)
+		}
+	}
+}
+
+func TestIsWorkspace(t *testing.T) {
+	for name, want := range map[string]bool{"reach-ws": true, "reach-": true, "syntoria-reach": false, "Reach-ws": false, "": false} {
+		if got := IsWorkspace(&Repo{DisplayName: name}); got != want {
+			t.Errorf("IsWorkspace(%q) = %v", name, got)
+		}
+	}
+	r := &Repo{ID: "r1", DisplayName: "reach-ws", Path: "/w/reach-ws", Kind: "folder"}
+	if w := NewWorkspace(r, &Worktree{Comment: "fix the docs", WorkspaceStatus: "in-review"}); *w != (Workspace{ID: "r1", Name: "reach-ws", Note: "fix the docs", Status: "in-review", Path: "/w/reach-ws"}) {
+		t.Fatalf("NewWorkspace = %+v", w)
+	}
+	if w := NewWorkspace(r, nil); w.Note != "" || w.Status != "" || w.ID != "r1" {
+		t.Fatalf("NewWorkspace without a root = %+v", w)
+	}
+}
+
+func TestExpired(t *testing.T) {
+	now := time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)
+	old, recent := now.Add(-CleanupAfter), now.Add(-CleanupAfter+time.Minute)
+	for _, c := range []struct {
+		status string
+		last   time.Time
+		busy   bool
+		want   bool
+	}{
+		{WorkspaceCompleted, old, false, true},
+		{WorkspaceCompleted, recent, false, false},
+		{WorkspaceCompleted, old, true, false},
+		{WorkspaceInProgress, old, false, false},
+		{"in-review", old, false, false},
+	} {
+		if got := Expired(c.status, c.last, now, c.busy); got != c.want {
+			t.Errorf("Expired(%s, %v, busy=%v) = %v", c.status, now.Sub(c.last), c.busy, got)
+		}
+	}
+}
+
+func TestOwnFolder(t *testing.T) {
+	if !OwnFolder("/w", "/w/reach-ws", "reach-ws") {
+		t.Fatal("own folder refused")
+	}
+	for _, c := range [][3]string{
+		{"/w", "/w/reach-ws", "reach-other"},      // another name
+		{"/w", "/elsewhere/reach-ws", "reach-ws"}, // outside the base
+		{"/w", "/w/sub/reach-ws", "reach-ws"},
+		{"/w", "/w", "reach-ws"},
+		{"/w", "/w/ws", "ws"}, // no prefix
+		{"w", "w/reach-ws", "reach-ws"},
+		{"/w", "/w/reach-ws/..", "reach-ws"},
+	} {
+		if OwnFolder(c[0], c[1], c[2]) {
+			t.Errorf("OwnFolder(%q, %q, %q) accepted", c[0], c[1], c[2])
+		}
+	}
+}
+
+func TestCheckNote(t *testing.T) {
+	for _, ok := range []string{"x", "Fix the README.\nThen run the tests.", strings.Repeat("あ", MaxNoteLength)} {
+		if err := CheckNote(ok); err != nil {
+			t.Errorf("CheckNote(%.20q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", " \n\t", strings.Repeat("a", MaxNoteLength+1), "a\x00b", "\xff"} {
+		if err := CheckNote(bad); Classify(err) == nil || Classify(err).Code != CodeInvalidRequest {
+			t.Errorf("CheckNote(%.20q) = %v", bad, err)
+		}
+	}
+	for status, want := range map[string]bool{"todo": true, "in-review": true, "my_status": true, "": false, "In-Review": false, "-x": false, "a b": false} {
+		if ValidWorkspaceStatus(status) != want {
+			t.Errorf("ValidWorkspaceStatus(%q) != %v", status, want)
 		}
 	}
 }
@@ -135,43 +217,6 @@ func TestJobOutcome(t *testing.T) {
 	for _, c := range cases {
 		if state, msg := JobOutcome(c.exit); state != c.state || msg != c.msg {
 			t.Errorf("JobOutcome(%+v) = %s, %q; want %s, %q", c.exit, state, msg, c.state, c.msg)
-		}
-	}
-}
-
-func TestWorkspaceAccess(t *testing.T) {
-	perms := []string{PermFileRead}
-	cases := []struct {
-		state string
-		known bool
-		perm  string
-		want  bool
-	}{
-		{WorkspaceReady, true, PermFileRead, true},
-		{WorkspaceReady, true, PermFileWrite, false},
-		{WorkspaceReady, false, PermFileRead, false}, // project removed from the config
-		{WorkspaceCreating, true, PermFileRead, false},
-		{WorkspaceDeleting, true, PermFileRead, false},
-		{WorkspaceDeleted, true, PermFileRead, false},
-		{StateUnknown, true, PermFileRead, false},
-	}
-	for _, c := range cases {
-		if got := WorkspaceAccess(&Workspace{State: c.state}, c.known, perms, c.perm); got != c.want {
-			t.Errorf("WorkspaceAccess(%s, known=%v, %s) = %v", c.state, c.known, c.perm, got)
-		}
-	}
-}
-
-func TestDeletable(t *testing.T) {
-	if err := Deletable(&Workspace{State: WorkspaceReady}, false); err != nil {
-		t.Fatal(err)
-	}
-	for _, c := range []struct {
-		state string
-		busy  bool
-	}{{WorkspaceReady, true}, {WorkspaceDeleting, false}, {WorkspaceDeleted, false}, {WorkspaceFailed, false}} {
-		if err := Deletable(&Workspace{State: c.state}, c.busy); Classify(err) == nil || Classify(err).Code != CodeInvalidState {
-			t.Errorf("Deletable(%s, busy=%v) = %v", c.state, c.busy, err)
 		}
 	}
 }

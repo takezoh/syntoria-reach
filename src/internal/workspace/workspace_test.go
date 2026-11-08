@@ -172,3 +172,29 @@ func TestFilesContract(t *testing.T) {
 		return f
 	})
 }
+
+func TestFolders(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "workspaces")
+	path := filepath.Join(base, "reach-ws")
+	if err := (Folders{}).Make(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Folders{}).Make(path); err == nil {
+		t.Fatal("an existing folder was made again")
+	}
+	// Removing goes through everything in the folder but never follows a
+	// symlink out of it.
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "keep"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(path, "f"), []byte("x"), 0o644)
+	os.Symlink(outside, filepath.Join(path, "link"))
+	if err := (Folders{}).Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("folder still exists")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
+		t.Fatal("removal followed a symlink")
+	}
+}

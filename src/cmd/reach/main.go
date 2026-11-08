@@ -70,6 +70,8 @@ func run() error {
 	go func() { errc <- srv.Serve(l) }()
 	slog.Info("reach listening", "socket", cfg.Socket)
 
+	go cleanup(ctx, svc)
+
 	connector := make(chan struct{})
 	if r := cfg.Remote; r != nil {
 		client, ok := svc.ClientByID(r.Client)
@@ -98,6 +100,29 @@ func run() error {
 	return nil
 }
 
+// cleanupInterval is how often completed workspaces are checked for removal.
+const cleanupInterval = time.Hour
+
+// cleanup removes due completed workspaces now and every cleanupInterval.
+func cleanup(ctx context.Context, svc *service.Service) {
+	t := time.NewTicker(cleanupInterval)
+	defer t.Stop()
+	for {
+		removed, err := svc.Cleanup(ctx, time.Now())
+		for _, id := range removed {
+			slog.Info("removed completed workspace", "workspace", id)
+		}
+		if err != nil {
+			slog.Warn("workspace cleanup", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 // deps wires the production adapters. Job output and harness logs are kept
 // next to the database.
 func deps(cfg *config.Config, st *store.Store) service.Deps {
@@ -115,6 +140,7 @@ func deps(cfg *config.Config, st *store.Store) service.Deps {
 		Jobs:       job.NewRunner(filepath.Join(stateDir, "jobs")),
 		Agents:     agent.New(filepath.Join(stateDir, "agents")),
 		Orca:       &orca.CLI{Command: cfg.Orca},
+		Folders:    workspace.Folders{},
 		NewID:      ids.New,
 	}
 }

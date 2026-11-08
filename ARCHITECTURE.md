@@ -42,7 +42,7 @@ flowchart TB
         PROC["Agent Session Manager: Codex / Claude / ACP"]
         JOB["Job Manager + OS process supervisor"]
         ST[("SQLite: Operations / Workspaces / Jobs / Sessions / Audit")]
-        ORCA["Orca server: workspaces (Git worktrees)"]
+        ORCA["Orca server: workspaces (projects reach-*)"]
         LOCAL <--> REACH
         REACH --> CAP
         REACH --> JOB
@@ -71,7 +71,7 @@ The standard deployment on Linux is a single Go daemon. The cloud has no residen
 | Operation Service | Re-validating arguments and permissions, idempotency decisions, accepting synchronous and asynchronous work | Business state of other Syntoria services |
 | Capability Registry | Public contracts of File / Command / Job, required permissions, choice of OS adapter | External AI decisions |
 | Linux Runtime | File operations in workspaces, process start/stop/isolation | MCP protocol details |
-| Orca adapter | Creating and deleting workspaces (Orca worktrees) through the Orca CLI | Agents and commands in those workspaces (Reach runs them) |
+| Orca adapter | Registering, listing, annotating (comment, workspace status) and removing the Orca projects that are workspaces, through the Orca CLI | Agents and commands in those workspaces (Reach runs them) |
 | Job Manager | Job state, logs and artifacts, stop, reconciliation after restart | Dependence on MCP connection liveness |
 | SQLite | Local source of truth for operations, jobs, policy, and audit | Data of other Syntoria services |
 
@@ -144,11 +144,10 @@ The initial MCP tools are the following candidates. Formal names and JSON Schema
 | Tool | Purpose | Main inputs / results |
 | --- | --- | --- |
 | list_nodes | Query authorized nodes | node_id, online / offline |
-| list_capabilities | Query a node's capabilities | node_id, capabilities |
-| list_projects | Projects the caller may create workspaces from | project_id, permissions |
-| create_workspace | Create an Orca workspace (worktree) from a project | operation_id, project_id, name → workspace_id, path |
-| list_workspaces | The caller's workspaces | workspace_id, project_id, path |
-| delete_workspace | Delete one of the caller's workspaces through Orca | operation_id, workspace_id |
+| list_capabilities | Query a node's capabilities: the caller's permissions, commands and agents | node_id, permissions, commands, agents |
+| create_workspace | Create a workspace for one unit of work: a folder registered as an Orca project, with a note | operation_id, name, note → workspace_id, name, note, status, path |
+| list_workspaces | Every workspace, to find ongoing work | workspace_id, name, note, status, path |
+| update_workspace | Change a workspace's note or Orca workspace status | operation_id, workspace_id, note, status |
 | list_files | File listing within a permitted area | workspace_id, relative_path |
 | read_file | Read a file | workspace_id, relative_path, bounded data |
 | write_file | Conditional file write | operation_id, workspace_id, path, expected_version |
@@ -209,10 +208,10 @@ Initial target: Linux with systemd, single user, single node.
 
 - Daemon: a non-root systemd user service. Linger is set explicitly when needed.
 - Storage: local SQLite (WAL) and managed log / artifact directories.
-- Workspaces: a caller creates a workspace from a project (a repository registered in the Orca server of the same host). Reach creates it as an Orca worktree with its own branch through the Orca CLI and records it; only that caller can use and delete it. Deletion goes through Orca, deletes the branch only if Orca can prove it is merged, and is refused while jobs or agent sessions run or when the worktree has uncommitted changes. Workspaces that Reach did not create are never deleted.
+- Workspaces: one workspace per unit of work. A caller creates one with a name and a note saying what the work is; Reach creates the folder `reach-<name>` under its `workspaces` folder and registers it in Orca as a folder project, with the note as the comment of the project's root entry. The workspace starts empty; the work brings in what it needs. Orca is the only record of a workspace: its existence, name, path, note and workspace status are read from Orca on every request, and Reach stores nothing about it, so a project changed or removed in Orca is changed or gone for Reach too. Reach sees only Orca projects whose name starts with `reach-`, and a client's permissions apply to every workspace. Callers do not delete workspaces: they set the status to `completed`, and the daemon, every hour, removes each completed workspace without activity for 7 days and nothing running — activity being Orca's last activity or Reach's latest audit record, agent session or job change for it. It removes the Orca project (with `--force`, which also detaches terminals open in Orca) and the folder, but only a folder it created under `workspaces`. Starting an agent in a completed workspace sets it back to `in-progress`.
 - Files: take a workspace ID and a relative path, and enforce the boundary with safe path resolution such as openat2. Escapes via symlinks or mounts are also checked.
 - Writes: conditional updates, with temporary files / atomic rename as needed.
-- Commands and jobs: an executable from the project's allowlist plus argv; no implicit shell expansion; a minimal environment (the daemon's environment is not inherited); execution time and output size limits.
+- Commands and jobs: an executable from the configured allowlist plus argv; no implicit shell expansion; a minimal environment (the daemon's environment is not inherited); execution time and output size limits.
 - Agents: sandboxing of the agent's tools is delegated to the agent harness (see §6).
 
 **Note:** Reach does not isolate commands and jobs itself. Only allowlisted executables run, as the daemon's user, so allowlists should not include executables that can run arbitrary code unless that is intended.
@@ -228,7 +227,7 @@ Verify external clients' OAuth/OIDC authentication and the binding between Reach
 - **Tokens**: every MCP request's token is introspected at Gate with the gateway's resource client credentials, and nothing is cached. The issuer, the audience (the gateway's MCP URL, a resource registered in Gate under its cookie parent), the expiry, Gate's approval and the client are checked, using the bearer verification of Gate's SDK. An invalid token is 401; Gate being unreachable is 503, never a sign-out.
 - **Admission**: only the configured subject (`OWNER_SUBJECT`, `github:<ID>`) is admitted. Any other is 403.
 - **The node**: it authenticates with the node token, a Worker secret.
-- **Authorization on Linux**: every remote request acts as the one Reach client named in the daemon's `remote` config, and the daemon authorizes it with that client's grants. The gateway asserts no other identity.
+- **Authorization on Linux**: every remote request acts as the one Reach client named in the daemon's `remote` config, and the daemon authorizes it with that client's permissions. The gateway asserts no other identity.
 - **Revocation**: revoking a connection on Gate's `/connections` stops it at its next request. Removing `remote` or rotating the node token cuts off all remote access.
 
 ### Linux runtime
@@ -245,8 +244,8 @@ Record the operation ID, authenticated principal, node, workspace, operation typ
 
 | Store | Contents | Authority |
 | --- | --- | --- |
-| Linux SQLite | operations, workspaces, jobs, agent_sessions, agent_events, audit_records | **Source of truth for operations / workspace ownership / jobs / agent sessions** |
-| Orca server | Worktrees, branches, and their files | **Source of truth for workspace contents** |
+| Linux SQLite | operations, jobs, agent_sessions, agent_events, audit_records | **Source of truth for operations / jobs / agent sessions** |
+| Orca server | Projects (`reach-*` are workspaces), their folders' registration, comments (notes) and workspace statuses | **Source of truth for workspaces** |
 | Linux files | Job stdout / stderr, harness stderr logs | **Source of truth for the actual data** |
 | Durable Object | WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
 | Workers | Transient processing and forwarding of authenticated requests | Holds no persistent job state |
@@ -267,7 +266,7 @@ If a requirement arises to copy data to the Cloudflare side, a separate contract
 | Prompt delivery unknown | Reconcile by the prompt's operation ID (get_operation). Never resend the same prompt under a new ID |
 | Duplicate requests | Prevent double side effects with SQLite unique constraints and argument comparison |
 | Permission revoked | Reject new requests. Running jobs follow an explicit stop policy |
-| Orca unavailable or refusing | create / delete fail with orca_failed; existing workspaces stay usable. A daemon crash during create / delete leaves the workspace unknown |
+| Orca unavailable or refusing | Workspace requests fail with orca_failed (an unreachable Orca is never an empty list); running jobs and sessions continue, and cleanup waits for the next run. A daemon crash during create leaves the operation unknown; the workspace is whatever Orca reports |
 
 Error classes: unauthorized / permission_denied / invalid_request / not_found / operation_conflict / version_conflict / invalid_state / harness_unavailable / orca_failed / internal; the remote path adds node_offline. An outcome that cannot be confirmed is the `unknown` state with `result_unknown`.
 

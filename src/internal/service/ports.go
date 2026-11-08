@@ -2,12 +2,13 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 )
 
 // The ports below are every side effect the service performs. Adapters
-// implement them (store, workspace, command, job, agent, orca, ids); the
+// implement them (store, workspace, command, job, agent, orca, folders, ids); the
 // composition root (cmd/reach) wires them and tests replace them with the
 // fakes in servicetest.
 
@@ -25,18 +26,12 @@ type Store interface {
 	GetOperation(clientID, operationID string) (*core.Operation, error)
 	Audit(core.AuditRecord) error
 
-	// CreateWorkspace records w in the creating state.
-	CreateWorkspace(w *core.Workspace) error
-	// SetWorkspaceState moves a workspace from one state to another and
-	// reports whether it was in the from state. Empty orcaID, path and branch
-	// are left unchanged.
-	SetWorkspaceState(id, from, to, orcaID, path, branch, errMessage string) (bool, error)
-	GetWorkspace(clientID, id string) (*core.Workspace, error)
-	// ListWorkspaces returns the client's ready workspaces, oldest first.
-	ListWorkspaces(clientID string) ([]*core.Workspace, error)
 	// WorkspaceBusy reports whether a workspace has running jobs or active
-	// agent sessions.
+	// agent sessions. Workspaces themselves are Orca's; the store keeps none.
 	WorkspaceBusy(id string) (bool, error)
+	// WorkspaceLastUsed returns when Reach last acted on a workspace (its
+	// audit records, agent sessions and jobs), or the zero time.
+	WorkspaceLastUsed(id string) (time.Time, error)
 
 	// CreateJob records j as running.
 	CreateJob(j *core.Job) error
@@ -101,11 +96,34 @@ type Agents interface {
 	Stop(id string) error
 }
 
-// Orca creates and removes workspaces (worktrees). Failures Orca reports
-// are *core.OrcaError.
+// Orca owns the projects that are workspaces and everything about them.
+// Failures Orca reports are *core.OrcaError.
 type Orca interface {
-	CreateWorktree(ctx context.Context, repoPath, name string) (*core.Worktree, error)
-	RemoveWorktree(ctx context.Context, id string) error
+	// AddFolder registers an existing folder as a folder project and
+	// returns its repo ID.
+	AddFolder(ctx context.Context, path string) (string, error)
+	Repos(ctx context.Context) ([]core.Repo, error)
+	// Repo returns one project; core.ErrNotFound if Orca has none.
+	Repo(ctx context.Context, id string) (*core.Repo, error)
+	// Worktrees lists the workspace entries of one project, or of every
+	// project when repoID is empty; core.ErrNotFound for an unknown
+	// project. A partial list is an error.
+	Worktrees(ctx context.Context, repoID string) ([]core.Worktree, error)
+	// SetWorktree changes a workspace entry's comment and workspace
+	// status; an empty value leaves that one unchanged.
+	SetWorktree(ctx context.Context, id, comment, status string) error
+	// DeleteProject removes a project, with its saved details, from Orca;
+	// its folder stays.
+	DeleteProject(ctx context.Context, repoID string) error
+}
+
+// Folders creates and removes workspace folders.
+type Folders interface {
+	// Make creates the folder path, which must not exist yet, and its
+	// parents.
+	Make(path string) error
+	// Remove removes the folder path and everything in it.
+	Remove(path string) error
 }
 
 // NewID returns prefix followed by a unique random suffix.
@@ -119,5 +137,6 @@ type Deps struct {
 	Jobs       Jobs
 	Agents     Agents
 	Orca       Orca
+	Folders    Folders
 	NewID      NewID
 }

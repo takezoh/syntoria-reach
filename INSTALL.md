@@ -9,9 +9,9 @@ You are installing (or updating) the Reach daemon on this host as a systemd user
 ## Done when
 
 - `~/.local/bin/reach` is built from this checkout.
-- `~/.config/reach/config.json` exists with mode 600, and the user has approved its projects, agents, clients and grants.
+- `~/.config/reach/config.json` exists with mode 600, and the user has approved its agents, commands, clients and their permissions.
 - `reach.service` is installed in `~/.config/systemd/user/`, enabled, and active.
-- `list_projects` answers through the socket for every configured client.
+- `list_capabilities` answers through the socket for every configured client.
 - If the user wants remote MCP (section 7): the gateway is deployed and registered in Gate, the daemon is connected to it, and its MCP endpoint refuses requests without a token.
 - The user has seen your report (see the last section).
 
@@ -24,8 +24,7 @@ The unit (`deploy/systemd/reach.service`) runs `%h/.local/bin/reach -config %h/.
 - Do not overwrite an existing config. If it needs a change, show the change with tokens redacted, apply it only after the user agrees, and keep the existing tokens.
 - Ask the user before you:
   - restart a running `reach.service`. A restart kills its running jobs and agent sessions, and they become `unknown`.
-  - register a repository in Orca.
-  - run the smoke test. It creates an Orca worktree and branch, and it runs an agent turn, which costs tokens.
+  - run the smoke test. It creates a workspace (a folder registered in Orca as a project), and it runs an agent turn, which costs tokens.
 - Do not change this repository.
 - If you run in a sandbox, it may block Unix sockets, the systemd user bus, or the Orca CLI. These commands then fail with errors like `EPERM`, "Operation not permitted", or "Failed to connect to bus". Such a failure says nothing about Reach. Run the command outside the sandbox if you are allowed to, or ask the user to run it and paste the output.
 
@@ -39,7 +38,7 @@ Collect every missing prerequisite, then report them all at once. Stop if any of
 - **Orca.** The Orca server of this host runs as the same user, and its CLI answers.
   - Find the CLI's absolute path with `command -v orca-ide` or `command -v orca`.
   - `<orca> status --json` shows that the runtime is reachable.
-  - `<orca> repo list --json` lists the registered repositories.
+  - `<orca> repo list --json` lists the registered projects.
 - **Agents.** Find the absolute path of each agent CLI the user may want: `codex` (protocol `codex`), `claude` (protocol `claude`), and any ACP agent (protocol `acp`).
 - **Existing install.** Check whether `~/.local/bin/reach`, `~/.config/reach/config.json` and `~/.config/systemd/user/reach.service` exist, and whether `systemctl --user is-active reach.service` reports active. If any of them exists, this is an update: keep the config, and skip what is already right.
 
@@ -47,12 +46,12 @@ Collect every missing prerequisite, then report them all at once. Stop if any of
 
 Propose a configuration from what you found, then let the user decide:
 
-- **Projects.** Which Orca repositories to expose. Give each a short `id`; its `repo` is the absolute path. A repository must be registered in Orca. If it is not, register it with `<orca> repo add --path <repo>`, after the user agrees.
-- **Commands.** Which executables each project allows, as absolute paths.
-- **Agents.** Which agents each project allows.
-- **Clients.** The callers: one client per caller, for example `davinci`, or `local` for manual use. Each client has an `id` and a token.
-- **Grants.** For each client and project, the permissions from `workspace.create`, `file.read`, `file.write`, `command.run` and `agent.run`.
-- **Socket and database.** Leave `socket` and `database` unset unless the user asks; they then default to `$XDG_RUNTIME_DIR/reach/reach.sock` and `$XDG_STATE_HOME/reach/reach.db` (`~/.local/state/reach/reach.db` when `XDG_STATE_HOME` is unset in the systemd user manager). Job output and harness logs go next to the database; the paths below assume the default.
+- **Agents.** Which agents may be started; every agent may be started in every workspace.
+- **Commands.** Which executables `run_command` and `start_job` may run, as absolute paths.
+- **Clients.** The callers: one client per caller, for example `davinci`, or `local` for manual use. Each client has an `id`, a token, and in `allow` its permissions from `workspace.create`, `file.read`, `file.write`, `command.run` and `agent.run`, which apply to every workspace.
+- **Socket, database and workspaces.** Leave `socket`, `database` and `workspaces` unset unless the user asks; they then default to `$XDG_RUNTIME_DIR/reach/reach.sock`, `$XDG_STATE_HOME/reach/reach.db` (`~/.local/state/reach/reach.db` when `XDG_STATE_HOME` is unset in the systemd user manager) and `workspaces` next to the database. Reach creates each workspace's folder in `workspaces` and registers it in Orca; job output and harness logs go next to the database; the paths below assume the default.
+
+The configuration names no repositories or Orca projects: a workspace is an Orca project Reach creates, named `reach-*`.
 
 **Child environment.** Commands, jobs and agents do not inherit the daemon's environment. They get exactly `PATH=/usr/local/bin:/usr/bin:/bin`, `LANG=C.UTF-8` and `HOME`, plus the agent's `env`. (Only the Orca CLI gets the daemon's environment.)
 
@@ -110,28 +109,26 @@ Any process other than `reach` is a running job or agent session. If there is on
 
 ## 6. Verify
 
-For each client, read its token from the config without printing it, then call `list_projects`:
+For each client, read its token from the config without printing it, then call `list_capabilities`:
 
 ```sh
 TOKEN=$(jq -r '.clients[] | select(.id == "<id>") | .token' ~/.config/reach/config.json)
 curl -sS --unix-socket "$XDG_RUNTIME_DIR/reach/reach.sock" -X POST \
-  -H "Authorization: Bearer $TOKEN" http://reach/v1/list_projects
+  -H "Authorization: Bearer $TOKEN" http://reach/v1/list_capabilities
 ```
 
-The answer is a JSON array of the client's projects, each with its `permissions`, `commands` and `agents`. If you get something else:
+The answer is the client's `permissions`, with the `commands` and `agents` it may run. If you get something else:
 
 - `401` means the token does not match the running config.
 - "Connection refused" or no socket means the service is not listening, or a sandbox blocks the socket.
 
 **Smoke test (optional).** Only with the user's consent, and with a client that has `workspace.create` and `agent.run`. Use unique `operation_id`s, and a name such as `reach-smoke-<yyyymmdd>` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`).
 
-1. `create_workspace` with `{"operation_id", "project", "name"}`. The operation's `state` is `succeeded`, and its `result.workspace` is the workspace ID. A failure names Orca's error in `error_message`.
+1. `create_workspace` with `{"operation_id", "name", "note"}`, the note saying it is the smoke test. The operation's `state` is `succeeded`, and its `result.workspace` is the workspace ID; Orca now lists the project `reach-<name>`. A failure names Orca's error in `error_message`.
 2. `start_agent_session` with `{"operation_id", "workspace", "agent"}`. The `result.session_id` is the session. If the harness does not start, the operation fails with `harness_failed`. Its stderr is the newest file in `~/.local/state/reach/agents/`.
 3. `send_agent_prompt` with `{"operation_id", "session_id", "text": "Reply with OK and nothing else."}`.
 4. Call `read_agent_events` with `{"session_id", "after": 0}` every few seconds until an event of type `turn_completed` arrives; its `text` is the turn status. Show the user the `message` events.
-5. `stop_agent_session`, then `delete_workspace`. Orca refuses to delete a workspace with uncommitted changes. If the agent changed files, tell the user instead of forcing anything.
-
-New workspaces start from the repository's default base (for example `origin/main`), not from local commits.
+5. `stop_agent_session`, then `update_workspace` with `{"operation_id", "workspace", "status": "completed"}`. The daemon removes the workspace, Orca project and folder, after 7 days without activity.
 
 ## 7. Remote MCP (optional)
 
@@ -147,7 +144,7 @@ Ask the user whether remote MCP clients (claude.ai, ChatGPT, Claude Code elsewhe
    - Run `npm ci` in `cloud/`.
    - The user signs in to Cloudflare: in `cloud/`, they run `npx wrangler login`, which opens a browser. Alternatively, they set `CLOUDFLARE_API_TOKEN`. Do not handle their Cloudflare credentials yourself.
    - `npx wrangler whoami` shows the account.
-2. **Agree on the remote client.** Every remote request acts as one client of the config, with that client's grants. Propose a dedicated client, for example `remote`, with only what remote AIs should do. For agent work that is `workspace.create` and `agent.run`. Add it as in section 4; its token also works on the local socket.
+2. **Agree on the remote client.** Every remote request acts as one client of the config, with that client's permissions. Propose a dedicated client, for example `remote`, with only what remote AIs should do. For agent work that is `workspace.create` and `agent.run`. Add it as in section 4; its token also works on the local socket.
 3. **Secrets.** Write `~/.config/reach/gateway-secrets.env` with mode 600. Every line is uploaded as a Worker secret, which keeps deployment values out of the repository:
    - `GATE_ISSUER`: Gate's issuer.
    - `GATE_CLIENT_ID`: the gateway's resource client ID in Gate, for example `reach-api`.
@@ -179,7 +176,7 @@ Ask the user whether remote MCP clients (claude.ai, ChatGPT, Claude Code elsewhe
      - claude.ai: Settings → Connectors → Add custom connector.
      - Claude Code: `claude mcp add --transport http reach https://reach-api.<parent>/mcp`, then `/mcp` to sign in.
    - Gate asks the user to sign in with GitHub and to approve the connection.
-   - `list_projects` from that client lists the remote client's projects.
+   - `list_capabilities` from that client shows the remote client's permissions.
 
 **Cutting off access.**
 - One connection: revoke it on Gate's `/connections` page. It stops working at its next request.
@@ -196,7 +193,7 @@ Tell the user:
 - For each client: its ID, and that its token is in the config at `.clients[] | select(.id == "<id>") | .token`. Do not include the token.
 - With remote MCP:
   - the gateway URL and its MCP endpoint (`https://<host>/mcp`)
-  - the remote client and its grants
+  - the remote client and its permissions
   - the Gate issuer, and that the user approves and revokes MCP connections at Gate (`/connections`)
   - whether the daemon is connected
 - Anything left to do, for example enabling linger, or configuring the caller to use the socket and its token.
@@ -211,6 +208,6 @@ rm ~/.config/systemd/user/reach.service ~/.local/bin/reach
 systemctl --user daemon-reload
 ```
 
-Workspaces created through Reach stay in Orca; delete them through Reach first if the user wants them gone. Remove the config (tokens) and the state directory only if the user asks.
+Workspaces stay: the Orca projects named `reach-*` and their folders under `workspaces` (by default `~/.local/state/reach/workspaces`). If the user wants them gone, remove those projects in Orca (`<orca> project setup-delete --setup <repo id> --force`) and then their folders. Remove the config (tokens) and the state directory only if the user asks.
 
 To remove the gateway, run `npx wrangler delete` in `cloud/`. It deletes the Worker and its Durable Object. Then ask the user or Gate's operator to remove the gateway's entry from `GATE_RESOURCES`.

@@ -31,9 +31,9 @@ type StartJobRequest struct {
 
 // StartJob starts a job once per operation ID. The operation result is the
 // job; a job that could not start is a failed job.
-func (s *Service) StartJob(c *Client, req StartJobRequest) (*core.Operation, error) {
+func (s *Service) StartJob(ctx context.Context, c *Client, req StartJobRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "start_job", WorkspaceID: req.Workspace, Target: req.Executable, OperationID: req.OperationID}
-	w, timeout, err := s.authorizeExecutable(c, req.Workspace, req.Executable, req.TimeoutSeconds, defaultJobTimeout, maxJobTimeout)
+	w, timeout, err := s.authorizeExecutable(ctx, c, req.Workspace, req.Executable, req.TimeoutSeconds, defaultJobTimeout, maxJobTimeout)
 	if err != nil {
 		s.audit(rec, err)
 		return nil, err
@@ -163,7 +163,7 @@ type StartAgentSessionRequest struct {
 // the session, ready for prompts.
 func (s *Service) StartAgentSession(ctx context.Context, c *Client, req StartAgentSessionRequest) (*core.Operation, error) {
 	rec := core.AuditRecord{ClientID: c.ID, Action: "start_agent_session", WorkspaceID: req.Workspace, Target: req.Agent, OperationID: req.OperationID}
-	w, err := s.authorize(c, req.Workspace, core.PermAgentRun)
+	w, err := s.authorize(ctx, c, req.Workspace, core.PermAgentRun)
 	a, known := s.harness[req.Agent]
 	if err == nil && (!known || !slices.Contains(w.agents, req.Agent)) {
 		err = core.Errorf(core.CodePermissionDenied, "agent %q is not allowed on workspace %q", req.Agent, req.Workspace)
@@ -202,6 +202,7 @@ func (s *Service) StartAgentSession(ctx context.Context, c *Client, req StartAge
 			s.agents.Stop(id)
 			return nil, internal(err)
 		}
+		s.reopen(ctx, req.Workspace)
 		return s.agentSession(c, id)
 	})
 }

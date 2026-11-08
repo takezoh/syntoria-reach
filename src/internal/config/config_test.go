@@ -22,9 +22,8 @@ const valid = `{
   "socket": "/run/reach.sock",
   "database": "/var/reach.db",
   "orca": ["/usr/bin/orca-ide"],
-  "projects": [{"id": "proj", "repo": "/srv/repo", "commands": ["/usr/bin/make"]}],
-  "clients": [{"id": "a", "token": "0123456789abcdef0123456789abcdef",
-               "grants": [{"project": "proj", "allow": ["workspace.create", "file.read", "command.run"]}]}]
+  "commands": ["/usr/bin/make"],
+  "clients": [{"id": "a", "token": "0123456789abcdef0123456789abcdef", "allow": ["workspace.create", "file.read", "command.run"]}]
 }`
 
 func TestLoad(t *testing.T) {
@@ -32,7 +31,7 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Projects[0].Commands[0] != "/usr/bin/make" || c.Clients[0].Grants[0].Allow[2] != core.PermCommandRun {
+	if c.Commands[0] != "/usr/bin/make" || c.Clients[0].Allow[2] != core.PermCommandRun || c.Workspaces != "/var/workspaces" {
 		t.Fatalf("got %+v", c)
 	}
 }
@@ -42,12 +41,14 @@ func TestLoadRejects(t *testing.T) {
 		t.Error("group/other readable config accepted")
 	}
 	bad := map[string]string{
-		"relative command": strings.Replace(valid, `"/usr/bin/make"`, `"make"`, 1),
-		"unknown perm":     strings.Replace(valid, `"command.run"`, `"root"`, 1),
-		"unknown project":  strings.Replace(valid, `"project": "proj"`, `"project": "x"`, 1),
-		"missing orca":     strings.Replace(valid, `"orca": ["/usr/bin/orca-ide"],`, ``, 1),
-		"short token":      strings.Replace(valid, `0123456789abcdef0123456789abcdef`, `short`, 1),
-		"relative repo":    strings.Replace(valid, `"/srv/repo"`, `"srv"`, 1),
+		"relative command":    strings.Replace(valid, `"/usr/bin/make"`, `"make"`, 1),
+		"unknown perm":        strings.Replace(valid, `"command.run"`, `"root"`, 1),
+		"missing orca":        strings.Replace(valid, `"orca": ["/usr/bin/orca-ide"],`, ``, 1),
+		"short token":         strings.Replace(valid, `0123456789abcdef0123456789abcdef`, `short`, 1),
+		"relative workspaces": strings.Replace(valid, `"socket"`, `"workspaces": "ws", "socket"`, 1),
+		// Keys of the earlier format are errors, not silently ignored.
+		"projects": strings.Replace(valid, `"socket"`, `"projects": [], "socket"`, 1),
+		"grants":   strings.Replace(valid, `"allow"`, `"grants": [], "allow"`, 1),
 	}
 	for name, body := range bad {
 		if _, err := Load(writeConfig(t, 0o600, body)); err == nil {
@@ -87,8 +88,8 @@ func TestApplyDefaults(t *testing.T) {
 	if err := c.ApplyDefaults(func(k string) string { return env[k] }, "/home/u"); err != nil {
 		t.Fatal(err)
 	}
-	if c.Socket != "/run/user/1/reach/reach.sock" || c.Database != "/home/u/.local/state/reach/reach.db" {
-		t.Fatalf("got socket=%s database=%s", c.Socket, c.Database)
+	if c.Socket != "/run/user/1/reach/reach.sock" || c.Database != "/home/u/.local/state/reach/reach.db" || c.Workspaces != "/home/u/.local/state/reach/workspaces" {
+		t.Fatalf("got socket=%s database=%s workspaces=%s", c.Socket, c.Database, c.Workspaces)
 	}
 	env["XDG_STATE_HOME"] = "/state"
 	c = &Config{Socket: "/s.sock"}

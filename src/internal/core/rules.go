@@ -8,22 +8,76 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var (
-	operationIDPattern   = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
-	workspaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	operationIDPattern     = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+	workspaceNamePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	workspaceStatusPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+)
+
+// MaxNoteLength bounds a workspace note, in characters.
+const MaxNoteLength = 2000
+
+// Workspace statuses Reach itself sets; Orca accepts others too.
+const (
+	WorkspaceInProgress = "in-progress"
+	WorkspaceCompleted  = "completed"
 )
 
 // ValidOperationID reports whether id can name an operation.
 func ValidOperationID(id string) bool { return operationIDPattern.MatchString(id) }
 
-// ValidWorkspaceName reports whether name can name a workspace (it becomes
-// the worktree and branch name).
-func ValidWorkspaceName(name string) bool { return workspaceNamePattern.MatchString(name) }
+// WorkspaceName returns the name of the Orca project for a requested
+// workspace name: WorkspacePrefix is prepended unless the name already has
+// it. It is also the name of the workspace's folder.
+func WorkspaceName(name string) (string, bool) {
+	if !strings.HasPrefix(name, WorkspacePrefix) {
+		name = WorkspacePrefix + name
+	}
+	return name, len(name) > len(WorkspacePrefix) && workspaceNamePattern.MatchString(name)
+}
+
+// IsWorkspace reports whether an Orca project is a Reach workspace.
+func IsWorkspace(r *Repo) bool { return strings.HasPrefix(r.DisplayName, WorkspacePrefix) }
+
+// NewWorkspace describes the workspace of an Orca project with its root entry
+// (nil when Orca reported none).
+func NewWorkspace(r *Repo, root *Worktree) *Workspace {
+	w := &Workspace{ID: r.ID, Name: r.DisplayName, Path: r.Path}
+	if root != nil {
+		w.Note, w.Status = root.Comment, root.WorkspaceStatus
+	}
+	return w
+}
+
+// Expired reports whether a workspace is due for cleanup: completed, idle,
+// and without activity for CleanupAfter.
+func Expired(status string, lastActivity, now time.Time, busy bool) bool {
+	return status == WorkspaceCompleted && !busy && now.Sub(lastActivity) >= CleanupAfter
+}
+
+// OwnFolder reports whether path is a folder Reach created for workspace
+// name under base, the only folders Reach ever removes.
+func OwnFolder(base, path, name string) bool {
+	return strings.HasPrefix(name, WorkspacePrefix) && filepath.IsAbs(base) && path == filepath.Join(base, name) && filepath.Base(path) == name
+}
+
+// CheckNote reports whether note can describe a workspace: not blank, at
+// most MaxNoteLength characters, without NUL bytes.
+func CheckNote(note string) error {
+	if strings.TrimSpace(note) == "" || utf8.RuneCountInString(note) > MaxNoteLength || strings.ContainsRune(note, 0) || !utf8.ValidString(note) {
+		return Errorf(CodeInvalidRequest, "note must be 1 to %d characters of text", MaxNoteLength)
+	}
+	return nil
+}
+
+// ValidWorkspaceStatus reports whether status can name an Orca workspace
+// status; Orca decides whether it exists.
+func ValidWorkspaceStatus(status string) bool { return workspaceStatusPattern.MatchString(status) }
 
 // CheckPath reports whether rel can name a file inside a workspace: a local
 // path ("." for the root) without NUL bytes. Symlinks and mount points are
@@ -114,24 +168,6 @@ func JobOutcome(e JobExit) (state, message string) {
 		return JobFailed, ""
 	}
 	return JobSucceeded, ""
-}
-
-// WorkspaceAccess reports whether a client holding perms on the workspace's
-// project may perform perm on it. Only ready workspaces of a configured
-// project are usable.
-func WorkspaceAccess(w *Workspace, projectKnown bool, perms []string, perm string) bool {
-	return projectKnown && w.State == WorkspaceReady && slices.Contains(perms, perm)
-}
-
-// Deletable decides whether a workspace may be deleted now.
-func Deletable(w *Workspace, busy bool) error {
-	switch {
-	case w.State != WorkspaceReady:
-		return Errorf(CodeInvalidState, "workspace is %s", w.State)
-	case busy:
-		return Errorf(CodeInvalidState, "workspace has running jobs or active agent sessions")
-	}
-	return nil
 }
 
 // Resumable decides whether prev may be continued by a new session in the

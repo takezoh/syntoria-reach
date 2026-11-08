@@ -29,10 +29,8 @@ func start(t *testing.T) *http.Client {
 	// The service runs on fakes: this package owns HTTP decoding, peer and
 	// token checks and error mapping, not the operations themselves.
 	svc := service.New(&config.Config{
-		Projects: []config.Project{{ID: "proj", Repo: "/repo"}},
-		Clients: []config.Client{{ID: "a", Token: token, Grants: []config.Grant{
-			{Project: "proj", Allow: []string{core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite}},
-		}}},
+		Workspaces: "/w",
+		Clients:    []config.Client{{ID: "a", Token: token, Allow: []string{core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite}}},
 	}, servicetest.New().Deps())
 	t.Cleanup(svc.Close)
 
@@ -73,7 +71,7 @@ func post(t *testing.T, c *http.Client, method, tok string, body any) (int, map[
 
 func TestLocalAPI(t *testing.T) {
 	c := start(t)
-	status, created := post(t, c, "create_workspace", token, map[string]any{"operation_id": "cw", "project": "proj", "name": "ws"})
+	status, created := post(t, c, "create_workspace", token, map[string]any{"operation_id": "cw", "name": "ws", "note": "localapi test"})
 	if status != 200 || created["state"] != "succeeded" {
 		t.Fatalf("create_workspace: %d %v", status, created)
 	}
@@ -113,7 +111,7 @@ func TestLocalAPI(t *testing.T) {
 	if status, out := post(t, c, "no_such_method", token, map[string]any{}); status != 404 {
 		t.Fatalf("unknown method: %d %v", status, out)
 	}
-	resp, err := c.Get("http://reach/v1/list_projects")
+	resp, err := c.Get("http://reach/v1/list_capabilities")
 	if err != nil {
 		t.Fatal(err)
 	}

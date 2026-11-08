@@ -13,7 +13,7 @@ import (
 
 func (f *fixture) startJob(t *testing.T, opID string) *core.Job {
 	t.Helper()
-	op, err := f.svc.StartJob(f.a, service.StartJobRequest{OperationID: opID, Workspace: f.ws, Executable: "/bin/sh", Args: []string{"-c", "x"}})
+	op, err := f.svc.StartJob(context.Background(), f.a, service.StartJobRequest{OperationID: opID, Workspace: f.ws, Executable: "/bin/sh", Args: []string{"-c", "x"}})
 	if err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("start job: %+v %v", op, err)
 	}
@@ -32,13 +32,13 @@ func (f *fixture) getJob(t *testing.T, id string) *core.Job {
 
 func TestStartJob(t *testing.T) {
 	f := newFixture(t)
-	if _, err := f.svc.StartJob(f.b, service.StartJobRequest{OperationID: "j", Workspace: f.ws, Executable: "/bin/sh"}); code(err) != core.CodePermissionDenied {
+	if _, err := f.svc.StartJob(context.Background(), f.b, service.StartJobRequest{OperationID: "j", Workspace: f.ws, Executable: "/bin/sh"}); code(err) != core.CodePermissionDenied {
 		t.Fatalf("client without command.run: %v", err)
 	}
-	if _, err := f.svc.StartJob(f.a, service.StartJobRequest{OperationID: "j", Workspace: f.ws, Executable: "/bin/bash"}); code(err) != core.CodePermissionDenied {
+	if _, err := f.svc.StartJob(context.Background(), f.a, service.StartJobRequest{OperationID: "j", Workspace: f.ws, Executable: "/bin/bash"}); code(err) != core.CodePermissionDenied {
 		t.Fatalf("executable not in allowlist: %v", err)
 	}
-	if _, err := f.svc.StartJob(f.a, service.StartJobRequest{OperationID: "j", Workspace: f.ws, Executable: "/bin/sh", TimeoutSeconds: 24*3600 + 1}); code(err) != core.CodeInvalidRequest {
+	if _, err := f.svc.StartJob(context.Background(), f.a, service.StartJobRequest{OperationID: "j", Workspace: f.ws, Executable: "/bin/sh", TimeoutSeconds: 24*3600 + 1}); code(err) != core.CodeInvalidRequest {
 		t.Fatalf("timeout out of range: %v", err)
 	}
 
@@ -94,9 +94,8 @@ func TestJobStartFailure(t *testing.T) {
 		t.Fatalf("job = %+v", j)
 	}
 	// A job that never ran does not keep the workspace busy.
-	op, err := f.svc.DeleteWorkspace(context.Background(), f.a, service.WorkspaceRequest{OperationID: "d", Workspace: f.ws})
-	if err != nil || op.State != core.StateSucceeded {
-		t.Fatalf("delete: %+v %v", op, err)
+	if busy, err := f.fakes.Store.WorkspaceBusy(f.ws); busy || err != nil {
+		t.Fatalf("busy=%v err=%v", busy, err)
 	}
 }
 
@@ -221,7 +220,7 @@ func TestStartAgentSession(t *testing.T) {
 	if err != nil || op.State != core.StateFailed || op.ErrorCode != core.CodeHarnessFailed {
 		t.Fatalf("failed start: %+v %v", op, err)
 	}
-	if failed, _ := f.fakes.Store.GetAgentSession("a", "as_3"); failed == nil || failed.State != core.SessionFailed || failed.ErrorMessage != "open session: timeout" {
+	if failed, _ := f.fakes.Store.GetAgentSession("a", "as_2"); failed == nil || failed.State != core.SessionFailed || failed.ErrorMessage != "open session: timeout" {
 		t.Fatalf("failed session = %+v", failed)
 	}
 }

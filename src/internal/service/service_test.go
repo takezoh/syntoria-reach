@@ -28,7 +28,7 @@ type fixture struct {
 	svc     *service.Service
 	fakes   *servicetest.Fakes
 	a, b, c *service.Client // a: everything; b: read only; c: agents only
-	ws      string          // a workspace of client a
+	ws      string          // a workspace, created by client a
 	root    string          // its path
 }
 
@@ -39,12 +39,12 @@ func newFixture(t *testing.T) *fixture {
 			{ID: "codex", Protocol: core.ProtocolCodex, Command: []string{"/bin/codex", "app-server"}, Env: map[string]string{"K": "V"}, Sandbox: "workspace-write"},
 			{ID: "dsh", Protocol: core.ProtocolACP, Command: []string{"/bin/dsh"}},
 		},
-		Projects: []config.Project{{ID: "proj", Repo: "/repo", Commands: []string{"/bin/sh"}, Agents: []string{"codex", "dsh"}}},
+		Workspaces: "/w",
+		Commands:   []string{"/bin/sh"},
 		Clients: []config.Client{
-			{ID: "a", Token: tokenA, Grants: []config.Grant{{Project: "proj", Allow: []string{
-				core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite, core.PermCommandRun, core.PermAgentRun}}}},
-			{ID: "b", Token: tokenB, Grants: []config.Grant{{Project: "proj", Allow: []string{core.PermWorkspaceCreate, core.PermFileRead}}}},
-			{ID: "c", Token: tokenC, Grants: []config.Grant{{Project: "proj", Allow: []string{core.PermWorkspaceCreate, core.PermAgentRun}}}},
+			{ID: "a", Token: tokenA, Allow: []string{core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite, core.PermCommandRun, core.PermAgentRun}},
+			{ID: "b", Token: tokenB, Allow: []string{core.PermWorkspaceCreate, core.PermFileRead}},
+			{ID: "c", Token: tokenC, Allow: []string{core.PermWorkspaceCreate, core.PermAgentRun}},
 		},
 	}
 	fakes := servicetest.New()
@@ -55,14 +55,14 @@ func newFixture(t *testing.T) *fixture {
 	f.b, _ = svc.Authenticate(tokenB)
 	f.c, _ = svc.Authenticate(tokenC)
 	f.ws = f.newWorkspace(t, f.a, "ws")
-	f.root = "/orca/ws"
+	f.root = "/w/reach-ws"
 	return f
 }
 
 // newWorkspace creates a workspace for c and returns its ID.
 func (f *fixture) newWorkspace(t *testing.T, c *service.Client, name string) string {
 	t.Helper()
-	op, err := f.svc.CreateWorkspace(context.Background(), c, service.CreateWorkspaceRequest{OperationID: "create-" + name, Project: "proj", Name: name})
+	op, err := f.svc.CreateWorkspace(context.Background(), c, service.CreateWorkspaceRequest{OperationID: "create-" + name, Name: name, Note: "work on " + name})
 	if err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("create workspace: %+v %v", op, err)
 	}
@@ -188,27 +188,32 @@ func TestPermissions(t *testing.T) {
 			return err
 		}, core.CodeInvalidRequest},
 		"client without file.write": {func() error {
-			_, err := f.svc.WriteFile(f.b, service.WriteFileRequest{OperationID: "x", Workspace: f.ws, Path: "f", Content: []byte("x")})
+			_, err := f.svc.WriteFile(context.Background(), f.b, service.WriteFileRequest{OperationID: "x", Workspace: f.ws, Path: "f", Content: []byte("x")})
 			return err
 		}, core.CodePermissionDenied},
 		"content too large": {func() error {
-			_, err := f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "x", Workspace: f.ws, Path: "f", Content: make([]byte, 8<<20+1)})
+			_, err := f.svc.WriteFile(context.Background(), f.a, service.WriteFileRequest{OperationID: "x", Workspace: f.ws, Path: "f", Content: make([]byte, 8<<20+1)})
 			return err
 		}, core.CodeInvalidRequest},
-		"foreign workspace": {func() error {
-			_, err := f.svc.ReadFile(f.b, service.ReadFileRequest{Workspace: f.ws, Path: "f"})
+		"client without file.read": {func() error {
+			_, err := f.svc.ReadFile(context.Background(), f.c, service.ReadFileRequest{Workspace: f.ws, Path: "f"})
 			return err
 		}, core.CodePermissionDenied},
-		"unknown workspace": {func() error {
-			_, err := f.svc.ListFiles(f.a, service.ListFilesRequest{Workspace: "nope"})
+		"workspace Orca does not have": {func() error {
+			_, err := f.svc.ListFiles(context.Background(), f.a, service.ListFilesRequest{Workspace: "nope"})
 			return err
-		}, core.CodePermissionDenied},
+		}, core.CodeNotFound},
+		"Orca project that is not a workspace": {func() error {
+			f.fakes.Orca.AddRepo(core.Repo{ID: "git-1", DisplayName: "syntoria-reach", Path: "/src/syntoria-reach", Kind: "git"})
+			_, err := f.svc.ListFiles(context.Background(), f.a, service.ListFilesRequest{Workspace: "git-1"})
+			return err
+		}, core.CodeNotFound},
 		"path outside": {func() error {
-			_, err := f.svc.ReadFile(f.a, service.ReadFileRequest{Workspace: f.ws, Path: "../x"})
+			_, err := f.svc.ReadFile(context.Background(), f.a, service.ReadFileRequest{Workspace: f.ws, Path: "../x"})
 			return err
 		}, core.CodeInvalidRequest},
 		"read limit": {func() error {
-			_, err := f.svc.ReadFile(f.a, service.ReadFileRequest{Workspace: f.ws, Path: "f", Limit: 4<<20 + 1})
+			_, err := f.svc.ReadFile(context.Background(), f.a, service.ReadFileRequest{Workspace: f.ws, Path: "f", Limit: 4<<20 + 1})
 			return err
 		}, core.CodeInvalidRequest},
 	}
@@ -231,7 +236,7 @@ func TestPermissions(t *testing.T) {
 func TestFiles(t *testing.T) {
 	f := newFixture(t)
 	req := service.WriteFileRequest{OperationID: "w1", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("one")}
-	op, err := f.svc.WriteFile(f.a, req)
+	op, err := f.svc.WriteFile(context.Background(), f.a, req)
 	if err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("op=%+v err=%v", op, err)
 	}
@@ -241,23 +246,23 @@ func TestFiles(t *testing.T) {
 	}
 
 	// Creating again without a version fails, and the failure is stored.
-	op, err = f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "w2", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("two")})
+	op, err = f.svc.WriteFile(context.Background(), f.a, service.WriteFileRequest{OperationID: "w2", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("two")})
 	if err != nil || op.State != core.StateFailed || op.ErrorCode != core.CodeVersionConflict {
 		t.Fatalf("op=%+v err=%v", op, err)
 	}
-	op, err = f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "w3", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("two"), ExpectedVersion: v1})
+	op, err = f.svc.WriteFile(context.Background(), f.a, service.WriteFileRequest{OperationID: "w3", Workspace: f.ws, Path: "dir/f.txt", Content: []byte("two"), ExpectedVersion: v1})
 	if err != nil || op.State != core.StateSucceeded {
 		t.Fatalf("op=%+v err=%v", op, err)
 	}
 
-	chunk, err := f.svc.ReadFile(f.b, service.ReadFileRequest{Workspace: f.newWorkspace(t, f.b, "b"), Path: "x"})
+	chunk, err := f.svc.ReadFile(context.Background(), f.b, service.ReadFileRequest{Workspace: f.newWorkspace(t, f.b, "b"), Path: "x"})
 	if code(err) != core.CodeNotFound || chunk != nil {
 		t.Fatalf("missing file: %+v %v", chunk, err)
 	}
-	if chunk, err = f.svc.ReadFile(f.a, service.ReadFileRequest{Workspace: f.ws, Path: "dir/f.txt"}); err != nil || string(chunk.Data) != "two" || !chunk.EOF {
+	if chunk, err = f.svc.ReadFile(context.Background(), f.a, service.ReadFileRequest{Workspace: f.ws, Path: "dir/f.txt"}); err != nil || string(chunk.Data) != "two" || !chunk.EOF {
 		t.Fatalf("read: %+v %v", chunk, err)
 	}
-	list, err := f.svc.ListFiles(f.a, service.ListFilesRequest{Workspace: f.ws})
+	list, err := f.svc.ListFiles(context.Background(), f.a, service.ListFilesRequest{Workspace: f.ws})
 	if err != nil || len(list.Entries) != 1 || list.Entries[0].Name != "dir" {
 		t.Fatalf("list: %+v %v", list, err)
 	}
@@ -273,7 +278,7 @@ func TestFiles(t *testing.T) {
 
 func TestAuditHasNoContent(t *testing.T) {
 	f := newFixture(t)
-	f.svc.WriteFile(f.a, service.WriteFileRequest{OperationID: "w1", Workspace: f.ws, Path: "f.txt", Content: []byte("TOPSECRET")})
+	f.svc.WriteFile(context.Background(), f.a, service.WriteFileRequest{OperationID: "w1", Workspace: f.ws, Path: "f.txt", Content: []byte("TOPSECRET")})
 	f.svc.RunCommand(context.Background(), f.b, service.RunCommandRequest{OperationID: "c1", Workspace: f.ws, Executable: "/bin/sh", Args: []string{"SECRET-ARG"}})
 	want := []string{"a|write_file|f.txt|ok|", "b|run_command|/bin/sh|denied|permission_denied"}
 	if got := f.audit(); strings.Join(got, "\n") != strings.Join(want, "\n") {

@@ -3,6 +3,7 @@ package servicetest
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/service"
@@ -48,52 +49,26 @@ func StoreContract(t *testing.T, open func(t *testing.T) service.Store) {
 		}
 	})
 
-	t.Run("workspaces", func(t *testing.T) {
+	t.Run("workspace use", func(t *testing.T) {
 		s := open(t)
-		for _, id := range []string{"ws_2", "ws_1"} {
-			if err := s.CreateWorkspace(&core.Workspace{ID: id, ClientID: "c", ProjectID: "p", Name: id}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := s.CreateWorkspace(&core.Workspace{ID: "ws_1", ClientID: "c"}); err == nil {
-			t.Fatal("duplicate workspace ID accepted")
-		}
-		w, err := s.GetWorkspace("c", "ws_1")
-		if err != nil || w.State != core.WorkspaceCreating || w.ProjectID != "p" || w.Name != "ws_1" {
-			t.Fatalf("get: %+v %v", w, err)
-		}
-		if _, err := s.GetWorkspace("other", "ws_1"); !errors.Is(err, core.ErrNotFound) {
-			t.Fatalf("other client: %v", err)
-		}
-		if list, _ := s.ListWorkspaces("c"); len(list) != 0 {
-			t.Fatalf("creating workspaces listed: %+v", list)
-		}
-		if ok, err := s.SetWorkspaceState("ws_1", core.WorkspaceReady, core.WorkspaceDeleting, "", "", "", ""); ok || err != nil {
-			t.Fatalf("move from a wrong state: ok=%v err=%v", ok, err)
-		}
-		for _, id := range []string{"ws_1", "ws_2"} {
-			if ok, err := s.SetWorkspaceState(id, core.WorkspaceCreating, core.WorkspaceReady, "orca-"+id, "/w/"+id, "b", ""); !ok || err != nil {
-				t.Fatalf("ready: ok=%v err=%v", ok, err)
-			}
-		}
-		// Empty orca ID, path and branch are kept; the message is replaced.
-		s.SetWorkspaceState("ws_1", core.WorkspaceReady, core.WorkspaceDeleting, "", "", "", "")
-		s.SetWorkspaceState("ws_1", core.WorkspaceDeleting, core.WorkspaceReady, "", "", "", "dirty")
-		w, _ = s.GetWorkspace("c", "ws_1")
-		if w.State != core.WorkspaceReady || w.OrcaID != "orca-ws_1" || w.Path != "/w/ws_1" || w.Branch != "b" || w.ErrorMessage != "dirty" {
-			t.Fatalf("after failed delete: %+v", w)
-		}
-		// The order of the list is not part of the contract.
-		list, err := s.ListWorkspaces("c")
-		if err != nil || len(list) != 2 || list[0].ID == list[1].ID ||
-			(list[0].ID != "ws_1" && list[0].ID != "ws_2") || (list[1].ID != "ws_1" && list[1].ID != "ws_2") {
-			t.Fatalf("list: %+v %v", list, err)
-		}
-		if list, _ := s.ListWorkspaces("other"); len(list) != 0 {
-			t.Fatalf("other client lists: %+v", list)
-		}
-		if busy, err := s.WorkspaceBusy("ws_1"); busy || err != nil {
+		if busy, err := s.WorkspaceBusy("ws"); busy || err != nil {
 			t.Fatalf("idle workspace busy=%v err=%v", busy, err)
+		}
+		if at, err := s.WorkspaceLastUsed("ws"); !at.IsZero() || err != nil {
+			t.Fatalf("unused workspace last used %v %v", at, err)
+		}
+		before := time.Now().Add(-time.Second)
+		if err := s.Audit(core.AuditRecord{ClientID: "c", Action: "read_file", WorkspaceID: "ws", Outcome: "succeeded"}); err != nil {
+			t.Fatal(err)
+		}
+		if at, err := s.WorkspaceLastUsed("ws"); at.Before(before) || err != nil {
+			t.Fatalf("after an audit record: %v %v", at, err)
+		}
+		if err := s.CreateJob(&core.Job{ID: "job_u", ClientID: "c", WorkspaceID: "other", Executable: "/bin/sh"}); err != nil {
+			t.Fatal(err)
+		}
+		if at, err := s.WorkspaceLastUsed("other"); at.Before(before) || err != nil {
+			t.Fatalf("after a job: %v %v", at, err)
 		}
 	})
 

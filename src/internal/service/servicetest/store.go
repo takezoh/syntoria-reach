@@ -23,7 +23,7 @@ type Store struct {
 	mu         sync.Mutex
 	operations map[[2]string]*core.Operation // client ID, operation ID
 	audit      []core.AuditRecord
-	workspaces map[string]*core.Workspace
+	auditAt    map[string]time.Time // workspace ID -> time of its latest audit record
 	jobs       map[string]*core.Job
 	sessions   map[string]*core.AgentSession
 	events     map[string][]core.AgentEvent
@@ -33,7 +33,7 @@ type Store struct {
 func NewStore() *Store {
 	return &Store{
 		operations: map[[2]string]*core.Operation{},
-		workspaces: map[string]*core.Workspace{},
+		auditAt:    map[string]time.Time{},
 		jobs:       map[string]*core.Job{},
 		sessions:   map[string]*core.AgentSession{},
 		events:     map[string][]core.AgentEvent{},
@@ -107,60 +107,27 @@ func (s *Store) Audit(r core.AuditRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.audit = append(s.audit, r)
+	if r.WorkspaceID != "" {
+		s.auditAt[r.WorkspaceID] = s.now()
+	}
 	return nil
 }
 
-func (s *Store) CreateWorkspace(w *core.Workspace) error {
+func (s *Store) WorkspaceLastUsed(id string) (time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.workspaces[w.ID]; ok {
-		return fmt.Errorf("workspace %s exists", w.ID)
-	}
-	now := s.now()
-	s.workspaces[w.ID] = &core.Workspace{ID: w.ID, ClientID: w.ClientID, ProjectID: w.ProjectID, Name: w.Name,
-		State: core.WorkspaceCreating, CreatedAt: now, UpdatedAt: now}
-	return nil
-}
-
-func (s *Store) SetWorkspaceState(id, from, to, orcaID, path, branch, errMessage string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	w, ok := s.workspaces[id]
-	if !ok || w.State != from {
-		return false, nil
-	}
-	w.State, w.ErrorMessage, w.UpdatedAt = to, errMessage, s.now()
-	w.OrcaID = cmp.Or(orcaID, w.OrcaID)
-	w.Path = cmp.Or(path, w.Path)
-	w.Branch = cmp.Or(branch, w.Branch)
-	return true, nil
-}
-
-func (s *Store) GetWorkspace(clientID, id string) (*core.Workspace, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	w, ok := s.workspaces[id]
-	if !ok || w.ClientID != clientID {
-		return nil, core.ErrNotFound
-	}
-	c := *w
-	return &c, nil
-}
-
-func (s *Store) ListWorkspaces(clientID string) ([]*core.Workspace, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := []*core.Workspace{}
-	for _, w := range s.workspaces {
-		if w.ClientID == clientID && w.State == core.WorkspaceReady {
-			c := *w
-			out = append(out, &c)
+	last := s.auditAt[id]
+	for _, j := range s.jobs {
+		if j.WorkspaceID == id && j.UpdatedAt.After(last) {
+			last = j.UpdatedAt
 		}
 	}
-	slices.SortFunc(out, func(a, b *core.Workspace) int {
-		return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
-	})
-	return out, nil
+	for _, a := range s.sessions {
+		if a.WorkspaceID == id && a.UpdatedAt.After(last) {
+			last = a.UpdatedAt
+		}
+	}
+	return last, nil
 }
 
 func (s *Store) WorkspaceBusy(id string) (bool, error) {

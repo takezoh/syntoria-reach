@@ -95,6 +95,8 @@ var migrations = []string{
 		created_at    INTEGER NOT NULL,
 		updated_at    INTEGER NOT NULL
 	);`,
+	// Workspaces are Orca's: Reach keeps nothing about them.
+	`DROP TABLE workspaces;`,
 }
 
 // Open opens (creating if needed) the database at path and applies migrations.
@@ -210,9 +212,9 @@ func (s *Store) GetOperation(clientID, operationID string) (*core.Operation, err
 	return op, nil
 }
 
-// MarkRunningUnknown marks operations, jobs, agent sessions and workspace
-// changes left active by a previous daemon process as unknown. Their processes died with that daemon
-// (or their fate cannot be confirmed), and they are never resumed. It must be
+// MarkRunningUnknown marks operations, jobs and agent sessions left active
+// by a previous daemon process as unknown. Their processes died with that
+// daemon (or their fate cannot be confirmed), and they are never resumed. It must be
 // called before serving requests and returns the number of records changed.
 func (s *Store) MarkRunningUnknown() (int64, error) {
 	const msg = "daemon stopped before the outcome was recorded"
@@ -222,7 +224,6 @@ func (s *Store) MarkRunningUnknown() (int64, error) {
 		`UPDATE operations SET state = 'unknown', error_code = 'result_unknown', error_message = ?, updated_at = ? WHERE state = 'running'`,
 		`UPDATE jobs SET state = 'unknown', error_message = ?, updated_at = ? WHERE state = 'running'`,
 		`UPDATE agent_sessions SET state = 'unknown', error_message = ?, updated_at = ? WHERE state IN ('starting', 'idle', 'running')`,
-		`UPDATE workspaces SET state = 'unknown', error_message = ?, updated_at = ? WHERE state IN ('creating', 'deleting')`,
 	} {
 		res, err := s.db.Exec(q, msg, now)
 		if err != nil {
