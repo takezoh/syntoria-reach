@@ -12,8 +12,7 @@ import (
 )
 
 // process is one harness child process: its process group, stdio pipes,
-// private stderr log, cancellation and one-time reaping. Ported from
-// DaVinci's execution.Process. Its lifetime is detached from any request so
+// private stderr log, cancellation and one-time reaping. Its lifetime is detached from any request so
 // protocol cleanup can still run after a caller goes away.
 type process struct {
 	cmd    *exec.Cmd

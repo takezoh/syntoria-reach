@@ -8,8 +8,7 @@ import (
 	"sync"
 )
 
-// codex speaks the Codex app-server protocol, following DaVinci's Codex
-// client. Sandboxing, model and effort are Codex's own, set in its command
+// codex speaks the Codex app-server protocol. Sandboxing, model and effort are Codex's own, set in its command
 // or configuration; approvals are disabled, so Codex never asks Reach.
 type codex struct {
 	rpc   *rpc
@@ -164,7 +163,7 @@ func (c *codex) next(ctx context.Context) (message, error) {
 }
 
 // close interrupts a running turn, unsubscribes from the thread and closes
-// the harness input, as DaVinci's Codex client does.
+// the harness input.
 func (c *codex) close(ctx context.Context) error {
 	c.mu.Lock()
 	thread, turn := c.thread, c.turn

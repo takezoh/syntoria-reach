@@ -189,8 +189,8 @@ func fakeACP() {
 	}
 }
 
-// fakeClaude follows the stream-json exchange DaVinci's Claude client relies
-// on: initialize control request, system/init with the session from
+// fakeClaude follows the stream-json exchange the claude client relies on:
+// initialize control request, system/init with the session from
 // --session-id, then one result per user message.
 func fakeClaude() {
 	session := ""

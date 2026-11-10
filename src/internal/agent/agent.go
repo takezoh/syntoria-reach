@@ -1,8 +1,7 @@
 // Package agent runs agents as processes of the daemon, for local
 // workspaces: Codex (app-server), Claude Code (stream-json) and ACP agents
-// such as DSH. The protocol clients and the process handling are ported
-// from DaVinci's agent adapters and execution package, without DaVinci's
-// prompts and output contracts. A runtime keeps its sessions in memory: the
+// such as DSH. Reach only relays prompts and replies; prompts and output
+// contracts are the caller's. A runtime keeps its sessions in memory: the
 // agents are children of the daemon and end with it. A session runs one
 // turn at a time and keeps the agent's last message of the turn. The agent
 // sandboxes its own tools.

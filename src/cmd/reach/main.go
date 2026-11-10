@@ -61,6 +61,25 @@ func run() error {
 	d, agents := deps(cfg, st)
 	svc := service.New(cfg, d)
 	defer svc.Close()
+	controllerSpecs := make([]remote.ControllerSpec, 0, len(cfg.Controllers))
+	clientTokens := make(map[string]string, len(cfg.Clients))
+	for _, cl := range cfg.Clients {
+		clientTokens[cl.ID] = cl.Token
+	}
+	for _, ctl := range cfg.Controllers {
+		controllerSpecs = append(controllerSpecs, remote.ControllerSpec{ID: ctl.ID, Role: ctl.Role, Command: ctl.Command, URL: ctl.URL, Client: ctl.Client})
+	}
+	var controllerAllow []string
+	if cfg.Remote != nil {
+		for _, cl := range cfg.Clients {
+			if cl.ID == cfg.Remote.Client {
+				controllerAllow = cl.Allow
+				break
+			}
+		}
+	}
+	controllers := remote.NewControllerManager(controllerSpecs, controllerAllow)
+	defer controllers.Close()
 	if agents != nil {
 		defer agents.Close() // the agents of local workspaces end with the daemon
 	}
@@ -76,6 +95,10 @@ func run() error {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(l) }()
 	slog.Info("reach listening", "socket", cfg.Socket, "workspaces", backendName(cfg))
+	// The local API must accept the Controller's bootstrap check before MCP
+	// initialize completes; a stdio Controller may perform that check while
+	// answering initialize.
+	controllers.StartControllers(ctx, cfg.Socket, clientTokens)
 
 	go cleanup(ctx, svc)
 
@@ -86,6 +109,9 @@ func run() error {
 			return errors.New("remote: unknown client " + r.Client) // config.Validate rules this out
 		}
 		c := &remote.Connector{URL: r.URL, Token: r.Token, Handler: func(ctx context.Context, method string, params []byte) (any, error) {
+			if method == "list_controllers" || method == "list_controller_tools" || method == "call_controller_tool" {
+				return controllers.Handle(ctx, method, params)
+			}
 			return api.Call(ctx, svc, client, method, params)
 		}}
 		go func() { c.Run(ctx); close(connector) }()

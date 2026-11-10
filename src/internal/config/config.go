@@ -23,14 +23,25 @@ import (
 // terminals; without it, workspaces are local folders Reach records itself
 // and agents run as processes of the daemon.
 type Config struct {
-	Socket     string   `json:"socket"`
-	Database   string   `json:"database"`
-	Workspaces string   `json:"workspaces"` // folder of the workspace folders Reach creates
-	Orca       []string `json:"orca"`       // Orca CLI command; Command[0] is absolute
-	Agents     []Agent  `json:"agents"`
-	Commands   []string `json:"commands"` // absolute paths of the executables run_command and start_job may run
-	Clients    []Client `json:"clients"`
-	Remote     *Remote  `json:"remote"`
+	Socket      string       `json:"socket"`
+	Database    string       `json:"database"`
+	Workspaces  string       `json:"workspaces"` // folder of the workspace folders Reach creates
+	Orca        []string     `json:"orca"`       // Orca CLI command; Command[0] is absolute
+	Agents      []Agent      `json:"agents"`
+	Commands    []string     `json:"commands"` // absolute paths of the executables run_command and start_job may run
+	Clients     []Client     `json:"clients"`
+	Controllers []Controller `json:"controllers"`
+	Remote      *Remote      `json:"remote"`
+}
+
+// Controller is an MCP server owned by this node. Exactly one transport is
+// configured; Client identifies the local API principal made available to it.
+type Controller struct {
+	ID      string   `json:"id"`
+	Role    string   `json:"role"`
+	Command []string `json:"command,omitempty"`
+	URL     string   `json:"url,omitempty"`
+	Client  string   `json:"client"`
 }
 
 // Remote connects the daemon to the Reach gateway (Cloudflare) so that remote
@@ -146,12 +157,14 @@ func (c *Config) Validate() error {
 		}
 	}
 	clients := map[string]bool{}
+	clientTokens := map[string]string{}
 	tokens := map[string]bool{}
 	for _, cl := range c.Clients {
 		if cl.ID == "" || clients[cl.ID] {
 			return fmt.Errorf("client id %q is empty or duplicated", cl.ID)
 		}
 		clients[cl.ID] = true
+		clientTokens[cl.ID] = cl.Token
 		if len(cl.Token) < 32 {
 			return fmt.Errorf("client %s: token must be at least 32 characters", cl.ID)
 		}
@@ -163,8 +176,39 @@ func (c *Config) Validate() error {
 			switch p {
 			case core.PermWorkspaceCreate, core.PermFileRead, core.PermFileWrite, core.PermCommandRun, core.PermAgentRun:
 			default:
-				return fmt.Errorf("client %s: unknown permission %q", cl.ID, p)
+				if !(strings.HasPrefix(p, core.PermControllerPrefix) && len(p) > len(core.PermControllerPrefix)) &&
+					!(strings.HasPrefix(p, core.PermControllerToolPrefix) && len(p) > len(core.PermControllerToolPrefix)) {
+					return fmt.Errorf("client %s: unknown permission %q", cl.ID, p)
+				}
 			}
+		}
+	}
+	controllers := map[string]bool{}
+	for _, ctl := range c.Controllers {
+		if ctl.ID == "" || controllers[ctl.ID] {
+			return fmt.Errorf("controller id %q is empty or duplicated", ctl.ID)
+		}
+		controllers[ctl.ID] = true
+		if strings.TrimSpace(ctl.Role) == "" {
+			return fmt.Errorf("controller %s: role must not be empty", ctl.ID)
+		}
+		if (len(ctl.Command) > 0) == (ctl.URL != "") {
+			return fmt.Errorf("controller %s: set exactly one of command or url", ctl.ID)
+		}
+		if len(ctl.Command) > 0 && (!filepath.IsAbs(ctl.Command[0]) || ctl.Command[0] == "") {
+			return fmt.Errorf("controller %s: command must start with an absolute path", ctl.ID)
+		}
+		if ctl.URL != "" {
+			u, err := url.Parse(ctl.URL)
+			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				return fmt.Errorf("controller %s: url must be an absolute http(s) URL", ctl.ID)
+			}
+		}
+		if !clients[ctl.Client] {
+			return fmt.Errorf("controller %s: unknown client %q", ctl.ID, ctl.Client)
+		}
+		if clientTokens[ctl.Client] == "" {
+			return fmt.Errorf("controller %s: client %q has no token", ctl.ID, ctl.Client)
 		}
 	}
 	if r := c.Remote; r != nil {

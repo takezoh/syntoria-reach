@@ -12,14 +12,35 @@ import (
 	"time"
 )
 
+// ControllerPermission grants all tools of one Controller. Tool names and
+// IDs are quoted so separators in either value cannot widen another grant.
+func permissionQuote(value string) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func ControllerPermission(id string) string { return PermControllerPrefix + permissionQuote(id) }
+
+// ControllerToolPermission grants one exact Controller tool.
+func ControllerToolPermission(id, tool string) string {
+	return PermControllerToolPrefix + permissionQuote(id) + ":" + permissionQuote(tool)
+}
+
+// ControllerToolPermissionPrefix is the exact prefix for grants naming id.
+func ControllerToolPermissionPrefix(id string) string {
+	return PermControllerToolPrefix + permissionQuote(id) + ":"
+}
+
 // Permissions a client can be granted. They apply to every workspace;
 // workspace.create lets the client create and update workspaces.
 const (
-	PermWorkspaceCreate = "workspace.create"
-	PermFileRead        = "file.read"
-	PermFileWrite       = "file.write"
-	PermCommandRun      = "command.run" // run_command and jobs
-	PermAgentRun        = "agent.run"
+	PermWorkspaceCreate      = "workspace.create"
+	PermFileRead             = "file.read"
+	PermFileWrite            = "file.write"
+	PermCommandRun           = "command.run" // run_command and jobs
+	PermAgentRun             = "agent.run"
+	PermControllerPrefix     = "controller:"
+	PermControllerToolPrefix = "controller-tool:"
 )
 
 // Error classes returned to callers.
@@ -34,6 +55,7 @@ const (
 	CodeHarnessFailed     = "harness_unavailable"
 	CodeOrcaFailed        = "orca_failed"
 	CodeResultUnknown     = "result_unknown"
+	CodeControllerError   = "controller_error"
 	CodeInternal          = "internal"
 )
 

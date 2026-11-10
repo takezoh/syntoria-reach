@@ -22,14 +22,20 @@ export function failure(code: string, message: string): Reply {
   return { error: { code, message } };
 }
 
-export function unknownOutcome(why: string): Reply {
+export function unknownOutcome(why: string, method?: string): Reply {
+  if (method === "call_controller_tool") {
+    return failure(
+      "result_unknown",
+      `${why}. The Controller call may have run: Reach keeps no receipt of it, so check its effect with the Controller's own tools before calling it again.`,
+    );
+  }
   return failure(
     "result_unknown",
     `${why}. The request may or may not have run: check it with get_operation, or resend it with the same operation_id.`,
   );
 }
 
-type Pending = { ws: WebSocket; resolve: (reply: Reply) => void; timer: ReturnType<typeof setTimeout> };
+type Pending = { ws: WebSocket; method: string; resolve: (reply: Reply) => void; timer: ReturnType<typeof setTimeout> };
 
 export class NodeBroker extends DurableObject<Env> {
   private pending = new Map<string, Pending>();
@@ -62,8 +68,8 @@ export class NodeBroker extends DurableObject<Env> {
     }
     const id = crypto.randomUUID();
     const reply = new Promise<Reply>((resolve) => {
-      const timer = setTimeout(() => this.settle(id, unknownOutcome("The node did not answer in time")), REPLY_TIMEOUT_MS);
-      this.pending.set(id, { ws, resolve, timer });
+      const timer = setTimeout(() => this.settle(id, unknownOutcome("The node did not answer in time", method)), REPLY_TIMEOUT_MS);
+      this.pending.set(id, { ws, method, resolve, timer });
     });
     try {
       ws.send(JSON.stringify({ id, method, params }));
@@ -102,7 +108,7 @@ export class NodeBroker extends DurableObject<Env> {
   // node may have run them.
   private dropped(ws: WebSocket): void {
     for (const [id, p] of this.pending) {
-      if (p.ws === ws) this.settle(id, unknownOutcome("The connection to the node closed before it answered"));
+      if (p.ws === ws) this.settle(id, unknownOutcome("The connection to the node closed before it answered", p.method));
     }
   }
 

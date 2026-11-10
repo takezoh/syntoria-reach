@@ -114,6 +114,39 @@ func TestRemote(t *testing.T) {
 	}
 }
 
+func TestControllers(t *testing.T) {
+	base := valid
+	with := func(controller string) string {
+		return strings.Replace(base, `"orca"`, `"controllers": `+controller+`, "orca"`, 1)
+	}
+	for _, raw := range []string{
+		`[{"id":"stdio","role":"Runs workflows","command":["/usr/bin/workflow","mcp"],"client":"a"}]`,
+		`[{"id":"http","role":"Resident service","url":"http://127.0.0.1:8000/mcp","client":"a"}]`,
+	} {
+		if _, err := Load(writeConfig(t, 0o600, with(raw))); err != nil {
+			t.Errorf("valid controller: %v", err)
+		}
+	}
+	granted := strings.Replace(valid, `"command.run"]`, `"command.run", "controller:\"stdio\"", "controller-tool:\"stdio\":\"do_work\""]`, 1)
+	granted = strings.Replace(granted, `"orca":`, `"controllers": [{"id":"stdio","role":"Runs workflows","command":["/usr/bin/workflow","mcp"],"client":"a"}], "orca":`, 1)
+	if _, err := Load(writeConfig(t, 0o600, granted)); err != nil {
+		t.Fatalf("valid Controller grants: %v", err)
+	}
+	for name, raw := range map[string]string{
+		"duplicate id":      `[{"id":"x","role":"A","command":["/bin/a"],"client":"a"},{"id":"x","role":"B","url":"http://localhost/mcp","client":"a"}]`,
+		"missing client":    `[{"id":"x","role":"A","command":["/bin/a"],"client":"missing"}]`,
+		"missing transport": `[{"id":"x","role":"A","client":"a"}]`,
+		"both transports":   `[{"id":"x","role":"A","command":["/bin/a"],"url":"http://localhost/mcp","client":"a"}]`,
+		"relative command":  `[{"id":"x","role":"A","command":["workflow"],"client":"a"}]`,
+		"invalid url":       `[{"id":"x","role":"A","url":"file:///tmp/x","client":"a"}]`,
+		"empty role":        `[{"id":"x","role":" ","command":["/bin/a"],"client":"a"}]`,
+	} {
+		if _, err := Load(writeConfig(t, 0o600, with(raw))); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
 func TestApplyDefaults(t *testing.T) {
 	env := map[string]string{"XDG_RUNTIME_DIR": "/run/user/1"}
 	c := &Config{}

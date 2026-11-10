@@ -13,7 +13,7 @@ Syntoria Reach is an independent service that lets ChatGPT, Claude, Codex, and o
 
 The AI decides and plans. Reach provides connectivity, access control, operations, execution state, results, and audit information. Embedding an LLM in Reach is not a base requirement.
 
-**The first full-scale client service is DaVinci.** DaVinci directs the development process and agents, and Reach serves as its Linux execution runtime. Reach is not an internal component of DaVinci; it is an independent service that other AIs can use on their own.
+**Reach is an execution environment and an interface to agents.** Programs that drive agents, **Controllers** such as a development workflow, run on top of it: Reach starts them and lets remote AIs call their tools, and they use the node's workspaces and agents through Reach. Reach does not know what a Controller does, and AIs can use Reach on their own.
 
 ## 2. Value for people
 
@@ -23,7 +23,7 @@ The AI decides and plans. Reach provides connectivity, access control, operation
 | Using the existing environment | Let AI use repositories, files, tools, and private environments without relocating them |
 | Switching AIs | Reuse the execution environment when moving from ChatGPT to another MCP client |
 | Long-running work | Keep already-running jobs when the connection drops, and query their state, logs, and results later |
-| Autonomous development | DaVinci safely runs multiple agents, builds, and verifications on Reach's execution environment, while the development process stays managed by DaVinci |
+| Autonomous work | A Controller runs multiple agents, builds, and verifications on Reach's execution environment, while its own process and judgment of results stay with the Controller |
 | Safe delegation | Configure targets, workspaces, and permissions per AI, and trace what was done |
 
 The goal is to reduce the effort of remotely operating one's own environment and the effort of relocating or reconfiguring environments so that AI can work in them.
@@ -50,13 +50,12 @@ The goal is to reduce the effort of remotely operating one's own environment and
 
 If the target node is offline, Reach reports it as unavailable. In the MVP, requests are not automatically held or accumulated and later executed on their own.
 
-### Case D: DaVinci's execution runtime
+### Case D: A Controller's execution environment
 
-1. DaVinci decides the work from the issue's goal and chooses the workspace purpose and which Codex / Claude Code / DSH etc. to run.
-2. DaVinci asks Reach's local API to start an agent session, and Reach starts the agent (for example Claude Code) in an Orca terminal of the workspace, where the user can watch it, or, on a node without Orca, as its own process; the agent sandboxes its own tools.
-3. DaVinci sends prompts and judges the meaning of each turn's result. Reach delivers turns, records the agent's events, and tracks process and job state.
-4. DaVinci binds Reach's agent session / job IDs to its own run, supervises progress, and receives verification results.
-5. When DaVinci restarts, it re-fetches Reach's current state and checks for unknown exits and unknown prompt delivery before continuing. DaVinci decides completion of the original issue and PR submission.
+1. A remote AI chooses a node and a Controller by its role and calls one of the Controller's tools; Reach forwards the call to the Controller it runs on that node.
+2. The Controller creates a workspace for its work and asks Reach's local API to start an agent session there. Reach starts the agent (for example Claude Code) in an Orca terminal of the workspace, where the user can watch it, or, on a node without Orca, as its own process; the agent sandboxes its own tools.
+3. The Controller sends prompts and judges the meaning of each turn's result. Reach delivers the prompts, reports the agent's state and reply, and tracks process and job state.
+4. The Controller binds Reach's workspace, agent session and job IDs to its own work. When it restarts, it re-reads Reach's current state and reconciles unknown prompt delivery before continuing. The Controller decides when its work is done.
 
 ## 4. Capabilities
 
@@ -84,7 +83,8 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 - **Client / Connection**: an authenticated AI client and its connection.
 - **Operation**: an individual operation request. It has a unique identifier used to detect resends and duplicates.
 - **Job**: an asynchronous execution and its state, independent of the communication session.
-- **Agent**: an agent a node may run, such as a coding agent or DaVinci, registered with its role: what it is for, by which an AI chooses it.
+- **Agent**: an agent a node may run, such as a coding agent or a reviewer, registered with its role: what it is for, by which an AI chooses it.
+- **Controller**: a program a node runs, or connects to, as an MCP server for remote callers, registered with its role; it drives agents through Reach's local API.
 - **Agent Session**: an agent running in a workspace (in an Orca terminal, or as Reach's process), which a caller prompts and whose replies it reads through Reach. Distinct from MCP sessions and from a caller's own run.
 - **Artifact**: a reference to output logs or generated files.
 - **Permission**: a definition of what is allowed for an actor, target, and operation.
@@ -104,20 +104,18 @@ When Reach is used based on an action approved in Weave, the AI / orchestrator /
 
 A Reach job completing does not mean a Weave action has completed. The calling side owns that judgment and its reflection.
 
-### Division of responsibilities with DaVinci
+### Division of responsibilities with Controllers
 
-| Item | Reach | DaVinci |
+| Item | Reach | Controller |
 | --- | --- | --- |
-| Linux processes / jobs | Launch, isolation, state, stop / reconnect / logs | Instructions, interpretation of results |
-| Agent sessions | Starting the agent in an Orca terminal, relaying prompts, reading its terminal output through Orca, stopping it | Prompts, output contracts, judging turn results |
-| Workspace | Permitted areas and runtime mount / path restrictions | Work targets; meaning and management of clones, branches, and results |
-| Authorization | Final enforcement for node / workspace / capability / operation | Managing development requests, execution purposes, and assignees |
-| Development runs | Only the execution facts of jobs / agent sessions | Runs / attempts, issues, sub-issues, PRs, verification and acceptance |
-| Cloud connection | Generic MCP / node transport | DaVinci-specific dashboard, issue projection, reporting |
+| Linux processes / jobs | Launch, state, stop / reconnect / logs | Instructions, interpretation of results |
+| Agent sessions | Starting the agent (in an Orca terminal or as its process), relaying prompts, reporting its state and reply, stopping it | Prompts, output contracts, judging turn results |
+| Workspace | Creating workspaces; permitted paths | What to work on in them; the meaning of their contents |
+| Authorization | Final enforcement for node / workspace / capability / operation, and which callers may call which Controller tools | Its own requests and their purposes |
+| Work state | Only the execution facts of operations, jobs and agent sessions | Its own units of work, results and acceptance |
+| Remote connection | Generic MCP / node transport, forwarding calls to Controller tools | What its tools do |
 
-A DaVinci run and a Reach job are separate entities; one run can use multiple Reach jobs / agent sessions. DaVinci becomes a client service that delegates Linux execution to Reach, but Reach itself works without knowing about DaVinci. The existing DaVinci runtime environment is kept until verification and migration are complete.
-
-[DaVinci integration](docs/davinci-execution-integration.md)
+A Controller's unit of work and a Reach job are separate entities; one unit of work can use multiple Reach jobs and agent sessions. Reach works without knowing what any Controller does.
 
 ## 7. Remote delivery (adopted: Option B)
 
@@ -145,7 +143,7 @@ Target: **Linux with systemd, one user, one or more nodes.** The minimum Linux d
 
 In the MVP, an MCP client connecting from the cloud can perform file operations and run commands in permitted Linux workspaces. Long-running work becomes jobs and is still managed on Linux after the MCP connection drops. Completion criteria: duplicate execution is prevented by operation ID, access outside permissions is denied, offline state is reported explicitly, and history and results can be retrieved again.
 
-**Additional MVP acceptance criteria: agent sessions and real use by DaVinci.** DaVinci, connected locally, can start agents such as Codex through Reach, run multiple turns in one session, and handle stop, reconnection, and events. An E2E verification is performed that keeps DaVinci's existing run / verification / PR contracts. Completing the migration of DaVinci's production environment itself is a separate, staged cutover acceptance.
+**Additional MVP acceptance criteria: agent sessions and Controllers.** A Controller, connected locally, can create workspaces, start agents such as Codex through Reach, run multiple turns in one session, and handle stop and reconnection; remote AIs can call its tools through the gateway within the permissions of the remote client.
 
 ## 10. Non-goals and evaluation
 
@@ -153,4 +151,4 @@ The initial release does not cover general-purpose AI agent orchestration, LLM h
 
 Metrics: execution success rate, unknown-result rate, job reconciliation success rate after disconnects, prevention of duplicate execution, accuracy of permission denials, manual effort required from the user, and compatibility across different AI clients.
 
-Related: [README](README.md) / [Technical Architecture](ARCHITECTURE.md) / [DaVinci Integration](docs/davinci-execution-integration.md)
+Related: [README](README.md) / [Technical Architecture](ARCHITECTURE.md)

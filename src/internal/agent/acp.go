@@ -9,10 +9,10 @@ import (
 	"sync"
 )
 
-// acp speaks the Agent Client Protocol (v1), following DaVinci's DSH client,
-// as a client that offers no file system or terminal capabilities: the agent
-// uses its own tools and sandbox. Permission requests are cancelled, as
-// DaVinci does: what the agent may do is its own policy's to allow.
+// acp speaks the Agent Client Protocol (v1) as a client that offers no file
+// system or terminal capabilities: the agent uses its own tools and sandbox.
+// Permission requests are cancelled: what the agent may do is its own
+// policy's to allow.
 type acp struct {
 	rpc      *rpc
 	closeCap bool

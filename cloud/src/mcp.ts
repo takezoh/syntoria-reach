@@ -21,7 +21,7 @@ Keep the note current with update_workspace as the work moves on. When the work 
 
 To have an agent do a task in a workspace: start_agent_session with the workspace and one of the node's agents; on a node with the Orca server, the agent runs in a terminal of the workspace there, where the user can watch it, and otherwise as a process on the node. send_agent_prompt with the task, then call read_agent_output until state is "idle": the agent has finished its turn, and reply is its last message of the turn. A reply may be cut off (on Orca after 8,000 characters): reply_truncated says so, so ask the agent for the rest or a shorter answer. Send the next prompt to the same session for a follow-up, and stop_agent_session when done, which ends the agent and the session; a session outlives a disconnect, so get_agent_session tells whether it is still there. If state is "waiting_on_human", the agent asks the user something in Orca, such as a permission: tell the user, and wait.
 
-Tools that change something take an operation_id that you choose, unique per action (for example "create-ws-docs-1"). If a call fails with result_unknown, the request may have run: call get_operation on the same node with the same operation_id, or resend the same call with the same operation_id. Never retry with a new operation_id. node_offline means the node is not connected and nothing ran.`;
+Tools that change something take an operation_id that you choose, unique per action (for example "create-ws-docs-1"). If a Reach operation fails with result_unknown, it may have run: call get_operation on the same node with the same operation_id, or resend the same call with that ID. For call_controller_tool, Reach keeps no receipt and get_operation does not apply: after result_unknown, check the call's effect with the Controller's own tools before calling it again. node_offline means the node is not connected and nothing ran.`;
 
 const node = z.string().min(1).describe("Node ID from list_nodes.");
 const operationId = z.string().min(1).max(128).describe("An ID you choose, unique per action. Resending the same call with the same ID never runs it twice.");
@@ -33,6 +33,24 @@ type Shape = Record<string, z.ZodType>;
 
 // The tools that forward a Reach method to a node; each also takes `node`.
 const nodeTools: { name: string; description: string; input: Shape; readOnly: boolean }[] = [
+  {
+    name: "list_controllers",
+    description: "Controllers registered on this node, with each ID and role.",
+    input: {},
+    readOnly: true,
+  },
+  {
+    name: "list_controller_tools",
+    description: "The MCP tools exposed by one Controller on this node.",
+    input: { controller: z.string().min(1) },
+    readOnly: true,
+  },
+  {
+    name: "call_controller_tool",
+    description: "Calls a tool on one Controller on this node. A result_unknown means it may have run; check its effect with the Controller's own tools before calling it again.",
+    input: { controller: z.string().min(1), tool: z.string().min(1), arguments: z.record(z.string(), z.unknown()).default({}) },
+    readOnly: false,
+  },
   {
     name: "list_capabilities",
     description: "Your permissions on the node, and the commands and agents (with their roles) you may run in its workspaces.",
@@ -136,7 +154,7 @@ async function call(env: Env, node: string, method: string, params: Record<strin
   try {
     return await nodeBroker(env, node).call(method, params);
   } catch {
-    return unknownOutcome("The gateway lost the request");
+    return unknownOutcome("The gateway lost the request", method);
   }
 }
 

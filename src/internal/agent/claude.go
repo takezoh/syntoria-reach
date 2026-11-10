@@ -12,8 +12,7 @@ import (
 )
 
 // claude drives Claude Code's stream-json interface (`claude --print
-// --input-format stream-json --output-format stream-json`). Ported from
-// DaVinci's claude.Client without its DaVinci-specific checks. Claude Code's
+// --input-format stream-json --output-format stream-json`). Claude Code's
 // own model, effort, permission mode and sandbox settings apply; they are
 // part of the configured command.
 type claude struct {

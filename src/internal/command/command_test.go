@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,31 @@ func TestRunNoShellExpansionAndEnv(t *testing.T) {
 	})
 	if s := string(res.Stdout); strings.Contains(s, "REACH_TEST_SECRET") {
 		t.Fatalf("daemon environment leaked: %s", s)
+	}
+}
+
+// Commands and jobs (both use Env(nil)) get exactly PATH, LANG and HOME, and
+// none of the daemon's environment, such as a token handed to a Controller.
+func TestRunEnvIsOnlyPathLangHome(t *testing.T) {
+	t.Setenv("REACH_TOKEN", "token-sentinel")
+	res, err := Run(context.Background(), core.CommandSpec{
+		Executable: "/usr/bin/env", Dir: t.TempDir(), Timeout: 10 * time.Second, OutputLimit: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(res.Stdout)
+	if strings.Contains(out, "token-sentinel") {
+		t.Fatalf("daemon environment leaked: %s", out)
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		name, _, _ := strings.Cut(line, "=")
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != "HOME,LANG,PATH" {
+		t.Fatalf("got environment %q, want only HOME, LANG and PATH", names)
 	}
 }
 
