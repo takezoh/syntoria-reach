@@ -1,0 +1,39 @@
+# Allowed lifecycle transitions for structured development records.
+# Empty arrays mark terminal states. Update the matching schema when adding states.
+
+adr:
+  proposed:   [accepted, rejected]
+  accepted:   [deprecated, superseded]
+  rejected:   []
+  deprecated: []
+  superseded: []
+
+change:
+  draft:     [ready, abandoned]
+  ready:     [active, abandoned]
+  active:    [closing, abandoned]
+  closing:   [active, done, abandoned]
+  done:      []
+  abandoned: []
+
+task:
+  todo:        [in_progress, blocked, cancelled]
+  in_progress: [blocked, done, cancelled]
+  blocked:     [todo, in_progress, cancelled]
+  done:        []
+  cancelled:   []
+
+note:
+  draft:     [published, archived]
+  published: [archived]
+  archived:  []
+
+issue:
+  open:     [done, rejected]
+  done:     []
+  rejected: []
+
+design:
+  active:     [deprecated, superseded]
+  deprecated: []
+  superseded: []

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-module.local/docs/adr.schema.json",
+  "title": "Architecture Decision Record (Nygard-style skeleton with frontmatter)",
+  "allOf": [
+    {
+      "$ref": "_common.schema.json"
+    }
+  ],
+  "type": "object",
+  "unevaluatedProperties": false,
+  "required": [
+    "decision_makers"
+  ],
+  "properties": {
+    "kind": {
+      "const": "adr"
+    },
+    "status": {
+      "enum": [
+        "proposed",
+        "accepted",
+        "rejected",
+        "deprecated",
+        "superseded"
+      ]
+    },
+    "decision_makers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "consulted": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "informed": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "consequences": {
+      "description": "Record positive, negative and neutral consequences in the Nygard format. Validation does not depend on ADR creation dates or edit history.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "positive",
+        "negative",
+        "neutral"
+      ],
+      "properties": {
+        "positive": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "Desirable consequences of adoption"
+        },
+        "negative": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "Undesirable consequences of adoption"
+        },
+        "neutral": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "Neutral consequences of adoption"
+        }
+      }
+    },
+    "confirmation": {
+      "type": "string",
+      "description": "spec-detail (2026-07-09): Optional, derived from MADR. Declare a fitness function, search or test that checks adherence to this decision. The source of truth is artifacts/architecture-contract/semantics.md section 18."
+    },
+    "decision_bindings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Project-root-relative files constrained by this decision at runtime. For an accepted ADR, each file must explicitly name the ADR ID in decision_ref or a comment and be included in source_paths."
+    }
+  }
+}

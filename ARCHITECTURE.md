@@ -240,15 +240,16 @@ Initial target: Linux with systemd, single user, one or more nodes.
 
 ### Cloud MCP
 
-Verify external clients' OAuth/OIDC authentication and the binding between Reach users, clients, and nodes. Syntoria Gate can be used as the issuer, but it is not a required runtime dependency of the Reach core. Token issuer / audience / expiry / scopes etc. are verified, and users and nodes are never determined from unverified request parameters.
+The remote entry point uses Cloudflare Access Managed OAuth. Access owns client registration, login, OAuth token exchange and policy evaluation; the Worker owns validation of the authenticated assertion and node routing. No MCP Server Portal is required.
 
-**Implemented so far (one user, multiple nodes).** The gateway is a resource server of Syntoria Gate and holds no OAuth state.
-- **Clients and approval**: MCP hosts register with Gate dynamically and get Gate's opaque access tokens after the person signs in with GitHub and approves the connection. The gateway's protected-resource metadata names Gate as the authorization server.
-- **Tokens**: every MCP request's token is introspected at Gate with the gateway's resource client credentials, and nothing is cached. The issuer, the audience (the gateway's MCP URL, a resource registered in Gate under its cookie parent), the expiry, Gate's approval and the client are checked, using the bearer verification of Gate's SDK. An invalid token is 401; Gate being unreachable is 503, never a sign-out.
-- **Admission**: only the configured subject (`OWNER_SUBJECT`, `github:<ID>`) is admitted. Any other is 403.
-- **Nodes**: the Worker secret `NODES` registers them, a JSON object of node IDs (letters, digits and `._-`, at most 64) and their tokens (at least 32 characters, one per node). A daemon authenticates with its node's token only; the gateway compares it with every node's token in constant time and gives the connection to that node's broker. The gateway refuses connections and MCP requests while `NODES` is missing or malformed.
-- **Authorization on Linux**: every remote request acts as the one Reach client named in the receiving daemon's `remote` config, and that daemon authorizes it with that client's permissions. The gateway asserts no other identity, and a node's agents in `list_nodes` are what that client may start.
-- **Revocation**: revoking a connection on Gate's `/connections` stops it at its next request. Removing a node's `remote`, or its entry or token in `NODES`, cuts that node off.
+**Implemented (one user, multiple nodes).**
+- **Assertions**: every MCP request must carry `Cf-Access-Jwt-Assertion`. `cloud/src/access.ts` verifies RS256 signatures using the configured issuer's `/cdn-cgi/access/certs`, exact issuer, the MCP application's audience, required expiry and issued-at claims, and the configured owner's email. It ignores client identity and does not accept bearer tokens or browser cookies as a substitute at the origin.
+- **Admission**: `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` and `ACCESS_OWNER_EMAIL` identify the issuer, MCP application and owner email. Another authenticated email or an assertion without a nonempty user subject is 403; missing or invalid credentials are 401. Missing configuration or unavailable signing keys are 503. Signing keys are cached with the verifier library's bounded lifetime; assertion outcomes are not cached.
+- **Edge boundary**: configure Access on `/mcp` only and enable Managed OAuth. Access supplies discovery and authentication challenges before origin requests. The Worker has no Gate protected-resource metadata. Alternative Worker URLs remain disabled. Protecting the whole hostname with interactive OAuth would break node connectivity.
+- **Nodes**: `NODES` registers node IDs and their existing tokens. `/connect` independently authenticates each daemon with its node token and binds it to its own broker. This channel does not use Access user login. Missing or malformed `NODES` fails closed.
+- **Authorization on Linux**: every remote request acts as the receiving daemon's `remote.client`; Linux still enforces that client's permissions. Neither the node mapping nor permissions change in this authentication migration.
+- **Revocation**: Access policies and token lifetimes replace Gate's immediate per-request connection checks. Issued credentials can remain usable until expiry. Removing or rotating node credentials remains a separate operation. No per-AI identity or connection revocation is implemented in Reach.
+- **Sessions**: long-running work remains on Linux. Clients poll `read_agent_output`; MCP Events is not implemented by this change. Local workerd tests do not prove hosted Claude or ChatGPT OAuth acceptance.
 
 ### Linux runtime
 
@@ -269,7 +270,7 @@ Record the operation ID, authenticated principal, node, workspace, operation typ
 | Daemon memory | Agent sessions of local workspaces (their processes are the daemon's children) | **Source of truth for local agent sessions**; lost, with the agents, when the daemon stops |
 | Linux files | Job stdout / stderr | **Source of truth for the actual data** |
 | Durable Object | One per node: its WebSocket connection identifiers, minimal node connection metadata | For communication control. Not a source of truth for jobs |
-| Worker secrets | `NODES`: the node IDs and their tokens; Gate's settings | Node registry and credentials |
+| Worker secrets | `NODES`: the node IDs and their tokens; Access issuer, audience and owner email | Node registry and credentials |
 | Workers | Transient processing and forwarding of authenticated requests | Holds no persistent job state |
 
 If a requirement arises to copy data to the Cloudflare side, a separate contract for what is stored, its sensitivity, retention period, and consistency is designed.
@@ -324,7 +325,7 @@ The availability goal is not "the WebSocket never drops" but **"even when it dro
 | Topic | What to verify before implementation |
 | --- | --- |
 | Remote MCP | Compatibility of target MCP hosts and the chosen SDK with 2026-07-28 / 2025-11-25 |
-| Authentication | Connection registration, revocation, and permission mapping when using an OAuth issuer / Gate |
+| Authentication | Managed OAuth client acceptance, policy changes, token expiry and permission mapping |
 | Node credential | Issuance, secret storage, expiry, revocation, re-registration |
 | Agent sandbox | What Claude Code's permission and sandbox settings actually confine for an agent in an Orca terminal on the target Linux |
 | Broker | WebSocket restoration after DO hibernation, concurrent requests, correlation on disconnect |

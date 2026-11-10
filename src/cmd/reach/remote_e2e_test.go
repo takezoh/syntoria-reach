@@ -1,24 +1,21 @@
 package main
 
-// End-to-end test of the remote path: this test is the MCP client. It runs
-// the gateway in workerd (wrangler dev) against a fake Syntoria Gate, which
-// answers OIDC discovery and token introspection, with three nodes: "desk",
-// a real daemon on a fake Orca; "lab", a real daemon with local workspaces
-// and a fake agent; and "away", which never connects. Each daemon reaches
-// the gateway over its outbound WebSocket with its own node token. The test
-// lists the nodes and their agents, drives a workspace and an agent session
-// on each node, and covers a node going offline and coming back while the
-// others work, and the gateway refusing tokens that Gate does not vouch for,
-// tokens of another person, a connection revoked at Gate, and Gate being
-// down.
-//
-// It needs Node.js and the gateway's packages (npm install in cloud/), so it
-// runs only with REACH_E2E_GATEWAY=1.
+// End-to-end test of the remote path in workerd with signed Access assertions
+// and three nodes: a daemon on fake Orca, a daemon using local workspaces and
+// an offline node. The fake issuer substitutes only Access signing keys; this
+// does not test Cloudflare's edge or a hosted client's OAuth authorization.
+// Enable explicitly with REACH_E2E_GATEWAY=1 (requires cloud dependencies).
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -38,9 +35,9 @@ import (
 )
 
 const (
-	gateClientID     = "reach-e2e"
-	gateClientSecret = "gate-secret-0123456789abcdef0123456789"
-	ownerSubject     = "github:1"
+	accessAudience = "reach-mcp-test-audience"
+	ownerSubject   = "owner-subject"
+	ownerEmail     = "owner@example.com"
 )
 
 // The nodes of the gateway and their tokens.
@@ -54,10 +51,10 @@ func TestRemoteE2E(t *testing.T) {
 	if os.Getenv("REACH_E2E_GATEWAY") == "" {
 		t.Skip("set REACH_E2E_GATEWAY=1 to run the gateway with wrangler dev (needs npm install in cloud/)")
 	}
-	gate := newFakeGate(t)
+	access := newFakeAccess(t)
 	nodes, _ := json.Marshal(nodeTokens)
-	base := startGateway(t, "GATE_ISSUER="+gate.URL, "GATE_CLIENT_ID="+gateClientID,
-		"GATE_CLIENT_SECRET="+gateClientSecret, "OWNER_SUBJECT="+ownerSubject, "NODES="+string(nodes))
+	base := startGateway(t, "ACCESS_TEAM_DOMAIN="+access.URL, "ACCESS_AUD="+accessAudience,
+		"ACCESS_OWNER_EMAIL="+ownerEmail, "NODES="+string(nodes))
 	resource := base + "/mcp"
 	connectURL := "ws" + strings.TrimPrefix(base, "http") + "/connect"
 
@@ -68,21 +65,21 @@ func TestRemoteE2E(t *testing.T) {
 		t.Fatalf("wrong node token: resp=%v err=%v", resp, err)
 	}
 
-	// An MCP host without a token is sent to Gate through the resource
-	// metadata.
+	// Origin requests need a verified edge assertion. Access owns discovery;
+	// the Worker must not continue advertising Gate or invent its own flow.
 	anonymous := &mcpClient{t: t, url: resource}
-	if status, header := anonymous.status(); status != http.StatusUnauthorized ||
-		header != `Bearer resource_metadata="`+base+`/.well-known/oauth-protected-resource/mcp"` {
-		t.Fatalf("unauthenticated MCP request: %d %q", status, header)
+	if status, _ := anonymous.status(); status != http.StatusUnauthorized {
+		t.Fatalf("missing assertion: %d", status)
 	}
-	var prm struct {
-		Resource             string   `json:"resource"`
-		AuthorizationServers []string `json:"authorization_servers"`
-		ScopesSupported      []string `json:"scopes_supported"`
-	}
-	getJSON(t, base+"/.well-known/oauth-protected-resource/mcp", &prm)
-	if prm.Resource != resource || !slices.Equal(prm.AuthorizationServers, []string{gate.URL}) || !slices.Contains(prm.ScopesSupported, "openid") {
-		t.Fatalf("resource metadata: %+v", prm)
+	for _, path := range []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"} {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("origin discovery %s: %d", path, resp.StatusCode)
+		}
 	}
 
 	remote := func(node string) string {
@@ -93,9 +90,8 @@ func TestRemoteE2E(t *testing.T) {
 	lab, _ := buildDaemon(t, true, remote("lab"))
 	lab.start()
 
-	// The token Gate issues to an approved MCP host of the owner.
-	gate.issue("tok-owner", ownerSubject, resource)
-	c := &mcpClient{t: t, url: resource, token: "tok-owner"}
+	// The Access assertion the edge forwards after authenticating the owner.
+	c := &mcpClient{t: t, url: resource, token: access.issue(ownerSubject, accessAudience, time.Now().Add(time.Hour))}
 	c.initialize()
 	var names []string
 	for _, tool := range c.rpc("tools/list", map[string]any{})["tools"].([]any) {
@@ -105,10 +101,6 @@ func TestRemoteE2E(t *testing.T) {
 		if !slices.Contains(names, want) {
 			t.Fatalf("tools %v lack %s", names, want)
 		}
-	}
-	// The gateway asked Gate, with its resource client credentials.
-	if gate.introspections() == 0 {
-		t.Fatal("the gateway did not introspect the token")
 	}
 
 	// The daemons connect on their own. list_nodes shows every node, the
@@ -227,33 +219,83 @@ func TestRemoteE2E(t *testing.T) {
 	}
 	c.mustTool("stop_agent_session", map[string]any{"node": "lab", "operation_id": "r-x", "session_id": labSession})
 
-	// Tokens Gate does not vouch for, or vouches for another resource, are
-	// refused and send the host back to Gate.
-	gate.issue("tok-elsewhere", ownerSubject, "https://other.example.test/mcp")
-	for _, token := range []string{"not-a-token", "tok-elsewhere"} {
-		if status, header := (&mcpClient{t: t, url: resource, token: token}).status(); status != http.StatusUnauthorized || !strings.Contains(header, "resource_metadata=") {
-			t.Fatalf("token %s: %d %q", token, status, header)
+	// Signature, issuer, audience and expiry are checked at the Worker itself.
+	for name, token := range map[string]string{
+		"malformed":         "not-a-token",
+		"wrong audience":    access.issue(ownerSubject, "other-app", time.Now().Add(time.Hour)),
+		"expired":           access.issue(ownerSubject, accessAudience, time.Now().Add(-time.Minute)),
+		"bad signature":     c.token[:len(c.token)-8] + "AAAAAAAA",
+		"wrong issuer":      access.sign(map[string]any{"iss": "https://other.example.test", "sub": ownerSubject, "aud": []string{accessAudience}, "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()}),
+		"missing expiry":    access.sign(map[string]any{"iss": access.URL, "sub": ownerSubject, "aud": []string{accessAudience}, "iat": time.Now().Unix()}),
+		"missing issued at": access.sign(map[string]any{"iss": access.URL, "sub": ownerSubject, "aud": []string{accessAudience}, "exp": time.Now().Add(time.Hour).Unix()}),
+		"missing subject":   access.sign(map[string]any{"iss": access.URL, "aud": []string{accessAudience}, "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()}),
+		"not yet valid":     access.sign(map[string]any{"iss": access.URL, "sub": ownerSubject, "aud": []string{accessAudience}, "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(), "nbf": time.Now().Add(time.Hour).Unix()}),
+		"oversized":         strings.Repeat("a", 16385),
+	} {
+		if status, _ := (&mcpClient{t: t, url: resource, token: token}).status(); status != http.StatusUnauthorized {
+			t.Fatalf("%s: %d", name, status)
 		}
 	}
-	// A valid token of another person is not admitted.
-	gate.issue("tok-stranger", "github:2", resource)
-	if status, _ := (&mcpClient{t: t, url: resource, token: "tok-stranger"}).status(); status != http.StatusForbidden {
-		t.Fatalf("another subject: %d", status)
+	for _, subject := range []string{"another-person", ""} {
+		if status, _ := (&mcpClient{t: t, url: resource, token: access.issue(subject, accessAudience, time.Now().Add(time.Hour))}).status(); status != http.StatusForbidden {
+			t.Fatalf("subject %q: %d", subject, status)
+		}
 	}
-	// Gate being down is an outage, not a sign-out.
-	gate.setDown(true)
-	if status, _ := c.status(); status != http.StatusServiceUnavailable {
-		t.Fatalf("Gate down: %d", status)
+	// A service assertion cannot impersonate the owner, even with the same app audience.
+	for name, claims := range map[string]map[string]any{
+		"missing email": {"iss": access.URL, "aud": []string{accessAudience}, "sub": ownerSubject, "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()},
+		"empty subject": {"iss": access.URL, "aud": []string{accessAudience}, "sub": "", "email": ownerEmail, "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()},
+	} {
+		if status, _ := (&mcpClient{t: t, url: resource, token: access.sign(claims)}).status(); status != http.StatusForbidden {
+			t.Fatalf("%s: %d", name, status)
+		}
 	}
-	gate.setDown(false)
-	// Revoking the connection at Gate stops it at the next request: nothing
-	// is cached.
+	// A valid JWT in Authorization alone is not an Access assertion.
+	if status, _ := (&mcpClient{t: t, url: resource, token: c.token, bearerOnly: true}).status(); status != http.StatusUnauthorized {
+		t.Fatalf("bearer bypass: %d", status)
+	}
+	// Cached keys are permitted; an issuer outage does not invalidate them.
+	access.setDown(true)
 	if status, _ := c.status(); status != http.StatusOK {
-		t.Fatalf("Gate back: %d", status)
+		t.Fatalf("cached keys: %d", status)
 	}
-	gate.revoke("tok-owner")
-	if status, _ := c.status(); status != http.StatusUnauthorized {
-		t.Fatalf("revoked connection: %d", status)
+	// A fresh Worker without cached keys reports an outage, never a sign-out.
+	cold := startGateway(t, "ACCESS_TEAM_DOMAIN="+access.URL, "ACCESS_AUD="+accessAudience, "ACCESS_OWNER_EMAIL="+ownerEmail, "NODES="+string(nodes))
+	if status, _ := (&mcpClient{t: t, url: cold + "/mcp", token: c.token}).status(); status != http.StatusServiceUnavailable {
+		t.Fatalf("key service down: %d", status)
+	}
+	access.setDown(false)
+	if status, _ := (&mcpClient{t: t, url: cold + "/mcp", token: c.token}).status(); status != http.StatusOK {
+		t.Fatalf("key service recovered: %d", status)
+	}
+
+}
+
+// Bad operator configuration must never open the MCP endpoint. Even when
+// MCP authentication is unconfigured, node authentication remains independent.
+func TestRemoteInvalidConfig(t *testing.T) {
+	if os.Getenv("REACH_E2E_GATEWAY") == "" {
+		t.Skip("set REACH_E2E_GATEWAY=1")
+	}
+	nodes, _ := json.Marshal(nodeTokens)
+	for _, tc := range []struct{ name, issuer, audience, owner, nodes string }{
+		{"missing owner", "https://access.example.com", accessAudience, "", string(nodes)},
+		{"invalid issuer", "https://access.example.com/unsafe", accessAudience, ownerEmail, string(nodes)},
+		{"malformed nodes", "https://access.example.com", accessAudience, ownerEmail, "{}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := startGateway(t, "ACCESS_TEAM_DOMAIN="+tc.issuer, "ACCESS_AUD="+tc.audience, "ACCESS_OWNER_EMAIL="+tc.owner, "NODES="+tc.nodes)
+			if status, _ := (&mcpClient{t: t, url: base + "/mcp"}).status(); status != http.StatusServiceUnavailable {
+				t.Fatalf("bad configuration: %d", status)
+			}
+			if tc.nodes == string(nodes) {
+				ws, resp, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(base, "http")+"/connect", &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer " + nodeTokens["desk"]}}})
+				if err != nil {
+					t.Fatalf("node channel depends on MCP configuration: %v %v", resp, err)
+				}
+				ws.CloseNow()
+			}
+		})
 	}
 }
 
@@ -280,70 +322,63 @@ func online(r any, node string) bool {
 	return false
 }
 
-// fakeGate stands in for Syntoria Gate: OIDC discovery, and introspection of
-// the tokens it was told about, for the gateway's resource client only.
-type fakeGate struct {
+// fakeAccess serves real RSA public keys and signs synthetic application JWTs.
+// It does not emulate Managed OAuth or Access policy evaluation.
+type fakeAccess struct {
 	*httptest.Server
-	mu     sync.Mutex
-	tokens map[string]map[string]any
-	down   bool
-	calls  int
+	key  *rsa.PrivateKey
+	mu   sync.Mutex
+	down bool
 }
 
-func newFakeGate(t *testing.T) *fakeGate {
-	g := &fakeGate{tokens: map[string]map[string]any{}}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"issuer": g.URL, "introspection_endpoint": g.URL + "/token/introspection"})
-	})
-	mux.HandleFunc("POST /token/introspection", func(w http.ResponseWriter, r *http.Request) {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		if g.down {
-			http.Error(w, "unavailable", http.StatusInternalServerError)
-			return
-		}
-		if id, secret, ok := r.BasicAuth(); !ok || id != gateClientID || secret != gateClientSecret {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_client"})
-			return
-		}
-		g.calls++
-		res, ok := g.tokens[r.PostFormValue("token")]
-		if !ok {
-			res = map[string]any{"active": false}
-		}
-		writeJSON(w, http.StatusOK, res)
-	})
-	g.Server = httptest.NewServer(mux)
-	t.Cleanup(g.Close)
-	return g
-}
-
-func (g *fakeGate) issue(token, subject, audience string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.tokens[token] = map[string]any{
-		"active": true, "token_type": "Bearer", "gate_approved": true, "iss": g.URL, "sub": subject, "aud": audience,
-		"connection_id": "conn-" + token, "client_id": "client-" + token, "exp": time.Now().Add(time.Hour).Unix(),
+func newFakeAccess(t *testing.T) *fakeAccess {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
 	}
+	a := &fakeAccess{key: key}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /cdn-cgi/access/certs", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.Lock()
+		down := a.down
+		a.mu.Unlock()
+		if down {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"keys": []any{map[string]any{
+			"kty": "RSA", "alg": "RS256", "use": "sig", "kid": "test-key",
+			"n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
+		}}})
+	})
+	a.Server = httptest.NewServer(mux)
+	t.Cleanup(a.Close)
+	return a
 }
-
-func (g *fakeGate) revoke(token string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.tokens[token] = map[string]any{"active": false}
+func (a *fakeAccess) sign(claims map[string]any) string {
+	header, _ := json.Marshal(map[string]string{"alg": "RS256", "kid": "test-key"})
+	payload, _ := json.Marshal(claims)
+	input := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
+	hash := sha256.Sum256([]byte(input))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, a.key, crypto.SHA256, hash[:])
+	if err != nil {
+		panic(err)
+	}
+	return input + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
-
-func (g *fakeGate) setDown(down bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.down = down
+func (a *fakeAccess) issue(subject, audience string, expiry time.Time) string {
+	email := "other@example.com"
+	if subject == ownerSubject {
+		email = ownerEmail
+	}
+	return a.sign(map[string]any{"email": email, "iss": a.URL, "sub": subject, "aud": []string{audience}, "iat": time.Now().Unix(), "exp": expiry.Unix(), "type": "app"})
 }
-
-func (g *fakeGate) introspections() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.calls
+func (a *fakeAccess) setDown(down bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.down = down
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -411,28 +446,17 @@ func freePort(t *testing.T) string {
 	return fmt.Sprint(l.Addr().(*net.TCPAddr).Port)
 }
 
-func getJSON(t *testing.T, u string, v any) {
-	t.Helper()
-	resp, err := http.Get(u)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET %s: %d", u, resp.StatusCode)
-	}
-	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
-		t.Fatalf("GET %s: %v", u, err)
-	}
-}
-
 // status sends tools/list and returns the HTTP status and WWW-Authenticate.
 func (c *mcpClient) status() (int, string) {
 	c.t.Helper()
 	b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 	req, _ := http.NewRequest(http.MethodPost, c.url, bytes.NewReader(b))
 	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+		if c.bearerOnly {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		} else {
+			req.Header.Set("Cf-Access-Jwt-Assertion", c.token)
+		}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
@@ -447,13 +471,14 @@ func (c *mcpClient) status() (int, string) {
 	return resp.StatusCode, resp.Header.Get("WWW-Authenticate")
 }
 
-// mcpClient speaks MCP Streamable HTTP (JSON responses) with a bearer token.
+// mcpClient speaks MCP Streamable HTTP as requests forwarded by the Access edge.
 type mcpClient struct {
-	t       *testing.T
-	url     string
-	token   string
-	version string
-	id      int
+	t          *testing.T
+	url        string
+	token      string
+	bearerOnly bool
+	version    string
+	id         int
 }
 
 type toolError struct {
@@ -465,7 +490,11 @@ func (c *mcpClient) post(msg map[string]any) (int, map[string]any) {
 	c.t.Helper()
 	b, _ := json.Marshal(msg)
 	req, _ := http.NewRequest(http.MethodPost, c.url, bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.bearerOnly {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	} else {
+		req.Header.Set("Cf-Access-Jwt-Assertion", c.token)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if c.version != "" {

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-module.local/docs/note.schema.json",
+  "title": "Loose note (memo, research log, ad-hoc record)",
+  "description": "Store reference information that is not managed as a decision, implementation change or work item.",
+  "allOf": [
+    {
+      "$ref": "_common.schema.json"
+    }
+  ],
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "kind": {
+      "const": "note"
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "published",
+        "archived"
+      ]
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "description": "A single label broader than tags, such as 'auth-flow' or 'perf-investigation'."
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 280,
+      "description": "A one- or two-sentence summary for people and agents reading the index."
+    },
+    "expires": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "Expected obsolescence date, used to decide whether to transition the status to archived."
+    },
+    "record_type": {
+      "enum": [
+        "review-finding",
+        "debug-experiment"
+      ],
+      "description": "Record type in the dev-evidence history producer contract. Requires subject_paths when specified."
+    },
+    "subject_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Repository-relative paths addressed by the record, aggregated into the dev-evidence history view."
+    },
+    "change_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional related change ID."
+    },
+    "outcome": {
+      "type": "string",
+      "maxLength": 120,
+      "description": "A brief conclusion, such as refuted/confirmed for debugging or fixed/filed for a finding."
+    }
+  },
+  "dependentRequired": {
+    "record_type": [
+      "subject_paths"
+    ]
+  }
+}

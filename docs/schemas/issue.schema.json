@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-module.local/docs/issue.schema.json",
+  "title": "Issue (out-of-scope capture: bug or plan)",
+  "description": "A durable queue of defects and opportunities outside the current session scope, ready for a later session. The canonical content, filing, triage and closure rules are in skills/dev-docs/knowledge/issue.md.",
+  "allOf": [
+    {
+      "$ref": "_common.schema.json"
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "done"
+          }
+        }
+      },
+      "then": {
+        "anyOf": [
+          {
+            "required": [
+              "disposition_target"
+            ]
+          },
+          {
+            "required": [
+              "disposition_reason"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "rejected"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "disposition_reason"
+        ]
+      }
+    }
+  ],
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "kind": {
+      "const": "issue"
+    },
+    "status": {
+      "enum": [
+        "open",
+        "done",
+        "rejected"
+      ]
+    },
+    "issue_type": {
+      "enum": [
+        "bug",
+        "plan"
+      ],
+      "description": "bug = a deviation from an existing specification, test or declared invariant. plan = a new opportunity, improvement or pending task."
+    },
+    "subject_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Repository-relative target paths. dev-evidence uses overlap with the change surface to retrieve related issues."
+    },
+    "disposition_target": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Document ID identifying the resolving change, promoted ADR or design. Transitioning to done requires this field or disposition_reason."
+    },
+    "disposition_reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The resolution when no change is created, or the reason for rejection. Required when transitioning to rejected."
+    }
+  },
+  "required": [
+    "issue_type"
+  ]
+}

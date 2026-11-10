@@ -18,6 +18,8 @@ coverage/
 
 # Wrangler's local state: dev storage and account caches.
 .wrangler/
+# Cloudflare CLI account and deployment caches.
+.cloudflare/
 
 # Credentials and keys
 *.pem

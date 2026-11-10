@@ -1,4 +1,4 @@
-// Secrets (Gate's resource client secret, the node tokens) are usable only
+// Secrets (the node tokens) are usable only
 // when long enough to resist guessing, and node tokens are compared in
 // constant time.
 

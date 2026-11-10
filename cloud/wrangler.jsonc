@@ -7,9 +7,8 @@
   // Workers logs record requests, not their bodies; the gateway never logs
   // tool arguments or results.
   "observability": { "enabled": true },
-  // The gateway answers only at the custom domain given on deploy
-  // (--domain reach-api.<parent>), under Gate's cookie parent: its MCP URL
-  // is the audience registered with Gate.
+  // Deploy at the existing custom domain. Access protects /mcp only; /connect
+  // retains node-token authentication and must not require interactive OAuth.
   "workers_dev": false,
   "preview_urls": false,
   // One NodeBroker per node, named by its node ID.
@@ -17,15 +16,10 @@
     "bindings": [{ "name": "NODE", "class_name": "NodeBroker" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NodeBroker"] }],
-  // Uploaded with --secrets-file on deploy (environment variables or .dev.vars
-  // locally), which keeps deployment values out of the repository:
-  //   GATE_ISSUER         Syntoria Gate's issuer, e.g. https://gate.<parent>
-  //   GATE_CLIENT_ID      the gateway's resource client ID in GATE_RESOURCES
-  //   GATE_CLIENT_SECRET  its client secret, at least 32 characters
-  //   OWNER_SUBJECT       the one Gate subject that may use Reach, github:<user ID>
-  //   NODES               the nodes and the tokens their daemons connect with, as a
-  //                       JSON object {"<node ID>": "<token>"}; node IDs are letters,
-  //                       digits and ._- (at most 64), each token at least 32
-  //                       characters and used by one node only
-  "secrets": { "required": ["GATE_ISSUER", "GATE_CLIENT_ID", "GATE_CLIENT_SECRET", "OWNER_SUBJECT", "NODES"] }
+  // Operator values are uploaded from an ignored secrets file, never tracked:
+  //   ACCESS_TEAM_DOMAIN    Access issuer origin, without a trailing slash
+  //   ACCESS_AUD            audience of the MCP Access application
+  //   ACCESS_OWNER_EMAIL  the owner's email, also restricted by Access policy
+  //   NODES                 existing node ID to token JSON map; preserve values
+  "secrets": { "required": ["ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "ACCESS_OWNER_EMAIL", "NODES"] }
 }

@@ -12,7 +12,7 @@ You are installing (or updating) the Reach daemon on this host as a systemd user
 - `~/.config/reach/config.json` exists with mode 600, and the user has approved its agents, commands, clients and their permissions.
 - `reach.service` is installed in `~/.config/systemd/user/`, enabled, and active.
 - `list_capabilities` answers through the socket for every configured client.
-- If the user wants remote MCP (section 7): the gateway is deployed and registered in Gate, this host is one of its nodes, the daemon is connected to it, and its MCP endpoint refuses requests without a token.
+- If the user wants remote MCP (section 7): the gateway is deployed and protected by Access Managed OAuth, this host is one of its nodes, the daemon is connected to it, and its MCP origin refuses requests without a valid Access assertion.
 - The user has seen your report (see the last section).
 
 The unit (`deploy/systemd/reach.service`) runs `%h/.local/bin/reach -config %h/.config/reach/config.json`, so use exactly these two paths.
@@ -137,60 +137,25 @@ The answer is the client's `permissions`, with the `commands` and the `agents` (
 
 ## 7. Remote MCP (optional)
 
-Ask the user whether remote MCP clients (claude.ai, ChatGPT, Claude Code elsewhere) should reach this host. If so, this host becomes a node of the user's Reach gateway: deploy the gateway in `cloud/` to their Cloudflare account and register it as a resource in their Syntoria Gate (unless it exists already), register the node on it, and connect the daemon to it. README.md ("Remote MCP") describes what it does.
+Remote clients connect directly to the Reach MCP endpoint, protected by Cloudflare Access Managed OAuth. A Portal is not required. One Worker serves all nodes; adding a node preserves the existing Worker, Access application, node IDs and tokens.
 
-One gateway serves all of the user's nodes. If the gateway exists already (section 1), skip step 4 and the Gate secrets of step 3: agree on the node ID and the remote client, add the node to `NODES` (step 3), upload it (step 5), and connect the daemon (step 6).
+1. **Prerequisites.** Use Node.js 22 or newer and run `npm ci` and `npm run check` in `cloud/`. Use an existing Cloudflare account and a hostname under its control. Preserve the existing hostname on an update. Authenticate the deployment CLI using the operator's existing configuration; never print credentials.
+2. **Access application.** Configure an MCP Access application covering the hostname's `/mcp` path and enable Managed OAuth. Allow only the owner's identity. Register the exact callback URIs used by the intended clients in Managed OAuth settings, and enable loopback callbacks only if needed. Set a short access-token lifetime. Access supplies the OAuth discovery endpoints at the edge; do not register Reach in Gate or create a Portal.
+   - Keep `/connect` outside interactive Access login. It remains protected by its node token. Verify this path separately; do not apply a hostname-wide login policy that would block daemons.
+   - Keep `workers.dev` and preview URLs disabled. Do not add an unprotected alias.
+3. **Operator configuration.** Back up the existing gateway secrets file outside tracked files. Prepare `~/.config/reach/gateway-secrets.env` with mode 600, containing:
+   - `ACCESS_TEAM_DOMAIN`: the exact Access team issuer origin, without a trailing slash.
+   - `ACCESS_AUD`: the audience tag of this MCP Access application.
+   - `ACCESS_OWNER_EMAIL`: the owner's email address, matching the Access allow policy. The Worker compares it only after JWT signature, issuer and audience verification.
+   - `NODES`: the existing JSON map of node IDs to node tokens. Preserve every existing value; this migration does not rotate node credentials.
+   - These names are operator inputs, not values to commit. HTTP issuer origins are permitted only on loopback for the isolated local test harness.
+4. **Node configuration.** For a new node, agree on its ID and the daemon's remote client permissions, add its token to `NODES`, and configure `remote` with the existing gateway's `/connect` WebSocket URL, the node token and that local client ID. For an existing node, leave these settings untouched. Daemon installation and restart rules above still apply.
+5. **Deploy.** Run `npx wrangler deploy --domain reach-api.example.com --secrets-file ~/.config/reach/gateway-secrets.env` in `cloud/`, substituting the operator's existing hostname at execution time. Keep all deployment records and backups in ignored operator storage. Retain the previous Worker revision, Gate resource registration and old secrets until hosted acceptance and rollback readiness are established.
+6. **Verify the edge and origin.** An unauthenticated MCP request must receive Access's OAuth challenge, not HTML login or Gate discovery. A valid OAuth connection must reach the MCP endpoint; invalid assertions and assertions for another application must fail at the origin. Check that every expected node connects and that `list_nodes` shows its allowed agents. Do not log full assertions or token-bearing requests.
+7. **Hosted client acceptance.** Connect both Claude and ChatGPT directly, authenticate through Access, list tools and nodes, and perform the previously authorized smoke test if one is needed. Local signed-assertion tests do not establish this acceptance. Check policy changes and expiry behavior without claiming Gate's immediate per-connection revocation semantics.
+8. **Rollback.** If acceptance fails, restore the previous Worker revision and the previous Access application configuration together. Preserve node tokens, `NODES`, Durable Object identities and Gate registration. Do not remove Gate or old secrets while a consumer still depends on them. After acceptance, remove obsolete Gate credentials for Reach as a separate operator action.
 
-1. **Prerequisites.**
-   - The user runs Syntoria Gate, or can ask its operator to register a resource. You need three of Gate's settings, which are the Gate service's environment variables:
-     - the issuer, `GATE_ISSUER`, for example `https://gate.<parent>`
-     - the cookie parent, `GATE_SESSION_COOKIE_DOMAIN`, the `<parent>` below
-     - the GitHub account ID Gate admits, `GATE_GITHUB_USER_ID`. The person's Gate subject is `github:<that ID>`.
-   - The gateway's host is `reach-api.<parent>`: Gate accepts only resources under its cookie parent, and the other Syntoria APIs are `<app>-api.<parent>`. The `<parent>` zone must be in the user's Cloudflare account. Agree on the host name with the user.
-   - `node --version` must be at least 22.
-   - **The node ID.** Agree with the user on a short ID for this host, such as `desktop` or `build-server` (letters, digits and `._-`, at most 64). Remote AIs see it in `list_nodes` and name it in every call.
-   - Run `npm ci` in `cloud/`.
-   - The user signs in to Cloudflare: in `cloud/`, they run `npx wrangler login`, which opens a browser. Alternatively, they set `CLOUDFLARE_API_TOKEN`. Do not handle their Cloudflare credentials yourself.
-   - `npx wrangler whoami` shows the account.
-2. **Agree on the remote client.** Every remote request acts as one client of the config, with that client's permissions. Propose a dedicated client, for example `remote`, with only what remote AIs should do. For agent work that is `workspace.create` and `agent.run`. Add it as in section 4; its token also works on the local socket.
-3. **Secrets.** Write `~/.config/reach/gateway-secrets.env` with mode 600. Every line is uploaded as a Worker secret, which keeps deployment values out of the repository:
-   - `GATE_ISSUER`: Gate's issuer.
-   - `GATE_CLIENT_ID`: the gateway's resource client ID in Gate, for example `reach-api`.
-   - `GATE_CLIENT_SECRET`: its client secret, 64 random hex characters (`openssl rand -hex 32`).
-   - `OWNER_SUBJECT`: `github:<ID>`, the only person the gateway admits.
-   - `NODES`: the nodes and their tokens, as one line of JSON, `NODES={"<node ID>":"<token>",...}`. Each node has a token of its own, 64 random hex characters, that its daemon connects with. To add this host to an existing gateway, add its entry and keep the others.
-   - **Update from one node.** A gateway that predates multiple nodes has `NODE_TOKEN` instead. Replace that line with `NODES={"<node ID>":"<the NODE_TOKEN value>"}`, so that the connected daemon keeps its token, and after the deploy run `npx wrangler secret delete NODE_TOKEN` in `cloud/`. The deploy does not drop the daemon's connection, which stays with the earlier gateway's broker, where no request reaches it any more: restart `reach.service` after the deploy (the restart rule applies), and check that the journal shows `connected to gateway` again. Tell the user that every tool but `list_nodes` now takes a required `node`: MCP clients that listed the tools before the deploy fail with the old arguments until they list them again (reconnect them, or start a new conversation).
-4. **Register the gateway in Gate.** Add this entry to Gate's `GATE_RESOURCES` secret:
-
-   ```json
-   {"audience": "https://reach-api.<parent>/mcp", "client_id": "<GATE_CLIENT_ID>", "client_secret": "<GATE_CLIENT_SECRET>", "browser_client_id": "reach-web"}
-   ```
-
-   - Gate requires a `browser_client_id`. The gateway accepts no browser sessions, so the value is unused, but it must be unique among Gate's resources.
-   - Add the payload as a new secret version, then deploy a new Gate revision that reads it. Gate's `docs/deployment.md` describes both.
-   - The payload holds the other resources' secrets, so the user or Gate's operator does this step. Do not read the payload yourself.
-5. **Deploy.** In `cloud/`, run `npx wrangler deploy --domain reach-api.<parent> --secrets-file ~/.config/reach/gateway-secrets.env`.
-   - Pass `--domain` on every deploy. The gateway has no `workers.dev` URL.
-   - Never commit the secrets file. It lives outside the repository.
-   - To change only the nodes of a deployed gateway, run `npx wrangler secret put NODES` in `cloud/` and give it the new JSON from the secrets file, without printing it. The secrets file can be on another host, the one that deployed the gateway; then the user runs this there.
-6. **Connect the daemon.**
-   - Add `"remote": {"url": "wss://reach-api.<parent>/connect", "token": "<this node's token>", "client": "<remote client>"}` to the config, keeping mode 600. Read the token from the secrets file (`NODES`) inside the command that writes it. The gateway knows the node by its token.
-   - If the installed binary predates this checkout, rebuild it (section 3).
-   - Restart `reach.service`; the restart rule applies.
-   - `journalctl --user -u reach.service -n 20 --no-pager` then shows `connected to gateway`.
-7. **Verify.**
-   - `curl -sS https://reach-api.<parent>/` answers with the gateway's name.
-   - `curl -sS https://reach-api.<parent>/.well-known/oauth-protected-resource/mcp` names Gate's issuer in `authorization_servers`.
-   - `curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://reach-api.<parent>/mcp` prints `401`.
-   - Then the user connects an MCP client to `https://reach-api.<parent>/mcp`:
-     - claude.ai: Settings → Connectors → Add custom connector.
-     - Claude Code: `claude mcp add --transport http reach https://reach-api.<parent>/mcp`, then `/mcp` to sign in.
-   - Gate asks the user to sign in with GitHub and to approve the connection.
-   - `list_nodes` from that client shows this node online, with its agents and their roles, and `list_capabilities` with `{"node": "<node ID>"}` shows the remote client's permissions.
-
-**Cutting off access.**
-- One connection: revoke it on Gate's `/connections` page. It stops working at its next request.
-- One node: remove `remote` from its config and restart its service, or remove its entry from `NODES` (or give it a new token) and upload `NODES` (step 5). To rotate its token, change it in `NODES` and in the node's config, upload `NODES`, then restart the node's service.
+MCP Events and completion notifications are separate work. Until implemented, read session replies with `read_agent_output`.
 
 ## Report
 
@@ -205,7 +170,7 @@ Tell the user:
   - the gateway URL and its MCP endpoint (`https://<host>/mcp`)
   - this host's node ID, and the other nodes in `NODES` (IDs only)
   - the remote client and its permissions
-  - the Gate issuer, and that the user approves and revokes MCP connections at Gate (`/connections`)
+  - that MCP login is managed by Access, with the configured token lifetime and policy behavior (without printing identifiers or credentials)
   - whether the daemon is connected
 - Anything left to do, for example enabling linger, or configuring the caller to use the socket and its token.
 
@@ -221,4 +186,4 @@ systemctl --user daemon-reload
 
 Workspaces stay: their folders under `workspaces` (by default `~/.local/state/reach/workspaces`), and on Orca the projects named `reach-*`. If the user wants them gone, remove those projects in Orca (`<orca> project setup-delete --setup <repo id> --force`) and then their folders. Remove the config (tokens) and the state directory only if the user asks.
 
-If the host is a node of a gateway, remove its entry from `NODES` and upload it (section 7, step 5). To remove the gateway itself, run `npx wrangler delete` in `cloud/`. It deletes the Worker and its Durable Objects. Then ask the user or Gate's operator to remove the gateway's entry from `GATE_RESOURCES`.
+If the host is a node of a gateway, remove its entry from `NODES` and upload the updated configuration. Removing the gateway itself deletes the Worker and its Durable Objects; do this only on explicit operator instruction, and remove only its own Access configuration after checking for shared dependencies.

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-module.local/docs/task.schema.json",
+  "title": "Work item (TODO / task)",
+  "allOf": [
+    {
+      "$ref": "_common.schema.json"
+    }
+  ],
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "kind": {
+      "const": "task"
+    },
+    "status": {
+      "enum": [
+        "todo",
+        "in_progress",
+        "blocked",
+        "done",
+        "cancelled"
+      ]
+    },
+    "priority": {
+      "enum": [
+        "critical",
+        "high",
+        "normal",
+        "low"
+      ]
+    },
+    "effort": {
+      "enum": [
+        "small",
+        "medium",
+        "large"
+      ]
+    },
+    "change": {
+      "type": "string",
+      "pattern": "^change-[0-9]{8}-[a-z0-9][a-z0-9-]*$"
+    },
+    "assignee": {
+      "type": "string"
+    },
+    "files_touched": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "pr": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "format": "uri"
+        }
+      ]
+    },
+    "pinned_context": {
+      "type": "array",
+      "description": "References to contracts, evidence and code needed for implementation decisions.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "done_criteria": {
+      "type": "array",
+      "description": "Observable task completion criteria.",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
