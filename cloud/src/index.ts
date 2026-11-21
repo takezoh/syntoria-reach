@@ -39,14 +39,15 @@ async function protectedMcp(request: Request, env: Env): Promise<Response> {
   } catch {
     return text(503, "Access settings are missing or malformed\n");
   }
+  let principal;
   try {
-    await access.authenticate(request.headers.get("Cf-Access-Jwt-Assertion"));
+    principal = await access.authenticate(request.headers.get("Cf-Access-Jwt-Assertion"));
   } catch (error) {
     const status = error instanceof AccessError ? error.status : 503;
     const code = status === 401 ? "invalid_token" : status === 403 ? "forbidden" : "authorization_unavailable";
     return json(status, { error: code }, status === 503 ? { "Retry-After": "5" } : {});
   }
-  return mcp(request, env, parseNodes(env.NODES)!);
+  return mcp(request, env, parseNodes(env.NODES)!, principal);
 }
 
 // A daemon's outbound WebSocket. Only a node's token admits it, as that

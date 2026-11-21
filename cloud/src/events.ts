@@ -8,6 +8,14 @@ export const MAX_BATCH = 100;
 export const MAX_DEDUPE = 2048;
 export const DEDUPE_MS = 24 * 60 * 60 * 1000;
 export const LEASE_MS = 300_000;
+export type WebhookOptions = { ttlMs?: number | null; cursor?: string | null; maxAgeMs?: number };
+export function lease(options: WebhookOptions): number | null {
+  const { ttlMs, cursor, maxAgeMs } = options;
+  if (ttlMs != null && (!Number.isSafeInteger(ttlMs) || ttlMs < 0)) return null;
+  if (cursor != null && typeof cursor !== "string") return null;
+  if (maxAgeMs !== undefined && (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 0)) return null;
+  return Math.max(60_000, Math.min(ttlMs ?? LEASE_MS, LEASE_MS));
+}
 // Node and Cloudflare clocks are assumed NTP-synchronized. The 30-second
 // tolerance favors delivery: an early stop can duplicate the read-once result,
 // whereas dropping a real stop loses its notification.
@@ -118,13 +126,19 @@ export function expire(s: State, now: number): State {
   for (const [id, d] of Object.entries(n.dedupe)) if (d.admitted + DEDUPE_MS <= now) delete n.dedupe[id];
   return n;
 }
-export function subscribe(s: State, input: GrantInput, now: number, id: string, decision: 'allowed' | 'denied' | 'unavailable'): [State, Result<Grant>] {
+export function subscribe(s: State, input: GrantInput, now: number, id: string, decision: 'allowed' | 'denied' | 'unavailable', options: WebhookOptions = {}, deadline = now + LEASE_MS): [State, Result<Grant>] {
   let n = expire(s, now);
-  if (!valid(input)) return [n, {ok:false,error:'invalid_params'}];
+  if (!valid(input) || (input.mode === 'webhook' && lease(options) === null)) return [n, {ok:false,error:'invalid_params'}];
   const existing = Object.values(n.grants).find(g => !g.reader && key(g) === key(input));
   if (existing) {
     if (decision === 'denied') { remove(n, existing.id); return [n, {ok:false,error:'forbidden'}]; }
-    existing.expires = now + LEASE_MS;
+    existing.expires = deadline;
+    if (input.mode === 'webhook' && options.cursor != null) {
+      let c: {grant:string;position:number} | undefined;
+      try { c = JSON.parse(atob(options.cursor)); } catch { /* invalid cursor */ }
+      const current = JSON.parse(atob(watermark(n, existing))) as {position:number};
+      if (!c || c.grant !== existing.id || !Number.isSafeInteger(c.position) || c.position < 0 || c.position > current.position) existing.truncated = true;
+    }
     existing.authorized = decision === 'allowed';
     if (input.mode === 'webhook') {
       existing.secret = input.secret; existing.deliveryActive = true;
@@ -134,7 +148,7 @@ export function subscribe(s: State, input: GrantInput, now: number, id: string, 
   }
   if (decision !== 'allowed') return [n, {ok:false,error:decision === 'denied' ? 'forbidden' : 'unavailable'}];
   if (Object.keys(n.grants).length >= MAX_GRANTS) return [n, {ok:false,error:'limit'}];
-  const g: Grant = { ...structuredClone(input), id, created:now, expires:now + LEASE_MS, authorized:true, events:[], floor:n.seq };
+  const g: Grant = { ...structuredClone(input), id, created:now, expires:deadline, authorized:true, events:[], floor:n.seq, truncated:input.mode === 'webhook' && options.cursor != null };
   n.grants[id] = g;
   return [n, {ok:true,value:g}];
 }

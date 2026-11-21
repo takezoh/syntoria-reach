@@ -1,10 +1,14 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { type CallToolResult, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { failure, nodeBroker, type Reply, unknownOutcome } from "./broker";
 import type { Nodes } from "./nodes";
+import type { Principal, Profile } from "./events";
+import { eventsWire } from "./events-wire";
 
 // The MCP endpoint. list_nodes lists the nodes with the agents each one can
 // run; every other tool forwards one Reach method, with the same arguments
@@ -24,6 +28,8 @@ To have an agent do a task in a workspace: start_agent_session with the workspac
 After an "unknown" turn-stop event or result_unknown from send_agent_prompt, call read_agent_output once for that session. If it is working, wait for the next event. If it is idle and its reply does not answer the prompt you sent, the prompt did not reach the agent: send it again with a new operation_id. Otherwise do not resend the prompt. No re-subscription is needed.
 
 Tools that change something take an operation_id that you choose, unique per action (for example "create-ws-docs-1"). If another Reach operation fails with result_unknown, it may have run: call get_operation on the same node with the same operation_id, or resend the same call with that ID. For call_controller_tool, Reach keeps no receipt and get_operation does not apply: after result_unknown, check the call's effect with the Controller's own tools before calling it again. node_offline means the node is not connected and nothing ran.`;
+
+const LIST_NODES_DESCRIPTION = "The user's nodes: for each, its ID, whether it is online, and, when it is, the agents you may start there with the role of each (what the agent is for). Choose the node and agent for the work here; an offline node runs nothing.";
 
 const node = z.string().min(1).describe("Node ID from list_nodes.");
 const operationId = z.string().min(1).max(128).describe("An ID you choose, unique per action. Resending the same call with the same ID never runs it twice.");
@@ -128,12 +134,70 @@ const nodeTools: { name: string; description: string; input: Shape; readOnly: bo
   },
 ];
 
-export async function mcp(request: Request, env: Env, nodes: Nodes): Promise<Response> {
+export async function mcp(request: Request, env: Env, nodes: Nodes, principal: Principal): Promise<Response> {
+  const profile: Profile = new URL(request.url).searchParams.get("events") === "chatgpt" ? "chatgpt" : "standard";
+  if (request.method === "POST") {
+    let message: any;
+    try { message = await request.clone().json(); } catch { message = null; }
+    const revision = request.headers.get("MCP-Protocol-Version");
+    const modern = revision === "2026-07-28" || message?.method === "server/discover";
+    const eventMethod = typeof message?.method === "string" && message.method.startsWith("events/");
+    const supportedEvents = profile === "chatgpt" || modern;
+    if (modern || eventMethod) {
+      const respond = (value: {result?:unknown;error?:unknown}) => Response.json({jsonrpc:"2.0",id:message?.id ?? null,...value});
+      // A notification gets no response, as on the SDK path.
+      if (message?.jsonrpc === "2.0" && typeof message.method === "string" && !("id" in message)) return new Response(null, {status:202});
+      if (!message || message.jsonrpc !== "2.0" || typeof message.method !== "string" || !(typeof message.id === "string" || typeof message.id === "number")) return respond({error:{code:-32600,message:"Invalid request"}});
+      if (message.method === "server/discover") return respond({result:{resultType:"complete",supportedVersions:["2026-07-28"],serverInfo:{name:"syntoria-reach",version:"0.2.0"},instructions:INSTRUCTIONS,capabilities:{tools:{},...(profile === "chatgpt" ? {events:{}} : {extensions:{"io.modelcontextprotocol/events":{}}})}}});
+      if (eventMethod) {
+        if (!supportedEvents) return respond({error:{code:-32601,message:"Method not found"}});
+        const value = await eventsWire(message.method,message.params,profile,principal,nodes, n => nodeBroker(env,n));
+        if (modern && value.result && typeof value.result === "object") value.result = {...value.result,resultType:"complete"};
+        return respond(value);
+      }
+      if (modern && (message.method === "tools/list" || message.method === "tools/call")) {
+        if (message.method === "tools/call" && typeof message.params?.name !== "string") return respond({error:{code:-32602,message:"Invalid params: name is required"}});
+        const server = toolServer(env, nodes);
+        const client = new Client({name:"reach-wire",version:"1"});
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        await server.connect(serverTransport);
+        await client.connect(clientTransport);
+        try {
+          const result = message.method === "tools/list"
+            ? await client.listTools(message.params ?? {})
+            : await client.callTool(message.params ?? {});
+          return respond({result:{...result,resultType:"complete"}});
+        } catch (error) {
+          // A protocol error stays a JSON-RPC error, as on the SDK path.
+          if (error instanceof McpError) return respond({error:{code:error.code,message:error.message}});
+          throw error;
+        } finally { await client.close(); }
+      }
+      if (modern) return respond({error:{code:-32601,message:"Method not found"}});
+    }
+  }
+  const server = toolServer(env, nodes);
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+  await server.connect(transport);
+  const original = request.clone();
+  const response = await transport.handleRequest(request);
+  if (profile === "chatgpt" && request.method === "POST") {
+    const body = await original.json().catch(() => null) as {method?:string} | null;
+    if (body?.method === "initialize" && response.ok) {
+      const payload = await response.json() as any;
+      if (payload.result) payload.result.capabilities.events = {};
+      return Response.json(payload, {status:response.status,headers:response.headers});
+    }
+  }
+  return response;
+}
+
+function toolServer(env: Env, nodes: Nodes): McpServer {
   const server = new McpServer({ name: "syntoria-reach", version: "0.2.0" }, { instructions: INSTRUCTIONS });
   server.registerTool(
     "list_nodes",
     {
-      description: "The user's nodes: for each, its ID, whether it is online, and, when it is, the agents you may start there with the role of each (what the agent is for). Choose the node and agent for the work here; an offline node runs nothing.",
+      description: LIST_NODES_DESCRIPTION,
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
@@ -146,10 +210,7 @@ export async function mcp(request: Request, env: Env, nodes: Nodes): Promise<Res
       ({ node: target, ...params }: Record<string, unknown>) => forward(env, nodes, String(target), tool.name, params),
     );
   }
-  // Stateless: every request stands alone, so any Worker instance can serve it.
-  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-  await server.connect(transport);
-  return transport.handleRequest(request);
+  return server;
 }
 
 async function call(env: Env, node: string, method: string, params: Record<string, unknown>): Promise<Reply> {

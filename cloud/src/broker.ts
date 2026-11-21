@@ -238,8 +238,8 @@ export class NodeBroker extends DurableObject<Env> {
     return 'unavailable';
   }
 
-  async subscribe(input: events.GrantInput): Promise<events.Result<Omit<events.Grant, 'secret'> | events.WebhookResult>> {
-    if (!events.valid(input)) return {ok:false,error:'invalid_params'};
+  async subscribe(input: events.GrantInput, options: events.WebhookOptions = {}): Promise<events.Result<Omit<events.Grant, 'secret'> | events.WebhookResult>> {
+    if (!events.valid(input) || (input.mode === 'webhook' && events.lease(options) === null)) return {ok:false,error:'invalid_params'};
     if (input.mode === 'webhook') {
       if (!secretBytes(input.secret)) return {ok:false,error:'invalid_params'};
       const allowed = destination(input.callback!, (this.env as Env & {WEBHOOK_ALLOWED_ORIGINS?:string}).WEBHOOK_ALLOWED_ORIGINS);
@@ -249,7 +249,8 @@ export class NodeBroker extends DurableObject<Env> {
     const subscriptionId = 'sub_' + Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
     const now = Date.now();
     const ws = this.ctx.getWebSockets().find(s => s.readyState === WebSocket.OPEN);
-    const answer = await this.authorize(input, now + events.LEASE_MS);
+    const deadline = now + (input.mode === 'webhook' ? events.lease(options)! : events.LEASE_MS);
+    const answer = await this.authorize(input, deadline);
     const decision = ws && ws.readyState === WebSocket.OPEN && this.ctx.getWebSockets().includes(ws) ? answer : 'unavailable';
     if (input.mode !== 'webhook') return this.change(state => events.subscribe(state, input, Date.now(), subscriptionId, decision));
     const pendingKey = events.verificationKey(input);
@@ -277,7 +278,8 @@ export class NodeBroker extends DurableObject<Env> {
         delete next.pending[pendingKey];
       } else if (!(next.cache[pendingKey] > completedAt)) return [next,{ok:false,error:'unavailable'}];
       if (!checked.ok) return [next,checked];
-      const [updated,result] = events.subscribe(next,input,completedAt,subscriptionId,currentDecision);
+      if (completedAt >= deadline) return [next,{ok:false,error:'unavailable'}];
+      const [updated,result] = events.subscribe(next,input,completedAt,subscriptionId,currentDecision,options,deadline);
       if (!result.ok) return [updated,result];
       if (reserved.value !== '') updated.cache[pendingKey] = result.value.expires;
       const value = events.webhookResult(updated,result.value);
@@ -286,8 +288,8 @@ export class NodeBroker extends DurableObject<Env> {
     });
   }
 
-  async refresh(input: events.GrantInput): Promise<events.Result<Omit<events.Grant, 'secret'> | events.WebhookResult>> {
-    return this.subscribe(input);
+  async refresh(input: events.GrantInput, options: events.WebhookOptions = {}): Promise<events.Result<Omit<events.Grant, 'secret'> | events.WebhookResult>> {
+    return this.subscribe(input, options);
   }
 
   async unsubscribe(input: events.GrantInput): Promise<events.Result<null>> {

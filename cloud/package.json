@@ -9,7 +9,8 @@
     "types": "wrangler types",
     "test:events": "node --experimental-strip-types src/events.test.ts",
     "test:webhook": "node --experimental-strip-types src/webhook.test.ts",
-    "test:delivery": "npm run test:events && npm run test:webhook"
+    "test:delivery": "npm run test:events && npm run test:webhook",
+    "test:wire": "node --experimental-strip-types --experimental-specifier-resolution=node src/events-wire.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

@@ -380,9 +380,10 @@ try {
   assert(socket,'alarm fixture socket');
   socket.accept();
   let finishAlarmAck: (()=>void) | undefined;
+  let authorizedExpiry = "";
   socket.addEventListener('message',(message:{data:string}) => {
     const frame = JSON.parse(message.data);
-    if (frame.method === 'events.authorize') socket.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));
+    if (frame.method === 'events.authorize') { authorizedExpiry = frame.params.expires_at; socket.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}})); }
     if (frame.type === 'turn_stop_ack') finishAlarmAck?.();
   });
   const idlePush=await object.openReader(push,null); assert(idlePush.ok,'idle reader opens');
@@ -414,6 +415,15 @@ try {
   await object.setChallengeFailure(false);
   const subscribed = await object.subscribe(webhook);
   assert(subscribed.ok && !JSON.stringify(subscribed).includes(webhook.secret), 'webhook subscribe hides secret');
+  const bounded = await object.subscribe({...webhook,arguments:{session_id:'session',node:'node'}},{ttlMs:1,cursor:subscribed.value.cursor,maxAgeMs:0});
+  assert(bounded.ok && bounded.value.id===subscribed.value.id && !bounded.value.truncated,'canonical refresh and live cursor');
+  assert(bounded.value.refreshBefore===authorizedExpiry && (await object.inspectGrant(bounded.value.id)).expires===Date.parse(authorizedExpiry),'authorization, grant and result share deadline');
+  assert(Date.parse(bounded.value.refreshBefore)-Date.now()>59000 && Date.parse(bounded.value.refreshBefore)-Date.now()<=60000,'minimum grant');
+  const invalidAge = await object.subscribe(webhook,{maxAgeMs:-1});
+  assert(!invalidAge.ok && invalidAge.error==='invalid_params','invalid max age rejected');
+  const foreign = await object.subscribe(webhook,{cursor:'foreign'});
+  assert(foreign.ok && foreign.value.truncated,'foreign cursor truncated');
+
   const challengeCount = await object.challengeCount();
   const refreshedWebhook = await object.refresh(webhook);
   assert(refreshedWebhook.ok && !JSON.stringify(refreshedWebhook).includes(webhook.secret), 'webhook refresh hides secret');

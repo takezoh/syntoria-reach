@@ -33,7 +33,7 @@ export function createAccessVerifier(config: AccessConfig) {
   const keys = createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`), { timeoutDuration: 5000 });
 
   return {
-    async authenticate(assertion: string | null): Promise<void> {
+    async authenticate(assertion: string | null): Promise<{ issuer: string; subject: string }> {
       if (!assertion || assertion.length > 16_384) throw new AccessError(401);
       try {
         const { payload } = await jwtVerify(assertion, keys, {
@@ -43,6 +43,7 @@ export function createAccessVerifier(config: AccessConfig) {
           requiredClaims: ["sub", "exp", "iat"],
         });
         if (typeof payload.sub !== "string" || !payload.sub || payload.email !== config.ownerEmail) throw new AccessError(403);
+        return { issuer, subject: payload.sub };
       } catch (error) {
         if (error instanceof AccessError) throw error;
         if (error instanceof errors.JWTInvalid || error instanceof errors.JWTExpired ||
