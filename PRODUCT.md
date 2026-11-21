@@ -73,7 +73,7 @@ If the target node is offline, Reach reports it as unavailable. In the MVP, requ
 | Multi-node | Yes (Linux) | One remote MCP endpoint for all of the person's Linux nodes; other OSes later |
 | Agent-specific orchestration | Later | Per-agent planning and conversation management. Starting agents in Orca terminals is supported in the MVP |
 | P2P / WebRTC | Later | Direct communication paths for clients that support them |
-| MCP Events | Later | Asynchronous notifications such as job completion and node state |
+| MCP Events | Yes (agent turns) | Notification that an agent turn started through Reach stopped; job completion and node state later |
 
 ## 5. Core concepts
 
