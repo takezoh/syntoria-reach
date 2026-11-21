@@ -7,7 +7,9 @@ package main
 // Enable explicitly with REACH_E2E_GATEWAY=1 (requires cloud dependencies).
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -15,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -22,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -31,7 +35,9 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/takezoh/syntoria-reach/src/internal/core"
 	"github.com/takezoh/syntoria-reach/src/internal/orca/orcatest"
+	"github.com/takezoh/syntoria-reach/src/internal/store"
 )
 
 const (
@@ -155,6 +161,7 @@ func TestRemoteE2E(t *testing.T) {
 	}
 	op = c.mustTool("start_agent_session", map[string]any{"node": "desk", "operation_id": "r-s", "workspace": wsID, "agent": "claude"}).(map[string]any)
 	sessionID := result(op)["session_id"]
+	c.eventsE2E(desk, sessionID.(string), wsID, names)
 	prompt := map[string]any{"node": "desk", "operation_id": "r-p", "session_id": sessionID, "text": "hi"}
 	if op := c.mustTool("send_agent_prompt", prompt).(map[string]any); op["state"] != "succeeded" {
 		t.Fatalf("send_agent_prompt: %v", op)
@@ -164,7 +171,7 @@ func TestRemoteE2E(t *testing.T) {
 	}
 	// Resending the prompt with the same operation ID types nothing again.
 	c.mustTool("send_agent_prompt", prompt)
-	if n := strings.Count(orcatest.Calls(t, filepath.Join(filepath.Dir(desk.sock), "orca")), "terminal send "); n != 1 {
+	if n := strings.Count(orcatest.Calls(t, filepath.Join(filepath.Dir(desk.sock), "orca")), "terminal send "); n != 5 {
 		t.Fatalf("the prompt was typed %d times", n)
 	}
 	if s := c.mustTool("get_agent_session", map[string]any{"node": "desk", "session_id": sessionID}).(map[string]any); s["workspace"] != wsID || s["state"] != "idle" {
@@ -237,7 +244,7 @@ func TestRemoteE2E(t *testing.T) {
 		}
 	}
 	for _, subject := range []string{"another-person", ""} {
-		if status, _ := (&mcpClient{t: t, url: resource, token: access.issue(subject, accessAudience, time.Now().Add(time.Hour))}).status(); status != http.StatusForbidden {
+		if status, _ := (&mcpClient{t: t, url: resource, token: access.issue(subject, accessAudience, time.Now().Add(time.Hour))}).post(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "events/poll", "params": map[string]any{}}); status != http.StatusForbidden {
 			t.Fatalf("subject %q: %d", subject, status)
 		}
 	}
@@ -463,6 +470,9 @@ func (c *mcpClient) status() (int, string) {
 	if c.version != "" {
 		req.Header.Set("MCP-Protocol-Version", c.version)
 	}
+	if c.name != "" {
+		req.Header.Set("Mcp-Name", c.name)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		c.t.Fatal(err)
@@ -477,6 +487,7 @@ type mcpClient struct {
 	url        string
 	token      string
 	bearerOnly bool
+	name       string
 	version    string
 	id         int
 }
@@ -490,7 +501,9 @@ func (c *mcpClient) post(msg map[string]any) (int, map[string]any) {
 	c.t.Helper()
 	b, _ := json.Marshal(msg)
 	req, _ := http.NewRequest(http.MethodPost, c.url, bytes.NewReader(b))
-	if c.bearerOnly {
+	if c.token == "" {
+		// An empty token sends no assertion header at all.
+	} else if c.bearerOnly {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	} else {
 		req.Header.Set("Cf-Access-Jwt-Assertion", c.token)
@@ -499,6 +512,9 @@ func (c *mcpClient) post(msg map[string]any) (int, map[string]any) {
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if c.version != "" {
 		req.Header.Set("MCP-Protocol-Version", c.version)
+	}
+	if c.name != "" {
+		req.Header.Set("Mcp-Name", c.name)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -602,4 +618,292 @@ func (c *mcpClient) waitTool(name string, args map[string]any, cond func(any, *t
 	}
 	c.t.Fatalf("%s %v: condition never held; last %v %+v", name, args, last, lastErr)
 	return nil
+}
+
+const eventName = "agent.session_state_changed"
+
+func (c *mcpClient) eventsE2E(d *daemon, session string, workspace any, oldNames []string) {
+	t := c.t
+	modern := &mcpClient{t: t, url: c.url, token: c.token, version: "2026-07-28", name: eventName}
+	chat := &mcpClient{t: t, url: c.url + "?events=chatgpt", token: c.token, version: "2026-07-28"}
+	for _, client := range []*mcpClient{modern, chat} {
+		discover := client.rpc("server/discover", map[string]any{})
+		caps := discover["capabilities"].(map[string]any)
+		if client == chat {
+			if caps["events"] == nil {
+				t.Fatalf("chat discovery: %v", discover)
+			}
+		} else if caps["extensions"].(map[string]any)["io.modelcontextprotocol/events"] == nil {
+			t.Fatalf("standard discovery: %v", discover)
+		}
+		list := client.rpc("events/list", map[string]any{})["events"].([]any)
+		if len(list) != 1 || list[0].(map[string]any)["name"] != eventName {
+			t.Fatalf("events list: %v", list)
+		}
+		var names []string
+		for _, tool := range client.rpc("tools/list", map[string]any{})["tools"].([]any) {
+			names = append(names, tool.(map[string]any)["name"].(string))
+		}
+		if !reflect.DeepEqual(names, oldNames) {
+			t.Fatalf("catalog: %v vs %v", names, oldNames)
+		}
+		client.mustTool("list_nodes", map[string]any{})
+	}
+	legacy := &mcpClient{t: t, url: chat.url, token: c.token}
+	init := legacy.rpc("initialize", map[string]any{"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "reach-e2e", "version": "0"}})
+	if init["capabilities"].(map[string]any)["events"] == nil {
+		t.Fatalf("legacy chat capabilities: %v", init)
+	}
+	legacy.version = init["protocolVersion"].(string)
+	var legacyNames []string
+	for _, tool := range legacy.rpc("tools/list", map[string]any{})["tools"].([]any) {
+		legacyNames = append(legacyNames, tool.(map[string]any)["name"].(string))
+	}
+	if !reflect.DeepEqual(legacyNames, oldNames) {
+		t.Fatalf("legacy chat catalog: %v", legacyNames)
+	}
+	for _, method := range []string{"events/poll", "events/stream"} {
+		_, out := chat.post(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": map[string]any{}})
+		if out["error"].(map[string]any)["code"] != float64(-32601) {
+			t.Fatalf("%s: %v", method, out)
+		}
+	}
+	for _, token := range []string{"", "malformed"} {
+		bad := *modern
+		bad.token = token
+		status, _ := bad.post(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "events/poll", "params": map[string]any{}})
+		if status != http.StatusUnauthorized && status != http.StatusForbidden {
+			t.Fatalf("event authentication: %d", status)
+		}
+	}
+	args := map[string]any{"node": "desk", "session_id": session}
+	params := map[string]any{"name": eventName, "arguments": args, "cursor": nil}
+	poll := func(cursor any) map[string]any { params["cursor"] = cursor; return modern.rpc("events/poll", params) }
+	initial := poll(nil)
+	cursor := initial["cursor"]
+	second := result(c.mustTool("start_agent_session", map[string]any{"node": "desk", "operation_id": "events-second", "workspace": workspace, "agent": "claude"}).(map[string]any))["session_id"]
+	other := modern.rpc("events/poll", map[string]any{"name": eventName, "arguments": map[string]any{"node": "desk", "session_id": second}, "cursor": cursor})
+	if other["truncated"] != true {
+		t.Fatalf("cross-session cursor: %v", other)
+	}
+	c.mustTool("stop_agent_session", map[string]any{"node": "desk", "operation_id": "events-second-stop", "session_id": second})
+	for _, name := range []string{"", "wrong"} {
+		bad := *modern
+		bad.name = name
+		status, out := bad.post(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "events/poll", "params": params})
+		if status != 400 || out["error"].(map[string]any)["code"] != float64(-32020) {
+			t.Fatalf("header: %d %v", status, out)
+		}
+	}
+	_, out := modern.post(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "events/subscribe", "params": map[string]any{"name": eventName, "arguments": args, "delivery": map[string]any{"mode": "push", "url": "https://example.test"}}})
+	if out["error"].(map[string]any)["code"] != float64(-32026) {
+		t.Fatalf("mode: %v", out)
+	}
+	_, out = modern.post(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "events/poll", "params": map[string]any{"name": eventName, "arguments": map[string]any{"node": "missing", "session_id": session}, "cursor": nil}})
+	if out["error"] == nil {
+		t.Fatalf("unknown node: %v", out)
+	}
+	c.mustTool("send_agent_prompt", map[string]any{"node": "desk", "operation_id": "events-poll", "session_id": session, "text": "events one"})
+	var got map[string]any
+	for range 100 {
+		raw := json.RawMessage(fmt.Sprintf(`{"session_id":%q,"node":"desk"}`, session))
+		got = modern.rpc("events/poll", map[string]any{"name": eventName, "arguments": raw, "cursor": cursor})
+		if got["truncated"] != false {
+			t.Fatalf("reordered cursor: %v", got)
+		}
+		if len(got["events"].([]any)) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	entries := got["events"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("poll: %v", got)
+	}
+	data := entries[0].(map[string]any)["data"].(map[string]any)
+	if len(data) != 4 || data["node"] != "desk" || data["session_id"] != session || data["state"] != "idle" || data["observed_at"] == nil {
+		t.Fatalf("payload: %v", data)
+	}
+	if out := c.mustTool("read_agent_output", map[string]any{"node": "desk", "session_id": session}).(map[string]any); out["reply"] != "echo: events one" {
+		t.Fatalf("output: %v", out)
+	}
+	cursor = got["cursor"]
+	if again := poll(cursor); len(again["events"].([]any)) != 0 {
+		t.Fatalf("duplicate: %v", again)
+	}
+	stream, cancel := modern.openEventStream(args, nil)
+	active := readEvent(t, stream, "active")
+	oldCursor := active["cursor"]
+	c.mustTool("send_agent_prompt", map[string]any{"node": "desk", "operation_id": "events-push", "session_id": session, "text": "events two"})
+	event := readEvent(t, stream, "event")
+	if event["data"].(map[string]any)["session_id"] != session {
+		t.Fatalf("stream: %v", event)
+	}
+	cancel()
+	stream.Close()
+	// Workerd detects an idle disconnect on a subsequent heartbeat write.
+	time.Sleep(3500 * time.Millisecond)
+	if out := c.mustTool("read_agent_output", map[string]any{"node": "desk", "session_id": session}).(map[string]any); out["reply"] != "echo: events two" {
+		t.Fatalf("stream output: %v", out)
+	}
+	stream, cancel = modern.openEventStream(args, oldCursor)
+	active = readEvent(t, stream, "active")
+	if active["truncated"] != true {
+		t.Fatalf("reopened: %v", active)
+	}
+	cancel()
+	stream.Close()
+	// Hold the fake backend while the prompt is in flight, then disconnect the reader.
+	stream, cancel = modern.openEventStream(args, nil)
+	readEvent(t, stream, "active")
+	lock, err := os.OpenFile(filepath.Join(filepath.Dir(d.sock), "orca", "state.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	before := orcatest.Calls(t, filepath.Join(filepath.Dir(d.sock), "orca"))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.mustTool("send_agent_prompt", map[string]any{"node": "desk", "operation_id": "events-abort", "session_id": session, "text": "after abort"})
+	}()
+	blocked := false
+	for range 100 {
+		if orcatest.Calls(t, filepath.Join(filepath.Dir(d.sock), "orca")) != before {
+			blocked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	stream.Close()
+	// Keep the backend blocked until both the Worker (on a later heartbeat
+	// write) and the broker's reader cleanup in the Durable Object have seen
+	// the disconnect, before the prompt is allowed to continue.
+	time.Sleep(5 * time.Second)
+	finished := false
+	select {
+	case <-done:
+		finished = true
+	default:
+	}
+	syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	lock.Close()
+	if finished {
+		t.Fatal("prompt finished while backend was blocked")
+	}
+	if !blocked {
+		t.Fatal("prompt did not reach blocked backend")
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("prompt did not continue after stream abort")
+	}
+	if out := c.mustTool("read_agent_output", map[string]any{"node": "desk", "session_id": session}).(map[string]any); out["reply"] != "echo: after abort" {
+		t.Fatalf("abort output: %v", out)
+	}
+	// An unarmed pending turn is durable evidence of a crash before observation.
+	cursor = poll(cursor)["cursor"]
+	d.kill()
+	db, err := store.Open(filepath.Join(filepath.Dir(d.sock), "reach.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.BeginTurn(core.Turn{ClientID: "e2e", OperationID: "events-unknown", SessionID: session}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	d.start()
+	c.waitTool("list_capabilities", map[string]any{"node": "desk"}, func(_ any, e *toolError) bool { return e == nil })
+	for range 100 {
+		got = poll(cursor)
+		if len(got["events"].([]any)) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	entries = got["events"].([]any)
+	if len(entries) != 1 || entries[0].(map[string]any)["data"].(map[string]any)["state"] != "unknown" {
+		t.Fatalf("unknown: %v", got)
+	}
+	c.mustTool("read_agent_output", map[string]any{"node": "desk", "session_id": session})
+	cursor = got["cursor"]
+	d.kill()
+	d.start()
+	c.waitTool("list_capabilities", map[string]any{"node": "desk"}, func(_ any, e *toolError) bool { return e == nil })
+	// The node relays its outbox in order, so a repeated unknown would arrive
+	// before the stop of a prompt sent after this restart.
+	c.mustTool("send_agent_prompt", map[string]any{"node": "desk", "operation_id": "events-after-restart", "session_id": session, "text": "after restart"})
+	var seen []any
+	for range 100 {
+		got = poll(cursor)
+		cursor = got["cursor"]
+		seen = append(seen, got["events"].([]any)...)
+		if len(seen) > 0 && seen[len(seen)-1].(map[string]any)["data"].(map[string]any)["state"] == "idle" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(seen) != 1 || seen[0].(map[string]any)["data"].(map[string]any)["state"] != "idle" {
+		t.Fatalf("after the second restart: %v", seen)
+	}
+	if out := c.mustTool("read_agent_output", map[string]any{"node": "desk", "session_id": session}).(map[string]any); out["reply"] != "echo: after restart" {
+		t.Fatalf("restart output: %v", out)
+	}
+}
+
+// eventStream keeps one buffered reader for the life of the response, so a
+// frame read ahead while finding one event is not lost for the next.
+type eventStream struct {
+	body   io.ReadCloser
+	reader *bufio.Reader
+}
+
+func (s *eventStream) Close() error { return s.body.Close() }
+
+func (c *mcpClient) openEventStream(args map[string]any, cursor any) (*eventStream, context.CancelFunc) {
+	c.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 42, "method": "events/stream", "params": map[string]any{"name": eventName, "arguments": args, "cursor": cursor, "heartbeatMs": 1000}})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(b))
+	req.Header.Set("Cf-Access-Jwt-Assertion", c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", c.version)
+	req.Header.Set("Mcp-Name", eventName)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		c.t.Fatalf("stream status: %s", resp.Status)
+	}
+	return &eventStream{body: resp.Body, reader: bufio.NewReader(resp.Body)}, cancel
+}
+
+func readEvent(t *testing.T, stream *eventStream, method string) map[string]any {
+	t.Helper()
+	for {
+		line, err := stream.reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var msg map[string]any
+		if err = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg["method"] == "notifications/events/"+method {
+			p := msg["params"].(map[string]any)
+			if p["_meta"].(map[string]any)["io.modelcontextprotocol/subscriptionId"] != float64(42) {
+				t.Fatalf("correlation: %v", msg)
+			}
+			return p
+		}
+	}
 }
