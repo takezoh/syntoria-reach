@@ -72,6 +72,16 @@ await e.acknowledge(stop('committed',1_000_000), async () => {effects.push('comm
 assert(effects.join(',')==='commit,ack:committed','ack after commit');
 try { await e.acknowledge(stop('failed',1_000_000), async () => {throw new Error('storage');}, id => effects.push('ack:'+id)); } catch { /* expected */ }
 assert(!effects.includes('ack:failed'),'storage failure does not ack');
+{
+  const hookA = {...base,mode:'webhook' as const,callback:'https://example.test/hook',secret:'whsec_'+btoa('a'.repeat(32))};
+  const hookB = {...hookA,arguments:{node:'node',session_id:'other-session'}};
+  let w = e.empty();
+  w.pending[e.verificationKey(hookB)] = {id:'pending-b',key:e.key(hookB),nonce:'n',secret:hookB.secret,expires:10_000};
+  [w] = e.unsubscribe(w,hookA,1_000);
+  assert(!!w.pending[e.verificationKey(hookB)],'unsubscribing another session keeps its challenge');
+  [w] = e.unsubscribe(w,hookB,1_000);
+  assert(!w.pending[e.verificationKey(hookB)],'unsubscribing the same subscription cancels its challenge');
+}
 console.log('events tests passed');
 
 const push = {...base,mode:'push' as const};
@@ -121,6 +131,7 @@ try {
   const connectHandler = () => { socket.accept(); socket.addEventListener('message', (event: {data:string}) => {
     const frame = JSON.parse(event.data);
     if (frame.method === 'events.authorize') {
+      assert(/^[0-9a-f]{64}$/.test(frame.params.subscription_key), 'node receives an opaque subscription key');
       if (holdAuthorization) { authorizationRequests.push(frame); authorizationWaiter?.(); authorizationWaiter=undefined; }
       else socket.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));
     }
@@ -197,7 +208,18 @@ const { build } = await (Function("return import('esbuild')")() as Promise<{buil
 const fs = await (Function("return import('node:fs/promises')")() as Promise<any>);
 const bundled = await build({stdin:{contents:`
 import { NodeBroker } from './src/broker.ts';
+import { safeHttps } from './src/webhook.ts';
 export class TestBroker extends NodeBroker {
+  failChallenge = false;
+  holdChallenge = false;
+  releaseChallenge() { this.resumeChallenge?.(); this.holdChallenge=false; }
+  async armChallenge() { this.holdChallenge=true; }
+  async pendingCount() { return (await this.ctx.storage.list({prefix:'verification/'})).size; }
+  webhookPort() { return safeHttps('https://example.test', async () => ({a:['8.8.8.8'],aaaa:[]}), async (_url,init) => {
+    if (this.holdChallenge) await new Promise(resolve => { this.resumeChallenge=resolve; });
+    return new Response(JSON.stringify({challenge:this.failChallenge ? 'wrong' : JSON.parse(init.body).challenge}));
+  }); }
+  async setChallengeFailure(value) { this.failChallenge = value; }
   async injectStop(stop) { await this.webSocketMessage({send() {}}, JSON.stringify(stop)); }
   async overflowReader(id, stop) {
     const grant = await this.ctx.storage.get('grant/' + id);
@@ -230,10 +252,10 @@ export class TestBroker extends NodeBroker {
   }
 }
 export default { fetch() { return new Response('ok'); } };
-`,resolveDir:Function('return process.cwd()')(),sourcefile:'alarm-fixture.ts'},bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
+`,resolveDir:Function('return process.cwd()')(),sourcefile:'alarm-fixture.ts'},bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers','node:dns/promises']});
 await fs.mkdir('.wrangler/tmp',{recursive:true});
 await fs.writeFile('.wrangler/tmp/alarm-fixture.mjs',bundled.outputFiles[0].text);
-const alarmHarness = createTestHarness({workers:[{config:{name:'alarm-test',main:'.wrangler/tmp/alarm-fixture.mjs',compatibility_date:'2026-11-01',durable_objects:{bindings:[{name:'NODE',class_name:'TestBroker'}]},migrations:[{tag:'v1',new_sqlite_classes:['TestBroker']}]}}]});
+const alarmHarness = createTestHarness({workers:[{config:{name:'alarm-test',main:'.wrangler/tmp/alarm-fixture.mjs',compatibility_date:'2026-11-01',compatibility_flags:['nodejs_compat'],vars:{WEBHOOK_ALLOWED_ORIGINS:'https://example.test'},durable_objects:{bindings:[{name:'NODE',class_name:'TestBroker'}]},migrations:[{tag:'v1',new_sqlite_classes:['TestBroker']}]}}]});
 try {
   await alarmHarness.listen();
   const alarmEnv = await alarmHarness.getWorker().getEnv();
@@ -249,6 +271,27 @@ try {
     if (frame.method === 'events.authorize') socket.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));
     if (frame.type === 'turn_stop_ack') finishAlarmAck?.();
   });
+  const webhook = {...base,mode:'webhook' as const,callback:'https://example.test/hook',secret:'whsec_'+btoa('a'.repeat(32))};
+  await object.armChallenge();
+  const inFlightWebhook = object.subscribe(webhook);
+  for (let i=0;i<100 && await object.pendingCount()===0;i++) await new Promise(resolve=>setTimeout(resolve,10));
+  assert(await object.pendingCount()===1,'pending challenge is durable');
+  const overlappingWebhook = await object.subscribe(webhook);
+  assert(!overlappingWebhook.ok && overlappingWebhook.error==='unavailable','only one challenge per principal and URL');
+  await object.unsubscribe(webhook);
+  await object.releaseChallenge();
+  assert(!(await inFlightWebhook).ok,'unsubscribe invalidates an in-flight challenge');
+  assert(await object.pendingCount()===0,'single-use challenge removed');
+  await object.setChallengeFailure(true);
+  const rejectedWebhook = await object.subscribe(webhook);
+  assert(!rejectedWebhook.ok && rejectedWebhook.error === 'challenge_failed', 'failed challenge does not activate');
+  await object.setChallengeFailure(false);
+  const subscribed = await object.subscribe(webhook);
+  assert(subscribed.ok && !JSON.stringify(subscribed).includes(webhook.secret), 'webhook subscribe hides secret');
+  const refreshedWebhook = await object.refresh(webhook);
+  assert(refreshedWebhook.ok && !JSON.stringify(refreshedWebhook).includes(webhook.secret), 'webhook refresh hides secret');
+  assert((await object.inspectGrant(subscribed.value.id)).secret === webhook.secret, 'webhook grant retains secret');
+  assert((await object.unsubscribe(webhook)).ok, 'webhook fixture cleanup');
   const first = await object.subscribe(base);
   assert(first.ok, 'alarm fixture first grant');
   await new Promise(resolve => setTimeout(resolve,10));

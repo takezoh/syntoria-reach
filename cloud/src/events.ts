@@ -14,15 +14,16 @@ const LEASE_MS = 300_000;
 export const CLOCK_SKEW_MS = 30_000;
 
 export type Principal = { issuer: string; subject: string };
-export type GrantInput = { principal: Principal; node: string; name: string; arguments: { node: string; session_id: string }; profile: string; mode: 'poll' | 'push' | 'webhook'; callback?: string };
+export type GrantInput = { principal: Principal; node: string; name: string; arguments: { node: string; session_id: string }; profile: string; mode: 'poll' | 'push' | 'webhook'; callback?: string; secret?: string };
 export type Stop = { type: 'turn_stop'; eventId: string; session_id: string; state: 'idle' | 'waiting_on_human' | 'exited' | 'unknown'; observed_at: string };
 export type Grant = GrantInput & { id: string; created: number; expires: number; authorized: boolean; events: string[]; floor: number; reader?: true };
 type Entry = { stop: Stop; seq: number; grants: string[] };
 type Dedupe = { admitted: number; grants: string[] };
-export type State = { grants: Record<string, Grant>; events: Record<string, Entry>; dedupe: Record<string, Dedupe>; seq: number };
-export type Category = 'unavailable' | 'forbidden' | 'not_found' | 'invalid_params' | 'limit';
+export type Verification = { id:string; key:string; nonce:string; secret:string; expires:number };
+export type State = { grants: Record<string, Grant>; events: Record<string, Entry>; dedupe: Record<string, Dedupe>; pending: Record<string, Verification>; seq: number };
+export type Category = 'unavailable' | 'forbidden' | 'not_found' | 'invalid_params' | 'limit' | 'callback_endpoint' | 'resolution_failed' | 'timeout' | 'tls_error' | 'connection_refused' | 'challenge_failed';
 export type Result<T> = { ok: true; value: T } | { ok: false; error: Category };
-export const empty = (): State => ({ grants: {}, events: {}, dedupe: {}, seq: 0 });
+export const empty = (): State => ({ grants: {}, events: {}, dedupe: {}, pending: {}, seq: 0 });
 export const key = (g: GrantInput): string => JSON.stringify([g.principal.issuer, g.principal.subject, g.node, g.name, g.arguments.node, g.arguments.session_id, g.mode, g.mode === 'webhook' ? g.callback : null]);
 export function valid(g: GrantInput): boolean {
   return !!(g && g.principal && typeof g.principal.issuer === 'string' && g.principal.issuer &&
@@ -31,10 +32,14 @@ export function valid(g: GrantInput): boolean {
     Object.keys(g.arguments).length === 2 && g.arguments.node === g.node &&
     typeof g.arguments.session_id === 'string' && g.arguments.session_id &&
     typeof g.profile === 'string' && g.profile && ['poll', 'push', 'webhook'].includes(g.mode) &&
-    (g.mode !== 'webhook' || (typeof g.callback === 'string' && g.callback)));
+    (g.mode === 'webhook' ? (typeof g.callback === 'string' && !!g.callback) : g.secret === undefined));
 }
+export const verificationKey = (g: GrantInput):string => JSON.stringify([g.principal.issuer,g.principal.subject,g.callback]);
 function remove(s: State, id: string): void {
   const g = s.grants[id]; if (!g) return;
+  // A pending challenge for the same principal and URL may belong to another
+  // session's subscribe; delete only the one reserved for this grant.
+  if (g.mode === 'webhook' && s.pending[verificationKey(g)]?.id === id) delete s.pending[verificationKey(g)];
   for (const eventId of g.events) {
     const e = s.events[eventId]; if (!e) continue;
     e.grants = e.grants.filter(x => x !== id);
@@ -76,6 +81,7 @@ export function readReader(s: State, id: string, now: number): [State, Result<{e
 export function expire(s: State, now: number): State {
   const n = structuredClone(s);
   for (const g of Object.values(n.grants)) if (g.expires <= now) remove(n, g.id);
+  for (const [id, pending] of Object.entries(n.pending)) if (pending.expires <= now) delete n.pending[id];
   for (const [id, d] of Object.entries(n.dedupe)) if (d.admitted + DEDUPE_MS <= now) delete n.dedupe[id];
   return n;
 }
@@ -87,6 +93,7 @@ export function subscribe(s: State, input: GrantInput, now: number, id: string, 
     if (decision === 'denied') { remove(n, existing.id); return [n, {ok:false,error:'forbidden'}]; }
     existing.expires = now + LEASE_MS;
     existing.authorized = decision === 'allowed';
+    if (input.mode === 'webhook') existing.secret = input.secret;
     return [n, {ok:true,value:existing}];
   }
   if (decision !== 'allowed') return [n, {ok:false,error:decision === 'denied' ? 'forbidden' : 'unavailable'}];
@@ -102,6 +109,9 @@ export function setAuthorization(s: State, id: string, decision: 'allowed' | 'de
 }
 export function unsubscribe(s: State, input: GrantInput, now: number): [State, Result<null>] {
   const n = expire(s,now); const g = Object.values(n.grants).find(x => !x.reader && key(x) === key(input));
+  // Unsubscribing also cancels this subscription's in-flight challenge, but not
+  // another session's challenge to the same principal and URL.
+  if (input.mode === 'webhook' && n.pending[verificationKey(input)]?.key === key(input)) delete n.pending[verificationKey(input)];
   if (!g) return [n,{ok:false,error:'not_found'}];
   remove(n,g.id); return [n,{ok:true,value:null}];
 }

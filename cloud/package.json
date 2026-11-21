@@ -7,10 +7,12 @@
     "deploy": "wrangler deploy",
     "check": "wrangler types && tsc --noEmit",
     "types": "wrangler types",
-    "test:events": "node --experimental-strip-types src/events.test.ts"
+    "test:events": "node --experimental-strip-types src/events.test.ts",
+    "test:webhook": "node --experimental-strip-types src/webhook.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
+    "ipaddr.js": "^1.9.1",
     "jose": "6.2.15",
     "zod": "4.6.7"
   },
