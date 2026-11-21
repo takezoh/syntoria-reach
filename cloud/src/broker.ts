@@ -40,12 +40,17 @@ type Pending = { ws: WebSocket; method: string; resolve: (reply: Reply) => void;
 
 export class NodeBroker extends DurableObject<Env> {
   private pending = new Map<string, Pending>();
+  private waiters = new Set<() => void>();
+  private readerEnds = new Map<string, 'forbidden' | 'expired' | 'limit' | 'closed'>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     // The daemon's keepalive is answered without waking the object.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    ctx.blockConcurrencyWhile(async () => { await this.change(s => [events.removeReaders(s, []), null]); });
   }
+
+  private wakeReaders(): void { for (const wake of this.waiters) wake(); this.waiters.clear(); }
 
   // Accepts the daemon's WebSocket. The Worker has checked the node token.
   // A new connection replaces the old one (the daemon reconnected).
@@ -63,6 +68,7 @@ export class NodeBroker extends DurableObject<Env> {
       for (const g of Object.values(next.grants)) g.authorized = false;
       return [next, null];
     });
+    this.wakeReaders();
     this.ctx.waitUntil(this.reauthorize());
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -97,9 +103,10 @@ export class NodeBroker extends DurableObject<Env> {
     if (reply.type === "turn_stop") {
       try {
         await events.acknowledge(reply as events.Stop,
-          stop => this.change(state => events.admit(state, stop, Date.now())),
+          stop => this.change(state => events.admit(state, stop, Date.now()), 'limit'),
           eventId => _ws.send(JSON.stringify({type:"turn_stop_ack",eventId})),
         );
+        this.wakeReaders();
       } catch {
         _ws.close(1011, "event storage failed");
       }
@@ -126,8 +133,8 @@ export class NodeBroker extends DurableObject<Env> {
 
   // The transaction owns the state and alarm together; no acknowledgement is
   // sent until the transaction has committed.
-  private async change<T>(fn: (state: events.State) => [events.State, T]): Promise<T> {
-    return this.ctx.storage.transaction(async tx => {
+  private async change<T>(fn: (state: events.State) => [events.State, T], reason?: 'forbidden' | 'limit' | 'closed'): Promise<T> {
+    const changed = await this.ctx.storage.transaction(async tx => {
       const state = events.empty();
       state.seq = await tx.get<number>("seq") ?? 0;
       for (const [k,v] of await tx.list<events.Grant>({prefix:"grant/"})) state.grants[k.slice(6)] = v;
@@ -145,15 +152,20 @@ export class NodeBroker extends DurableObject<Env> {
         }
       }
       if (next.seq !== state.seq) await tx.put("seq", next.seq);
-      const deadlines = Object.values(next.grants).map(g => g.expires);
+      const deadlines = [...Object.values(next.grants).map(g => g.expires), ...Object.values(next.dedupe).map(d => d.admitted + events.DEDUPE_MS)];
       if (deadlines.length) await tx.setAlarm(Math.min(...deadlines));
       else await tx.deleteAlarm();
-      return result;
+      const ended = Object.values(state.grants).filter(g => g.reader && !next.grants[g.id]).map(g => ({id:g.id, reason:g.expires <= Date.now() ? 'expired' as const : reason}));
+      return {result, ended};
     });
+    for (const end of changed.ended) if (end.reason) this.readerEnds.set(end.id, end.reason);
+    if (changed.ended.length) this.wakeReaders();
+    return changed.result;
   }
 
   async alarm(): Promise<void> {
     await this.change(state => [events.expire(state, Date.now()), null]);
+    this.wakeReaders();
   }
 
   private async authorize(input: events.GrantInput, expiry: number): Promise<'allowed' | 'denied' | 'unavailable'> {
@@ -194,6 +206,75 @@ export class NodeBroker extends DurableObject<Env> {
     return this.change(state => events.poll(state, input, cursor, batch, Date.now(), crypto.randomUUID(), maxAgeMs));
   }
 
+  // Records are newline-delimited JSON for the wire adapter; framing on the
+  // The wire closes the reader on every request exit, including abort.
+  async openReader(input: events.GrantInput, cursor: string | null): Promise<events.Result<ReadableStream<Uint8Array>>> {
+    if (!events.valid(input) || input.mode !== 'push' || (cursor !== null && typeof cursor !== 'string')) return {ok:false,error:'invalid_params'};
+    const ws = this.ctx.getWebSockets().find(s => s.readyState === WebSocket.OPEN);
+    const decision = await this.authorize(input, Date.now() + 300_000);
+    const active = ws && ws.readyState === WebSocket.OPEN && this.ctx.getWebSockets().includes(ws);
+    const id = crypto.randomUUID();
+    const opened = await this.change(s => events.openReader(s, input, Date.now(), id, active ? decision : 'unavailable', cursor));
+    if (!opened.ok) return opened;
+    const encoder = new TextEncoder();
+    let initial = true;
+    let closed = false;
+    const cleanup = async () => {
+      if (closed) return;
+      closed = true; this.wakeReaders();
+      await this.change(s => [events.closeReader(s, id), null], 'closed');
+      this.readerEnds.delete(id);
+    };
+    const stream = new ReadableStream<Uint8Array>({
+      pull: async controller => {
+        if (initial) {
+          initial = false;
+          controller.enqueue(encoder.encode(JSON.stringify({type:'active',id,cursor:opened.value.cursor,truncated:opened.value.truncated})+'\n'));
+          return;
+        }
+        while (!closed) {
+          let wake!: () => void;
+          const signal = new Promise<void>(resolve => { wake = resolve; this.waiters.add(resolve); });
+          try {
+            const result = await this.change(s => {
+              if (this.ctx.getWebSockets().some(ws => ws.readyState === WebSocket.OPEN)) return events.readReader(s, id, Date.now());
+              const next = events.expire(s, Date.now());
+              return [next, {ok:false as const,error:next.grants[id] ? 'unavailable' as const : 'not_found' as const}];
+            });
+            if (!result.ok && result.error !== 'unavailable') {
+              const reason = this.readerEnds.get(id) ?? 'expired';
+              if (reason !== 'closed') controller.enqueue(encoder.encode(JSON.stringify({type:'terminated',reason})+'\n'));
+              await cleanup(); controller.close(); return;
+            }
+            if (result.ok && result.value) {
+              controller.enqueue(encoder.encode(JSON.stringify({type:'event',...result.value})+'\n'));
+              return;
+            }
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const heartbeat = new Promise<'heartbeat'>(resolve => { timer = setTimeout(() => resolve('heartbeat'), 1000); });
+            const outcome = await Promise.race([signal.then(() => 'wake' as const), heartbeat]);
+            if (timer !== undefined) clearTimeout(timer);
+            if (outcome === 'heartbeat' && !closed) {
+              controller.enqueue(encoder.encode('{"type":"keepalive"}\n'));
+              return;
+            }
+          } finally { this.waiters.delete(wake); }
+        }
+      },
+      cancel: cleanup,
+    }, {highWaterMark:0});
+    return {ok:true,value:stream};
+  }
+
+  async closeReader(input: events.GrantInput, id: string): Promise<events.Result<null>> {
+    if (!events.valid(input) || input.mode !== 'push' || typeof id !== 'string') return {ok:false,error:'invalid_params'};
+    return this.change(s => {
+      const g = s.grants[id];
+      if (!g || !g.reader || events.key(g) !== events.key(input)) return [s,{ok:false,error:'not_found'}] as [events.State,events.Result<null>];
+      return [events.closeReader(s,id),{ok:true,value:null}];
+    }, 'closed');
+  }
+
   private async pause(): Promise<void> {
     if (this.ctx.getWebSockets().some(ws => ws.readyState === WebSocket.OPEN)) return;
     await this.change(state => {
@@ -201,14 +282,19 @@ export class NodeBroker extends DurableObject<Env> {
       for (const g of Object.values(next.grants)) g.authorized = false;
       return [next, null];
     });
+    this.wakeReaders();
   }
 
   private async reauthorize(): Promise<void> {
+    const ws = this.ctx.getWebSockets().find(s => s.readyState === WebSocket.OPEN);
+    if (!ws) return;
     const grants = await this.ctx.storage.list<events.Grant>({prefix:"grant/"});
     for (const g of grants.values()) {
       if (g.expires <= Date.now()) continue;
       const decision = await this.authorize(g, g.expires);
-      await this.change(current => [events.setAuthorization(current, g.id, decision, Date.now()), null]);
+      if (ws.readyState !== WebSocket.OPEN || !this.ctx.getWebSockets().includes(ws)) return;
+      await this.change(current => [events.setAuthorization(current, g.id, decision, Date.now()), null], decision === 'denied' ? 'forbidden' : undefined);
+      this.wakeReaders();
     }
   }
 

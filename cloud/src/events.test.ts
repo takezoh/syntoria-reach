@@ -74,6 +74,31 @@ try { await e.acknowledge(stop('failed',1_000_000), async () => {throw new Error
 assert(!effects.includes('ack:failed'),'storage failure does not ack');
 console.log('events tests passed');
 
+const push = {...base,mode:'push' as const};
+let ps=e.empty();
+let opened: e.Result<{grant:e.Grant;cursor:string;truncated:boolean}>;
+[ps,opened]=e.openReader(ps,push,10_000,'reader1','allowed',null); assert(opened.ok,'first reader'); const oldCursor=opened.value.cursor;
+[ps,opened]=e.openReader(ps,push,10_000,'reader2','allowed',null); assert(opened.ok,'independent reader');
+[ps,ack]=e.admit(ps,stop('push-shared',10_001),10_001);
+assert(ps.events['push-shared'].grants.length===2,'push readers share occurrence');
+ps=e.closeReader(ps,'reader1');
+assert(!ps.grants.reader1 && ps.events['push-shared'].grants.join() === 'reader2' && ps.dedupe['push-shared'].grants.join() === 'reader2','cancel removes only its membership');
+[ps,opened]=e.openReader(ps,push,10_002,'reader3','allowed',oldCursor);
+assert(opened.ok && opened.value.truncated && opened.value.cursor!==oldCursor && !ps.grants.reader3.events.length,'old cursor cannot recover');
+let read: e.Result<{event:e.Stop;cursor:string}|null>;
+[ps,read]=e.readReader(ps,'reader2',10_002); assert(read.ok && read.value?.event.eventId==='push-shared','other reader receives shared occurrence');
+ps=e.removeReaders(ps,[]); assert(!Object.keys(ps.grants).length && ps.dedupe['push-shared'].grants.length===0,'restart removes readers and membership');
+let solo=e.empty();
+[solo,opened]=e.openReader(solo,push,20_000,'solo','allowed',null); assert(opened.ok,'solo reader');
+[solo,ack]=e.admit(solo,stop('resend',20_001),20_001); assert(ack,'first admission');
+solo=e.closeReader(solo,'solo');
+assert(!solo.events.resend && solo.dedupe.resend.grants.length===0,'only admission marker remains');
+[solo,opened]=e.openReader(solo,push,20_002,'replacement','allowed',null); assert(opened.ok,'replacement');
+[solo,ack]=e.admit(solo,stop('resend',20_001),20_003);
+assert(ack && !solo.events.resend && !solo.grants.replacement.events.length,'resend acknowledged without delivery');
+[solo,ack]=e.admit(solo,stop('new-stop',20_001),20_003);
+assert(ack && solo.grants.replacement.events[0]==='new-stop','new identity retains clock skew tolerance');
+
 // Exercise real SQLite-backed DO storage and its daemon WebSocket locally.
 const { createTestHarness } = await (Function("return import('wrangler')")() as Promise<{createTestHarness: (options: unknown) => any}>);
 const harness = createTestHarness({workers:[{configPath:'./wrangler.jsonc'}]});
@@ -102,6 +127,25 @@ try {
     if (frame.type === 'turn_stop_ack') receivedAck?.(frame.eventId);
   }); };
   connectHandler();
+  const pushOne = await stub.openReader(push,null);
+  const pushTwo = await stub.openReader(push,null);
+  assert(pushOne.ok && pushTwo.ok, 'real DO opens independent readers');
+  const readerOne = pushOne.value.getReader(); const readerTwo = pushTwo.value.getReader();
+  const decode = (chunk: Uint8Array) => JSON.parse(new TextDecoder().decode(chunk));
+  const activeOne = decode((await readerOne.read()).value); const activeTwo = decode((await readerTwo.read()).value);
+  assert(activeOne.type === 'active' && !activeOne.truncated, 'initial active');
+  await new Promise<void>(resolve => { receivedAck=()=>resolve(); socket.send(JSON.stringify(stop('push-do',Date.now()+1))); });
+  assert((await stub.closeReader(push,activeOne.id)).ok,'wire closes cancelled reader');
+  await readerOne.cancel();
+  const delivered = decode((await readerTwo.read()).value);
+  assert(delivered.type === 'event' && delivered.event.eventId === 'push-do', 'other reader receives shared event');
+  const reopened = await stub.openReader(push,activeOne.cursor);
+  assert(reopened.ok, 'replacement reader');
+  const replacementReader = reopened.value.getReader();
+  const replacementActive = decode((await replacementReader.read()).value);
+  assert(replacementActive.truncated && replacementActive.cursor !== activeOne.cursor, 'replacement has fresh truncated cursor');
+  await stub.closeReader(push,replacementActive.id); await replacementReader.cancel();
+  await stub.closeReader(push,activeTwo.id); await readerTwo.cancel();
   const granted = await stub.subscribe(base);
   assert(granted.ok, 'real DO grant');
   const start = await stub.poll(base,null,10);
@@ -154,6 +198,17 @@ const fs = await (Function("return import('node:fs/promises')")() as Promise<any
 const bundled = await build({stdin:{contents:`
 import { NodeBroker } from './src/broker.ts';
 export class TestBroker extends NodeBroker {
+  async injectStop(stop) { await this.webSocketMessage({send() {}}, JSON.stringify(stop)); }
+  async overflowReader(id, stop) {
+    const grant = await this.ctx.storage.get('grant/' + id);
+    for (let i=0;i<256;i++) {
+      const eventId='overflow-fixture-'+i;
+      grant.events.push(eventId);
+      await this.ctx.storage.put('event/'+eventId,{stop:{...stop,eventId},seq:i+1,grants:[id]});
+    }
+    await this.ctx.storage.put('grant/'+id,grant);
+    await this.injectStop(stop);
+  }
   async inspectAlarm() { return this.ctx.storage.getAlarm(); }
   async expireAndFire(id) {
     const key = 'grant/' + id;
@@ -164,6 +219,7 @@ export class TestBroker extends NodeBroker {
   }
   async hasGrant(id) { return !!(await this.ctx.storage.get('grant/' + id)); }
   async inspectEvent(id) { return this.ctx.storage.get('event/' + id); }
+  async inspectDedupe(id) { return this.ctx.storage.get('dedupe/' + id); }
   async inspectGrant(id) { return this.ctx.storage.get('grant/' + id); }
   async shortenGrant(id) {
     const key = 'grant/' + id;
@@ -232,6 +288,74 @@ try {
   assert(!(await object.hasGrant(second.value.id)), 'reconnect denial deletes grant');
   assert(!(await object.inspectEvent('alarm-shared')), 'denial deletes last event membership');
   socket2.close();
+
+  const connected = await object.fetch('http://node/', {headers:{Upgrade:'websocket'}});
+  const socket3 = connected.webSocket; assert(socket3,'push authorization socket'); socket3.accept();
+  socket3.addEventListener('message',(message:{data:string}) => {
+    const frame=JSON.parse(message.data);
+    if (frame.method==='events.authorize') socket3.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));
+  });
+  const pushResult=await object.openReader(push,null); assert(pushResult.ok,'push opens');
+  const otherResult=await object.openReader(push,null); assert(otherResult.ok,'second push opens');
+  const pushReader=pushResult.value.getReader();
+  const otherReader=otherResult.value.getReader(); const otherActive=JSON.parse(new TextDecoder().decode((await otherReader.read()).value));
+  const active=JSON.parse(new TextDecoder().decode((await pushReader.read()).value));
+  const pushId=JSON.parse(atob(active.cursor)).grant;
+  const pushClosed=new Promise<void>(resolve=>socket3.addEventListener('close',()=>resolve()));
+  socket3.close(); await pushClosed;
+  for (let i=0;i<50 && (await object.inspectGrant(pushId)).authorized;i++) await new Promise(resolve=>setTimeout(resolve,10));
+  await object.injectStop(stop('push-offline',Date.now()));
+  assert((await object.closeReader(push,otherActive.id)).ok,'request completion explicitly closes reader');
+  await otherReader.cancel();
+  assert(!(await object.hasGrant(otherActive.id)), 'request completion deletes grant');
+  const shared = await object.inspectEvent('push-offline');
+  const membership = await object.inspectDedupe('push-offline');
+  assert(shared.grants.length===1 && shared.grants[0]===pushId && membership.grants.length===1 && membership.grants[0]===pushId,'completion deletes only ended membership');
+  const pending=pushReader.read();
+  assert(!await Promise.race([pending.then(()=>true),new Promise<boolean>(resolve=>setTimeout(()=>resolve(false),30))]),'offline reader is suspended');
+  const reconnect=await object.fetch('http://node/',{headers:{Upgrade:'websocket'}});
+  const socket4=reconnect.webSocket; assert(socket4,'push reconnect socket'); socket4.accept();
+  const request=await new Promise<string>((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('push authorization timeout')),5000);
+    socket4.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize'){clearTimeout(timer);resolve(frame.id);}});
+  });
+  assert(!await Promise.race([pending.then(()=>true),new Promise<boolean>(resolve=>setTimeout(()=>resolve(false),30))]),'reader waits for reauthorization');
+  socket4.send(JSON.stringify({id:request,result:{decision:'denied'}}));
+  const terminated=await pending;
+  assert(!terminated.done && JSON.parse(new TextDecoder().decode(terminated.value)).reason==='forbidden' && (await pushReader.read()).done && !(await object.hasGrant(pushId)),'denial reports forbidden and deletes grant');
+  socket4.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') socket4.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));});
+  const expiring=await object.openReader(push,null); assert(expiring.ok,'expiring reader opens');
+  const expiryReader=expiring.value.getReader();
+  const expiryActive=JSON.parse(new TextDecoder().decode((await expiryReader.read()).value));
+  await object.expireAndFire(expiryActive.id);
+  const expiryEnd=await expiryReader.read();
+  assert(!expiryEnd.done && JSON.parse(new TextDecoder().decode(expiryEnd.value)).reason==='expired','expiry has a distinct reason');
+  const full=await object.openReader(push,null); assert(full.ok,'full reader opens');
+  const fullReader=full.value.getReader();
+  const fullActive=JSON.parse(new TextDecoder().decode((await fullReader.read()).value));
+  await object.overflowReader(fullActive.id,stop('push-overflow',Date.now()));
+  const fullEnd=await fullReader.read();
+  assert(!fullEnd.done && JSON.parse(new TextDecoder().decode(fullEnd.value)).reason==='limit' && !(await object.hasGrant(fullActive.id)),'overflow reports limit and removes reader');
+  const lost=await object.openReader(push,null); assert(lost.ok,'lost request opens');
+  const lostReader=lost.value.getReader();
+  const lostActive=JSON.parse(new TextDecoder().decode((await lostReader.read()).value));
+  await new Promise(resolve=>setTimeout(resolve,2200));
+  await lostReader.cancel();
+  for (let i=0;i<40 && await object.hasGrant(lostActive.id);i++) await new Promise(resolve=>setTimeout(resolve,100));
+  assert(!(await object.hasGrant(lostActive.id)),'lost stream is reconciled without an event');
+  socket4.close();
+  const beforeRestart=await object.fetch('http://node/',{headers:{Upgrade:'websocket'}});
+  const socket5=beforeRestart.webSocket; assert(socket5,'restart fixture socket'); socket5.accept();
+  socket5.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') socket5.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));});
+  const orphan=await object.openReader(push,null); assert(orphan.ok,'reader before restart');
+  const orphanReader=orphan.value.getReader();
+  const orphanActive=JSON.parse(new TextDecoder().decode((await orphanReader.read()).value));
+  const orphanId=JSON.parse(atob(orphanActive.cursor)).grant;
+  assert(await object.hasGrant(orphanId),'reader persisted before restart');
+  await alarmHarness.update({workers:[{config:{name:'alarm-test',main:'.wrangler/tmp/alarm-fixture.mjs',compatibility_date:'2026-11-01',durable_objects:{bindings:[{name:'NODE',class_name:'TestBroker'}]},migrations:[{tag:'v1',new_sqlite_classes:['TestBroker']}]}}]});
+  const restartedEnv=await alarmHarness.getWorker().getEnv();
+  const restarted=restartedEnv.NODE.get(restartedEnv.NODE.idFromName('alarm-node'));
+  assert(!(await restarted.hasGrant(orphanId)),'restart reconciles lost reader');
 } finally {
   await alarmHarness.close();
 }

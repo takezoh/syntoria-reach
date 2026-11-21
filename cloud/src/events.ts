@@ -16,7 +16,7 @@ export const CLOCK_SKEW_MS = 30_000;
 export type Principal = { issuer: string; subject: string };
 export type GrantInput = { principal: Principal; node: string; name: string; arguments: { node: string; session_id: string }; profile: string; mode: 'poll' | 'push' | 'webhook'; callback?: string };
 export type Stop = { type: 'turn_stop'; eventId: string; session_id: string; state: 'idle' | 'waiting_on_human' | 'exited' | 'unknown'; observed_at: string };
-export type Grant = GrantInput & { id: string; created: number; expires: number; authorized: boolean; events: string[]; floor: number };
+export type Grant = GrantInput & { id: string; created: number; expires: number; authorized: boolean; events: string[]; floor: number; reader?: true };
 type Entry = { stop: Stop; seq: number; grants: string[] };
 type Dedupe = { admitted: number; grants: string[] };
 export type State = { grants: Record<string, Grant>; events: Record<string, Entry>; dedupe: Record<string, Dedupe>; seq: number };
@@ -40,11 +40,38 @@ function remove(s: State, id: string): void {
     e.grants = e.grants.filter(x => x !== id);
     if (!e.grants.length) delete s.events[eventId];
   }
-  for (const [eventId, d] of Object.entries(s.dedupe)) {
+  for (const d of Object.values(s.dedupe)) {
     d.grants = d.grants.filter(g => g !== id);
-    if (!d.grants.length) delete s.dedupe[eventId];
   }
   delete s.grants[id];
+}
+export function removeReaders(s: State, live: string[]): State {
+  const n = structuredClone(s);
+  for (const g of Object.values(n.grants)) if (g.reader && !live.includes(g.id)) remove(n, g.id);
+  return n;
+}
+export function closeReader(s: State, id: string): State {
+  const n = structuredClone(s); remove(n, id); return n;
+}
+export function openReader(s: State, input: GrantInput, now: number, id: string, decision: 'allowed' | 'denied' | 'unavailable', cursor: string | null): [State, Result<{grant: Grant; cursor: string; truncated: boolean}>] {
+  const n = expire(s, now);
+  if (!valid(input) || input.mode !== 'push' || (cursor !== null && typeof cursor !== 'string')) return [n,{ok:false,error:'invalid_params'}];
+  if (decision !== 'allowed') return [n,{ok:false,error:decision === 'denied' ? 'forbidden' : 'unavailable'}];
+  if (Object.keys(n.grants).length >= MAX_GRANTS) return [n,{ok:false,error:'limit'}];
+  const grant: Grant = {...structuredClone(input), id, created:now, expires:now+LEASE_MS, authorized:true, events:[], floor:n.seq, reader:true};
+  n.grants[id] = grant;
+  return [n,{ok:true,value:{grant,cursor:btoa(JSON.stringify({grant:id,position:n.seq})),truncated:cursor !== null}}];
+}
+export function readReader(s: State, id: string, now: number): [State, Result<{event: Stop; cursor: string} | null>] {
+  const n = expire(s, now); const g = n.grants[id];
+  if (!g) return [n,{ok:false,error:'not_found'}];
+  if (!g.authorized) return [n,{ok:false,error:'unavailable'}];
+  const eventId = g.events.shift();
+  if (!eventId) return [n,{ok:true,value:null}];
+  const row = n.events[eventId];
+  g.floor = row.seq; row.grants = row.grants.filter(x => x !== id);
+  if (!row.grants.length) delete n.events[eventId];
+  return [n,{ok:true,value:{event:row.stop,cursor:btoa(JSON.stringify({grant:id,position:row.seq}))}}];
 }
 export function expire(s: State, now: number): State {
   const n = structuredClone(s);
@@ -55,7 +82,7 @@ export function expire(s: State, now: number): State {
 export function subscribe(s: State, input: GrantInput, now: number, id: string, decision: 'allowed' | 'denied' | 'unavailable'): [State, Result<Grant>] {
   let n = expire(s, now);
   if (!valid(input)) return [n, {ok:false,error:'invalid_params'}];
-  const existing = Object.values(n.grants).find(g => key(g) === key(input));
+  const existing = Object.values(n.grants).find(g => !g.reader && key(g) === key(input));
   if (existing) {
     if (decision === 'denied') { remove(n, existing.id); return [n, {ok:false,error:'forbidden'}]; }
     existing.expires = now + LEASE_MS;
@@ -74,7 +101,7 @@ export function setAuthorization(s: State, id: string, decision: 'allowed' | 'de
   return n;
 }
 export function unsubscribe(s: State, input: GrantInput, now: number): [State, Result<null>] {
-  const n = expire(s,now); const g = Object.values(n.grants).find(x => key(x) === key(input));
+  const n = expire(s,now); const g = Object.values(n.grants).find(x => !x.reader && key(x) === key(input));
   if (!g) return [n,{ok:false,error:'not_found'}];
   remove(n,g.id); return [n,{ok:true,value:null}];
 }
@@ -85,6 +112,7 @@ export function admit(s: State, stop: Stop, now: number): [State, boolean] {
   const matching = Object.values(n.grants).filter(g => g.arguments.session_id === stop.session_id && Date.parse(stop.observed_at) >= g.created - CLOCK_SKEW_MS);
   for (const g of matching) {
     if (g.events.length >= MAX_EVENTS) {
+      if (g.reader) { remove(n, g.id); continue; }
       const oldest = g.events.shift()!;
       const row = n.events[oldest];
       g.floor = Math.max(g.floor, row.seq);
@@ -92,20 +120,21 @@ export function admit(s: State, stop: Stop, now: number): [State, boolean] {
       if (!row.grants.length) delete n.events[oldest];
     }
   }
-  if (matching.length) {
-    n.events[stop.eventId] = { stop, seq: ++n.seq, grants: matching.map(g => g.id) };
-    for (const g of matching) g.events.push(stop.eventId);
+  const eligible = matching.filter(g => !!n.grants[g.id]);
+  if (eligible.length) {
+    n.events[stop.eventId] = { stop, seq: ++n.seq, grants: eligible.map(g => g.id) };
+    for (const g of eligible) g.events.push(stop.eventId);
     const ids = Object.keys(n.dedupe);
     if (ids.length >= MAX_DEDUPE) {
       ids.sort((a,b) => n.dedupe[a].admitted - n.dedupe[b].admitted);
       delete n.dedupe[ids[0]];
     }
-    n.dedupe[stop.eventId] = {admitted:now, grants:matching.map(g => g.id)};
+    n.dedupe[stop.eventId] = {admitted:now, grants:eligible.map(g => g.id)};
   }
   return [n,true];
 }
 export function poll(s: State, input: GrantInput, cursor: string | null, batch: number, now: number, nextCursor: string, maxAgeMs?: number): [State, Result<{events: Stop[]; cursor:string; truncated:boolean; hasMore:boolean; nextPollMs:number}>] {
-  const n = expire(s,now); const g = Object.values(n.grants).find(x => key(x) === key(input));
+  const n = expire(s,now); const g = Object.values(n.grants).find(x => !x.reader && key(x) === key(input));
   if (!g) return [n,{ok:false,error:'not_found'}];
   if (!g.authorized) return [n,{ok:false,error:'unavailable'}];
   if (!Number.isInteger(batch) || batch < 1 || (maxAgeMs !== undefined && (!Number.isInteger(maxAgeMs) || maxAgeMs < 0))) return [n,{ok:false,error:'invalid_params'}];
