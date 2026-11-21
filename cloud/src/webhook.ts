@@ -1,10 +1,11 @@
+import type {DeliveryResult} from './events';
 import ipaddr from 'ipaddr.js';
 
 export type WebhookError = 'invalid_params' | 'callback_endpoint' | 'resolution_failed' | 'timeout' | 'tls_error' | 'connection_refused' | 'challenge_failed';
 export type Outcome<T> = {ok:true; value:T} | {ok:false; error:WebhookError};
 export type Resolver = (hostname:string, signal?:AbortSignal) => Promise<{a:string[]; aaaa:string[]}>;
 export type Transport = (url:string, init:RequestInit) => Promise<Response>;
-export type SafeHttps = { verify(url:string, secret:string, subscriptionId:string, nonce:string, messageId:string, now:number):Promise<Outcome<null>> };
+export type SafeHttps = { deliver(url:string, secret:string, subscriptionId:string, messageId:string, now:number, body:string, expires:number, eligible:()=>Promise<boolean>):Promise<DeliveryResult>; verify(url:string, secret:string, subscriptionId:string, nonce:string, messageId:string, now:number):Promise<Outcome<null>> };
 
 export function secretBytes(secret:unknown): Uint8Array | null {
   if (typeof secret !== 'string' || !/^whsec_(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(secret)) return null;
@@ -85,21 +86,38 @@ function equal(a:string,b:string):boolean {
   for (let i=0;i<Math.max(x.length,y.length);i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
   return diff === 0;
 }
+async function resolvePublic(resolver:Resolver, host:string, signal:AbortSignal):Promise<Outcome<null>> {
+  let answer:{a:string[];aaaa:string[]};
+  try {
+    answer = await Promise.race([resolver(host,signal), new Promise<never>((_,reject) => signal.addEventListener('abort',()=>reject(new DOMException('timeout','TimeoutError')),{once:true}))]);
+  } catch (e) { return {ok:false,error:failure(e) === 'timeout' ? 'timeout' : 'resolution_failed'}; }
+  if (!answer || !Array.isArray(answer.a) || !Array.isArray(answer.aaaa) || answer.a.some(a=>!ipaddr.IPv4.isValid(a)) || answer.aaaa.some(a=>!ipaddr.IPv6.isValid(a))) return {ok:false,error:'resolution_failed'};
+  const addresses=[...answer.a,...answer.aaaa];
+  if (!addresses.length) return {ok:false,error:'resolution_failed'};
+  return addresses.some(a=>!publicAddress(a)) ? {ok:false,error:'callback_endpoint'} : {ok:true,value:null};
+}
 export function safeHttps(allowlist:string | undefined, resolver:Resolver = workersResolver, transport:Transport = fetch):SafeHttps {
-  return { async verify(url,secret,subscriptionId,nonce,messageId,now) {
+  return { async deliver(url,secret,subscriptionId,messageId,now,body,expires,eligible) {
+    const dest = destination(url,allowlist); if (!dest.ok) return {status:'terminal',category:'callback_endpoint'};
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(),5000);
+    const timeout = new Promise<never>((_,reject) => controller.signal.addEventListener('abort',()=>reject(new DOMException('timeout','TimeoutError')),{once:true}));
+    try {
+      const resolved = await resolvePublic(resolver,dest.value.hostname,controller.signal);
+      if (!resolved.ok) return {status:resolved.error === 'callback_endpoint' ? 'terminal' : 'retryable',category:resolved.error === 'callback_endpoint' || resolved.error === 'timeout' ? resolved.error : 'resolution_failed'};
+      if (Date.now() >= expires || !await eligible() || Date.now() >= expires) return {status:'deferred'};
+      const timestamp = String(Math.floor(now/1000));
+      const response = await Promise.race([transport(url,{method:'POST',redirect:'manual',signal:controller.signal,headers:{'Content-Type':'application/json','webhook-id':messageId,'webhook-timestamp':timestamp,'webhook-signature':await sign(secret,messageId,timestamp,body),'X-MCP-Subscription-Id':subscriptionId},body}),timeout]);
+      if (response.status >= 200 && response.status < 300) return {status:'accepted'};
+      return {status:response.status === 410 || response.status === 413 ? 'terminal' : 'retryable',category:response.status >= 500 ? 'http_5xx' : response.status >= 400 ? 'http_4xx' : 'http_other'};
+    } catch (e) { const category = failure(e); return {status:'retryable',category:category === 'timeout' || category === 'tls_error' ? category : 'connection_refused'}; } finally { clearTimeout(timer); }
+  }, async verify(url,secret,subscriptionId,nonce,messageId,now) {
     const dest = destination(url,allowlist); if (!dest.ok) return dest;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(),5000);
     try {
-      let answer:{a:string[];aaaa:string[]};
-      try {
-        answer = await Promise.race([resolver(dest.value.hostname,controller.signal), new Promise<never>((_,reject) => controller.signal.addEventListener('abort',()=>reject(new DOMException('timeout','TimeoutError')),{once:true}))]);
-      } catch (e) { return {ok:false,error:failure(e) === 'timeout' ? 'timeout' : 'resolution_failed'}; }
-      if (!answer || !Array.isArray(answer.a) || !Array.isArray(answer.aaaa)) return {ok:false,error:'resolution_failed'};
-      if (answer.a.some(a => !ipaddr.IPv4.isValid(a)) || answer.aaaa.some(a => !ipaddr.IPv6.isValid(a))) return {ok:false,error:'resolution_failed'};
-      const addresses = [...answer.a,...answer.aaaa];
-      if (!addresses.length) return {ok:false,error:'resolution_failed'};
-      if (addresses.some(a=>!publicAddress(a))) return {ok:false,error:'callback_endpoint'};
+      const resolved = await resolvePublic(resolver,dest.value.hostname,controller.signal);
+      if (!resolved.ok) return resolved;
       const body = JSON.stringify({type:'verification',challenge:nonce});
       const timestamp = String(Math.floor(now/1000));
       // Workers cannot pin challenge or delivery connections to the checked address.

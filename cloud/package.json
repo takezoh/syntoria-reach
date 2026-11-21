@@ -8,7 +8,8 @@
     "check": "wrangler types && tsc --noEmit",
     "types": "wrangler types",
     "test:events": "node --experimental-strip-types src/events.test.ts",
-    "test:webhook": "node --experimental-strip-types src/webhook.test.ts"
+    "test:webhook": "node --experimental-strip-types src/webhook.test.ts",
+    "test:delivery": "npm run test:events && npm run test:webhook"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

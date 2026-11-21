@@ -121,3 +121,35 @@ try {
   }
 } finally { await dnsHarness.close(); }
 console.log('workerd DNS contract tests passed');
+
+// The receiver computes HMAC independently from the exact request bytes and
+// rejects an ID substituted after signing. It deduplicates across subscriptions.
+{
+  const {createHmac} = await (Function("return import('node:crypto')")() as Promise<{createHmac:(algorithm:string,key:string)=>{update:(text:string)=>{digest:(format:string)=>string}}}>);
+  const secret = 'whsec_' + btoa('a'.repeat(32));
+  const seen = new Set<string>();
+  const deliveries:Array<{id:string;body:string;subscription:string;duplicate:boolean}> = [];
+  let address = '8.8.8.8'; let status = 200; let requests = 0;
+  const port = safeHttps('https://example.test', async()=>({a:[address],aaaa:[]}), async (_url,init)=>{
+    requests++;
+    const headers = new Headers(init.headers); const id=headers.get('webhook-id')!;
+    const timestamp=headers.get('webhook-timestamp')!; const body=String(init.body);
+    const mac = createHmac('sha256', 'a'.repeat(32)).update(`${id}.${timestamp}.${body}`).digest('base64');
+    assert(headers.get('webhook-signature')===`v1,${mac}`,'receiver verifies actual id and body');
+    assert(headers.get('webhook-signature')!==`v1,${createHmac('sha256','a'.repeat(32)).update(`substituted.${timestamp}.${body}`).digest('base64')}`,'substituted id fails');
+    assert(init.redirect==='manual' && !headers.has('authorization') && !headers.has('cf-access-jwt-assertion'),'safe callback headers');
+    deliveries.push({id,body,subscription:headers.get('X-MCP-Subscription-Id')!,duplicate:seen.has(id)}); seen.add(id);
+    return new Response(null,{status});
+  });
+  const body=JSON.stringify({eventId:'same-event',name:'agent.session_state_changed',timestamp:'2026-01-01T00:00:00Z',data:{node:'node',session_id:'session',state:'idle',observed_at:'2026-01-01T00:00:00Z'},cursor:'cursor'});
+  await port.deliver('https://example.test/hook',secret,'sub1','random1',1000,body,Date.now()+10000,async()=>true);
+  await port.deliver('https://example.test/hook',secret,'sub2','random2',1000,body,Date.now()+10000,async()=>true);
+  await port.deliver('https://example.test/hook',secret,'sub1','random1',2000,body,Date.now()+10000,async()=>true);
+  assert(deliveries.length===3 && !deliveries[0].duplicate && !deliveries[1].duplicate && deliveries[2].duplicate,'receiver deduplicates retries but not subscriptions');
+  for (const terminal of [410,413]) { status=terminal; const result=await port.deliver('https://example.test/hook',secret,'sub1','id',3000,body,Date.now()+10000,async()=>true); assert(result.status==='terminal' && result.category==='http_4xx','terminal HTTP status'); }
+  status=503; let result=await port.deliver('https://example.test/hook',secret,'sub1','id',3000,body,Date.now()+10000,async()=>true); assert(result.status==='retryable' && result.category==='http_5xx','503 retryable');
+  const revokedBefore=requests; result=await port.deliver('https://example.test/hook',secret,'sub1','id',3000,body,Date.now()+10000,async()=>false);
+  assert(result.status==='deferred' && requests===revokedBefore,'revoked grant prevents request without inventing callback error');
+  const before=requests; address='127.0.0.1'; result=await port.deliver('https://example.test/hook',secret,'sub1','id',4000,body,Date.now()+10000,async()=>true);
+  assert(result.status==='terminal' && requests===before,'fresh private DNS answer prevents request');
+}

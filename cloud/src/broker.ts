@@ -107,8 +107,13 @@ export class NodeBroker extends DurableObject<Env> {
     }
     if (reply.type === "turn_stop") {
       try {
+        const randomIds = Array.from({length:events.MAX_GRANTS}, () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2,'0')).join(''));
         await events.acknowledge(reply as events.Stop,
-          stop => this.change(state => events.admit(state, stop, Date.now()), 'limit'),
+          stop => this.change(state => {
+            const ids:Record<string,string> = {};
+            Object.values(state.grants).filter(g => g.mode === 'webhook').forEach((g,i) => { ids[g.id] = randomIds[i]; });
+            return events.admit(state, stop, Date.now(), ids);
+          }, 'limit'),
           eventId => _ws.send(JSON.stringify({type:"turn_stop_ack",eventId})),
         );
         this.wakeReaders();
@@ -142,12 +147,14 @@ export class NodeBroker extends DurableObject<Env> {
     const changed = await this.ctx.storage.transaction(async tx => {
       const state = events.empty();
       state.seq = await tx.get<number>("seq") ?? 0;
+      for (const [k,v] of await tx.list<events.Message>({prefix:"message/"})) state.messages[k.slice(8)] = v;
       for (const [k,v] of await tx.list<events.Grant>({prefix:"grant/"})) state.grants[k.slice(6)] = v;
       for (const [k,v] of await tx.list<events.State["events"][string]>({prefix:"event/"})) state.events[k.slice(6)] = v;
       for (const [k,v] of await tx.list<events.State["dedupe"][string]>({prefix:"dedupe/"})) state.dedupe[k.slice(7)] = v;
       for (const [k,v] of await tx.list<events.Verification>({prefix:"verification/"})) state.pending[k.slice(13)] = v;
       const [next, result] = fn(state);
       for (const [prefix, before, after] of [
+        ["message/", state.messages, next.messages],
         ["grant/", state.grants, next.grants],
         ["event/", state.events, next.events],
         ["dedupe/", state.dedupe, next.dedupe],
@@ -159,7 +166,7 @@ export class NodeBroker extends DurableObject<Env> {
         }
       }
       if (next.seq !== state.seq) await tx.put("seq", next.seq);
-      const deadlines = [...Object.values(next.grants).map(g => g.expires), ...Object.values(next.dedupe).map(d => d.admitted + events.DEDUPE_MS), ...Object.values(next.pending).map(p => p.expires)];
+      const deadlines = [...Object.values(next.messages).filter(m => m.status !== 'abandoned' && next.grants[m.grant]?.authorized).map(m => m.due), ...Object.values(next.grants).map(g => g.expires), ...Object.values(next.dedupe).map(d => d.admitted + events.DEDUPE_MS), ...Object.values(next.pending).map(p => p.expires)];
       if (deadlines.length) await tx.setAlarm(Math.min(...deadlines));
       else await tx.deleteAlarm();
       const ended = Object.values(state.grants).filter(g => g.reader && !next.grants[g.id]).map(g => ({id:g.id, reason:g.expires <= Date.now() ? 'expired' as const : reason}));
@@ -171,7 +178,17 @@ export class NodeBroker extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    await this.change(state => [events.expire(state, Date.now()), null]);
+    for (;;) {
+      const reserved = await this.change(state => events.reserve(state, Date.now()));
+      if (!reserved) break;
+      const {key,message,grant,stop,cursor} = reserved;
+      const body = JSON.stringify({eventId:stop.eventId,name:grant.name,timestamp:stop.observed_at,data:{node:grant.node,session_id:stop.session_id,state:stop.state,observed_at:stop.observed_at},cursor});
+      const outcome = await this.webhookPort().deliver(grant.callback!,grant.secret!,grant.id,message.id,Date.now(),body,grant.expires,async () => {
+        const current = await this.ctx.storage.get<events.Grant>('grant/' + grant.id);
+        return !!current && current.authorized && current.expires > Date.now();
+      });
+      await this.change(state => [events.delivered(events.expire(state,Date.now()),key,message.attempts,outcome),null]);
+    }
     this.wakeReaders();
   }
 
@@ -197,11 +214,13 @@ export class NodeBroker extends DurableObject<Env> {
       const allowed = destination(input.callback!, (this.env as Env & {WEBHOOK_ALLOWED_ORIGINS?:string}).WEBHOOK_ALLOWED_ORIGINS);
       if (!allowed.ok) return allowed;
     }
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(events.key(input)));
+    const subscriptionId = 'sub_' + Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
     const now = Date.now();
     const ws = this.ctx.getWebSockets().find(s => s.readyState === WebSocket.OPEN);
     const answer = await this.authorize(input, now + 300_000);
     const decision = ws && ws.readyState === WebSocket.OPEN && this.ctx.getWebSockets().includes(ws) ? answer : 'unavailable';
-    if (input.mode !== 'webhook') return this.change(state => events.subscribe(state, input, Date.now(), crypto.randomUUID(), decision));
+    if (input.mode !== 'webhook') return this.change(state => events.subscribe(state, input, Date.now(), subscriptionId, decision));
     const pendingKey = events.verificationKey(input);
     const id = crypto.randomUUID(), nonce = crypto.randomUUID() + crypto.randomUUID();
     const reservedAt = Date.now();
@@ -213,7 +232,7 @@ export class NodeBroker extends DurableObject<Env> {
       if (next.pending[pendingKey]) return [next,{ok:false as const,error:'unavailable' as const}];
       if (!existing && Object.keys(next.grants).length + Object.keys(next.pending).length >= events.MAX_GRANTS) return [next,{ok:false as const,error:'limit' as const}];
       next.pending[pendingKey] = {id,key:events.key(input),nonce,secret:input.secret!,expires:existing ? Math.min(existing.expires,reservedAt+300_000) : reservedAt+300_000};
-      return [next,{ok:true as const,value:existing?.id ?? id}];
+      return [next,{ok:true as const,value:existing?.id ?? subscriptionId}];
     });
     if (!reserved.ok) return reserved;
     const checked = await this.webhookPort().verify(input.callback!,input.secret!,reserved.value,nonce,`msg_verification_${crypto.randomUUID()}`,Date.now());
@@ -224,7 +243,7 @@ export class NodeBroker extends DurableObject<Env> {
       if (next.pending[pendingKey]?.id !== id) return [next,{ok:false,error:'unavailable'}];
       delete next.pending[pendingKey];
       if (!checked.ok) return [next,checked];
-      const [updated,result] = events.subscribe(next,input,completedAt,id,currentDecision);
+      const [updated,result] = events.subscribe(next,input,completedAt,subscriptionId,currentDecision);
       if (!result.ok) return [updated,result];
       const {secret: _secret, ...value} = result.value;
       return [updated,{ok:true,value}];

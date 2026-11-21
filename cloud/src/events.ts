@@ -14,24 +14,29 @@ const LEASE_MS = 300_000;
 export const CLOCK_SKEW_MS = 30_000;
 
 export type Principal = { issuer: string; subject: string };
-export type GrantInput = { principal: Principal; node: string; name: string; arguments: { node: string; session_id: string }; profile: string; mode: 'poll' | 'push' | 'webhook'; callback?: string; secret?: string };
+// The wire selects the profile per registration URL; each has its own webhook-id rule.
+export type Profile = 'standard' | 'chatgpt';
+export type GrantInput = { principal: Principal; node: string; name: string; arguments: { node: string; session_id: string }; profile: Profile; mode: 'poll' | 'push' | 'webhook'; callback?: string; secret?: string };
 export type Stop = { type: 'turn_stop'; eventId: string; session_id: string; state: 'idle' | 'waiting_on_human' | 'exited' | 'unknown'; observed_at: string };
 export type Grant = GrantInput & { id: string; created: number; expires: number; authorized: boolean; events: string[]; floor: number; reader?: true };
 type Entry = { stop: Stop; seq: number; grants: string[] };
 type Dedupe = { admitted: number; grants: string[] };
 export type Verification = { id:string; key:string; nonce:string; secret:string; expires:number };
-export type State = { grants: Record<string, Grant>; events: Record<string, Entry>; dedupe: Record<string, Dedupe>; pending: Record<string, Verification>; seq: number };
+export type DeliveryCategory = 'callback_endpoint' | 'resolution_failed' | 'timeout' | 'tls_error' | 'connection_refused' | 'http_4xx' | 'http_5xx' | 'http_other';
+export type DeliveryResult = {status:'accepted'} | {status:'deferred'} | {status:'terminal'|'retryable'; category:DeliveryCategory};
+export type Message = { grant:string; eventId:string; id:string; seq:number; attempts:number; due:number; status:'pending'|'abandoned'; lastOutcome:DeliveryCategory | null };
+export type State = { messages: Record<string, Message>; grants: Record<string, Grant>; events: Record<string, Entry>; dedupe: Record<string, Dedupe>; pending: Record<string, Verification>; seq: number };
 export type Category = 'unavailable' | 'forbidden' | 'not_found' | 'invalid_params' | 'limit' | 'callback_endpoint' | 'resolution_failed' | 'timeout' | 'tls_error' | 'connection_refused' | 'challenge_failed';
 export type Result<T> = { ok: true; value: T } | { ok: false; error: Category };
-export const empty = (): State => ({ grants: {}, events: {}, dedupe: {}, pending: {}, seq: 0 });
-export const key = (g: GrantInput): string => JSON.stringify([g.principal.issuer, g.principal.subject, g.node, g.name, g.arguments.node, g.arguments.session_id, g.mode, g.mode === 'webhook' ? g.callback : null]);
+export const empty = (): State => ({ messages: {}, grants: {}, events: {}, dedupe: {}, pending: {}, seq: 0 });
+export const key = (g: GrantInput): string => JSON.stringify([g.principal.issuer, g.principal.subject, g.node, g.name, g.arguments.node, g.arguments.session_id, g.profile, g.mode, g.mode === 'webhook' ? g.callback : null]);
 export function valid(g: GrantInput): boolean {
   return !!(g && g.principal && typeof g.principal.issuer === 'string' && g.principal.issuer &&
     typeof g.principal.subject === 'string' && g.principal.subject && typeof g.node === 'string' && g.node &&
     g.name === 'agent.session_state_changed' && g.arguments && typeof g.arguments === 'object' &&
     Object.keys(g.arguments).length === 2 && g.arguments.node === g.node &&
     typeof g.arguments.session_id === 'string' && g.arguments.session_id &&
-    typeof g.profile === 'string' && g.profile && ['poll', 'push', 'webhook'].includes(g.mode) &&
+    (g.profile === 'standard' || g.profile === 'chatgpt') && ['poll', 'push', 'webhook'].includes(g.mode) &&
     (g.mode === 'webhook' ? (typeof g.callback === 'string' && !!g.callback) : g.secret === undefined));
 }
 export const verificationKey = (g: GrantInput):string => JSON.stringify([g.principal.issuer,g.principal.subject,g.callback]);
@@ -48,6 +53,7 @@ function remove(s: State, id: string): void {
   for (const d of Object.values(s.dedupe)) {
     d.grants = d.grants.filter(g => g !== id);
   }
+  for (const [key, message] of Object.entries(s.messages)) if (message.grant === id) delete s.messages[key];
   delete s.grants[id];
 }
 export function removeReaders(s: State, live: string[]): State {
@@ -98,7 +104,7 @@ export function subscribe(s: State, input: GrantInput, now: number, id: string, 
   }
   if (decision !== 'allowed') return [n, {ok:false,error:decision === 'denied' ? 'forbidden' : 'unavailable'}];
   if (Object.keys(n.grants).length >= MAX_GRANTS) return [n, {ok:false,error:'limit'}];
-  const g: Grant = { ...structuredClone(input), id, created:now, expires:now + LEASE_MS, authorized:true, events:[], floor:0 };
+  const g: Grant = { ...structuredClone(input), id, created:now, expires:now + LEASE_MS, authorized:true, events:[], floor:n.seq };
   n.grants[id] = g;
   return [n, {ok:true,value:g}];
 }
@@ -115,7 +121,7 @@ export function unsubscribe(s: State, input: GrantInput, now: number): [State, R
   if (!g) return [n,{ok:false,error:'not_found'}];
   remove(n,g.id); return [n,{ok:true,value:null}];
 }
-export function admit(s: State, stop: Stop, now: number): [State, boolean] {
+export function admit(s: State, stop: Stop, now: number, ids: Record<string,string> = {}): [State, boolean] {
   const n = expire(s,now);
   if (!stop.eventId || !stop.session_id || !['idle','waiting_on_human','exited','unknown'].includes(stop.state) || !Number.isFinite(Date.parse(stop.observed_at))) return [n,false];
   if (n.events[stop.eventId] || n.dedupe[stop.eventId]) return [n,true];
@@ -124,6 +130,7 @@ export function admit(s: State, stop: Stop, now: number): [State, boolean] {
     if (g.events.length >= MAX_EVENTS) {
       if (g.reader) { remove(n, g.id); continue; }
       const oldest = g.events.shift()!;
+      delete n.messages[JSON.stringify([g.id,oldest])];
       const row = n.events[oldest];
       g.floor = Math.max(g.floor, row.seq);
       row.grants = row.grants.filter(id => id !== g.id);
@@ -133,11 +140,18 @@ export function admit(s: State, stop: Stop, now: number): [State, boolean] {
   const eligible = matching.filter(g => !!n.grants[g.id]);
   if (eligible.length) {
     n.events[stop.eventId] = { stop, seq: ++n.seq, grants: eligible.map(g => g.id) };
-    for (const g of eligible) g.events.push(stop.eventId);
-    const ids = Object.keys(n.dedupe);
-    if (ids.length >= MAX_DEDUPE) {
-      ids.sort((a,b) => n.dedupe[a].admitted - n.dedupe[b].admitted);
-      delete n.dedupe[ids[0]];
+    for (const g of eligible) {
+      g.events.push(stop.eventId);
+      if (g.mode === 'webhook') {
+        const id = g.profile === 'chatgpt' ? stop.eventId : ids[g.id];
+        if (!id) throw new Error('missing webhook message id');
+        n.messages[JSON.stringify([g.id,stop.eventId])] = {grant:g.id,eventId:stop.eventId,id,seq:n.seq,attempts:0,due:now,status:'pending',lastOutcome:null};
+      }
+    }
+    const dedupeIds = Object.keys(n.dedupe);
+    if (dedupeIds.length >= MAX_DEDUPE) {
+      dedupeIds.sort((a,b) => n.dedupe[a].admitted - n.dedupe[b].admitted);
+      delete n.dedupe[dedupeIds[0]];
     }
     n.dedupe[stop.eventId] = {admitted:now, grants:eligible.map(g => g.id)};
   }
@@ -182,4 +196,31 @@ export function poll(s: State, input: GrantInput, cursor: string | null, batch: 
 export async function acknowledge(stop: Stop, commit: (stop: Stop) => Promise<unknown>, send: (eventId: string) => void): Promise<void> {
   await commit(stop);
   if (typeof stop.eventId === 'string' && stop.eventId) send(stop.eventId);
+}
+
+export function reserve(s:State, now:number): [State, {key:string; message:Message; grant:Grant; stop:Stop; cursor:string} | null] {
+  const n = expire(s,now);
+  for (const [key,m] of Object.entries(n.messages)) {
+    const g = n.grants[m.grant];
+    if (!g || !g.authorized || m.status === 'abandoned' || m.due > now) continue;
+    if (m.attempts >= 10) { m.status = 'abandoned'; continue; }
+    m.attempts++; m.due = now + Math.min(1000 * 2 ** (m.attempts - 1), 60000);
+    const unresolved = Object.values(n.messages).filter(x => x.grant === g.id && x.status !== 'abandoned');
+    const position = Math.min(...unresolved.map(x => x.seq)) - 1;
+    const cursor = btoa(JSON.stringify({grant:g.id,position}));
+    return [n,{key,message:structuredClone(m),grant:structuredClone(g),stop:structuredClone(n.events[m.eventId].stop),cursor}];
+  }
+  return [n,null];
+}
+export function delivered(s:State, key:string, attempt:number, outcome:DeliveryResult):State {
+  const n = structuredClone(s), m = n.messages[key];
+  if (!m || m.attempts !== attempt) return n;
+  if (outcome.status === 'deferred') { m.attempts--; return n; }
+  if (outcome.status === 'accepted') {
+    delete n.messages[key];
+    const g = n.grants[m.grant], row = n.events[m.eventId];
+    if (g) g.events = g.events.filter(id => id !== m.eventId);
+    if (row) { row.grants = row.grants.filter(id => id !== m.grant); if (!row.grants.length) delete n.events[m.eventId]; }
+  } else { m.lastOutcome = outcome.category; if (outcome.status === 'terminal' || m.attempts >= 10) m.status = 'abandoned'; }
+  return n;
 }

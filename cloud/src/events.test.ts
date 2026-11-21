@@ -3,6 +3,7 @@ function assert(v: unknown, message: string): asserts v { if (!v) throw new Erro
 const base: e.GrantInput = { principal:{issuer:'issuer',subject:'alice'},node:'node',name:'agent.session_state_changed',arguments:{node:'node',session_id:'session'},profile:'standard',mode:'poll' };
 const extraArgs = {...base.arguments,extra:'x'};
 assert(!e.valid({...base,arguments:extraArgs}), 'arguments reject additional properties');
+assert(!e.valid({...base,profile:'ChatGPT' as e.Profile}), 'an unknown profile is rejected');
 let s=e.empty();
 let outcome: e.Result<e.Grant>;
 [s,outcome]=e.subscribe(s,base,100_000,'grant','unavailable'); assert(!outcome.ok && outcome.error==='unavailable','offline');
@@ -81,6 +82,62 @@ assert(!effects.includes('ack:failed'),'storage failure does not ack');
   assert(!!w.pending[e.verificationKey(hookB)],'unsubscribing another session keeps its challenge');
   [w] = e.unsubscribe(w,hookB,1_000);
   assert(!w.pending[e.verificationKey(hookB)],'unsubscribing the same subscription cancels its challenge');
+}
+// Delivery state cases use supplied identifiers and time, so retries and crashes are deterministic.
+{
+  const hook = {...base,mode:'webhook' as const,callback:'https://example.test/hook',secret:'whsec_'+btoa('a'.repeat(32))};
+  const chat = {...hook,profile:'chatgpt' as const};
+  let state=e.empty();
+  [state]=e.subscribe(state,hook,1000,'standard','allowed');
+  [state]=e.subscribe(state,chat,1000,'chat','allowed');
+  assert(e.key(hook)!==e.key(chat) && Object.keys(state.grants).length===2,'profiles have independent grants');
+  [state]=e.subscribe(state,chat,1001,'ignored','allowed');
+  assert(state.grants.standard.profile==='standard' && state.grants.chat.profile==='chatgpt','refresh preserves profile');
+  [state]=e.admit(state,stop('early',1002),1002,{standard:'random_standard',chat:'unused'});
+  assert(Object.values(state.messages).find(m=>m.grant==='chat')?.id==='early','ChatGPT id is eventId');
+  let reserved:ReturnType<typeof e.reserve>[1];
+  [state,reserved]=e.reserve(state,1002); assert(reserved && reserved.message.attempts===1,'first reservation');
+  const first=reserved; const snapshot=structuredClone(state);
+  [state,reserved]=e.reserve(snapshot,2002); assert(reserved && reserved.message.id===first.message.id && reserved.message.attempts===2,'lost request preserves reservation and id');
+  state=e.delivered(state,reserved.key,2,{status:'terminal',category:'http_4xx'});
+  [state]=e.subscribe(state,hook,200_000,'ignored','allowed');
+  [state]=e.admit(state,stop('later',300_002),300_002,{standard:'later_standard',chat:'unused'});
+  [state,reserved]=e.reserve(state,300_002);
+  assert(!reserved || reserved.message.id!=='random_standard','terminal message cannot revive on refresh');
+  let only=e.empty(); [only]=e.subscribe(only,hook,1000,'one','allowed');
+  [only]=e.admit(only,stop('failed',1001),1001,{one:'failed-id'});
+  [only,reserved]=e.reserve(only,1001); assert(reserved,'early reserve');
+  only=e.delivered(only,reserved.key,1,{status:'retryable',category:'http_5xx'});
+  [only]=e.admit(only,stop('success',1002),1002,{one:'success-id'});
+  [only,reserved]=e.reserve(only,1002); assert(reserved && reserved.message.eventId==='success','later message selected');
+  assert(JSON.parse(atob(reserved.cursor)).position===0,'later delivery cursor remains before failed event');
+  only=e.delivered(only,reserved.key,1,{status:'accepted'});
+  let time=2001;
+  for (let attempt=2;attempt<=10;attempt++) {
+    [only,reserved]=e.reserve(only,time); assert(reserved && reserved.message.attempts===attempt,'bounded attempt '+attempt);
+    only=e.delivered(only,reserved.key,attempt,{status:'retryable',category:'timeout'}); time=reserved.message.due;
+  }
+  assert(Object.values(only.messages)[0].lastOutcome==='timeout' && Object.values(only.messages)[0].status==='abandoned','last category retained on abandonment');
+  [only,reserved]=e.reserve(only,time); assert(!reserved,'no eleventh attempt');
+  [only,reserved]=e.reserve(only,301000); assert(!reserved && !Object.keys(only.messages).length,'expiry removes messages');
+  let cap=e.empty(); [cap]=e.subscribe(cap,hook,1000,'cap-hook','allowed');
+  for (let n=0;n<=e.MAX_EVENTS;n++) [cap]=e.admit(cap,stop('cap-hook-'+n,1001),1001,{'cap-hook':'id'+n});
+  [cap,reserved]=e.reserve(cap,1001); assert(reserved && reserved.message.eventId==='cap-hook-1','eviction cannot leave orphan message');
+}
+{
+  let state=e.empty(); let grant:e.Result<e.Grant>; let batch:e.Result<{events:e.Stop[];cursor:string;truncated:boolean;hasMore:boolean;nextPollMs:number}>;
+  [state,grant]=e.subscribe(state,base,1000,'same-id','allowed');
+  [state,batch]=e.poll(state,base,null,10,1000,'unused'); assert(batch.ok,'initial cursor'); const old=batch.value.cursor;
+  [state]=e.admit(state,stop('expired-history',1001),1001);
+  [state,grant]=e.subscribe(state,base,400000,'same-id','allowed');
+  [state,batch]=e.poll(state,base,old,10,400000,'unused');
+  assert(batch.ok && batch.value.truncated,'expired cursor signals lost history when identity is reused');
+  const hook={...base,mode:'webhook' as const,callback:'https://example.test/hook',secret:'whsec_'+btoa('a'.repeat(32))};
+  let h=e.empty(); [h]=e.subscribe(h,hook,1000,'hook','allowed'); [h]=e.admit(h,stop('paused',1001),1001,{hook:'message'});
+  let reserved:ReturnType<typeof e.reserve>[1]; [h,reserved]=e.reserve(h,1001); assert(reserved,'reserved before pause');
+  h=e.delivered(h,reserved.key,1,{status:'deferred'});
+  const msg=Object.values(h.messages)[0];
+  assert(msg.attempts===0 && msg.lastOutcome===null && msg.status==='pending','pre-send suspension does not consume or invent an outcome');
 }
 console.log('events tests passed');
 
@@ -215,11 +272,28 @@ export class TestBroker extends NodeBroker {
   releaseChallenge() { this.resumeChallenge?.(); this.holdChallenge=false; }
   async armChallenge() { this.holdChallenge=true; }
   async pendingCount() { return (await this.ctx.storage.list({prefix:'verification/'})).size; }
-  webhookPort() { return safeHttps('https://example.test', async () => ({a:['8.8.8.8'],aaaa:[]}), async (_url,init) => {
+  webhookPort() { const port = safeHttps('https://example.test', async () => ({a:['8.8.8.8'],aaaa:[]}), async (_url,init) => {
     if (this.holdChallenge) await new Promise(resolve => { this.resumeChallenge=resolve; });
-    return new Response(JSON.stringify({challenge:this.failChallenge ? 'wrong' : JSON.parse(init.body).challenge}));
-  }); }
+    const body=JSON.parse(init.body);
+    if (body.type === 'verification') return new Response(JSON.stringify({challenge:this.failChallenge ? 'wrong' : body.challenge}));
+    const messages=[...(await this.ctx.storage.list({prefix:'message/'})).values()];
+    const headers=Object.fromEntries(new Headers(init.headers));
+    const log=await this.ctx.storage.get('test-log') ?? [];
+    log.push({body:init.body,headers,messages}); await this.ctx.storage.put('test-log',log);
+    return new Response(null,{status:await this.ctx.storage.get('test-status') ?? 503});
+  }); return {...port, deliver:async (...args) => {
+    if (this.deliveryFault === 'before') { this.deliveryFault = undefined; throw new Error('lost before request'); }
+    const outcome = await port.deliver(...args);
+    if (this.deliveryFault === 'after') { this.deliveryFault = undefined; throw new Error('lost after acceptance'); }
+    return outcome;
+  }}; }
+  async setFault(value) { this.deliveryFault=value; }
   async setChallengeFailure(value) { this.failChallenge = value; }
+  async setDeliveryStatus(value) { await this.ctx.storage.put('test-status',value); }
+  async deliveryLog() { return await this.ctx.storage.get('test-log') ?? []; }
+  async forceDue() { for (const [key,value] of await this.ctx.storage.list({prefix:'message/'})) { value.due=Date.now()-1; await this.ctx.storage.put(key,value); } }
+  async dispatch() { await this.alarm(); }
+  async messages() { return [...(await this.ctx.storage.list({prefix:'message/'})).values()]; }
   async injectStop(stop) { await this.webSocketMessage({send() {}}, JSON.stringify(stop)); }
   async overflowReader(id, stop) {
     const grant = await this.ctx.storage.get('grant/' + id);
@@ -390,6 +464,21 @@ try {
   const beforeRestart=await object.fetch('http://node/',{headers:{Upgrade:'websocket'}});
   const socket5=beforeRestart.webSocket; assert(socket5,'restart fixture socket'); socket5.accept();
   socket5.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') socket5.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));});
+  const hook1={...webhook,callback:'https://example.test/one'};
+  const hook2={...webhook,callback:'https://example.test/two'};
+  const grant1=await object.subscribe(hook1), grant2=await object.subscribe(hook2);
+  assert(grant1.ok && grant2.ok && grant1.value.id!==grant2.value.id,'two webhook grants');
+  const grant1Id=grant1.value.id, grant2Id=grant2.value.id;
+  await object.setDeliveryStatus(503);
+  await object.injectStop(stop('restart-delivery',Date.now()));
+  await object.dispatch();
+  const beforeDeliveryRestart=await object.deliveryLog();
+  assert(beforeDeliveryRestart.length===2,'both webhooks dispatched');
+  for (const entry of beforeDeliveryRestart) {
+    const message=entry.messages.find((m:{id:string})=>m.id===entry.headers['webhook-id']);
+    assert(message && message.attempts===1 && message.due>Date.now(),'attempt reserved durably before request');
+  }
+  assert(beforeDeliveryRestart[0].headers['webhook-id']!==beforeDeliveryRestart[1].headers['webhook-id'],'standard ids differ');
   const orphan=await object.openReader(push,null); assert(orphan.ok,'reader before restart');
   const orphanReader=orphan.value.getReader();
   const orphanActive=JSON.parse(new TextDecoder().decode((await orphanReader.read()).value));
@@ -399,6 +488,59 @@ try {
   const restartedEnv=await alarmHarness.getWorker().getEnv();
   const restarted=restartedEnv.NODE.get(restartedEnv.NODE.idFromName('alarm-node'));
   assert(!(await restarted.hasGrant(orphanId)),'restart reconciles lost reader');
+  const afterRestart=await restarted.messages();
+  assert(afterRestart.length===2 && afterRestart.every((m:{attempts:number})=>m.attempts===1),'attempt reservations survive restart');
+  const reconnectDelivery=await restarted.fetch('http://node/',{headers:{Upgrade:'websocket'}});
+  const deliverySocket=reconnectDelivery.webSocket; assert(deliverySocket,'delivery reconnect'); deliverySocket.accept();
+  deliverySocket.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') deliverySocket.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));});
+  for (let i=0;i<100;i++) { const gs=await Promise.all([restarted.inspectGrant(grant1Id),restarted.inspectGrant(grant2Id)]); if(gs.every((g:{authorized:boolean})=>g.authorized)) break; await new Promise(resolve=>setTimeout(resolve,10)); }
+  await restarted.setDeliveryStatus(200); await restarted.forceDue(); await restarted.dispatch();
+  const afterDeliveryRestart=await restarted.deliveryLog();
+  assert(afterDeliveryRestart.length===4,'both retries dispatched after restart');
+  for (const original of beforeDeliveryRestart) {
+    const retry=afterDeliveryRestart.find((entry:{headers:Record<string,string>;messages:Array<{id:string;attempts:number}>}, i:number)=>i>=2 && entry.headers['webhook-id']===original.headers['webhook-id']);
+    assert(retry && retry.messages.some((m:{id:string;attempts:number})=>m.id===original.headers['webhook-id'] && m.attempts===2),'retry retains ID and committed attempt');
+  }
+  const {createHmac} = await (Function("return import('node:crypto')")() as Promise<{createHmac:(algorithm:string,key:string)=>{update:(text:string)=>{digest:(format:string)=>string}}}>);
+  const received=new Set<string>();
+  for (const [index,entry] of afterDeliveryRestart.entries()) {
+    const id=entry.headers['webhook-id'], timestamp=entry.headers['webhook-timestamp'];
+    const signature=createHmac('sha256','a'.repeat(32)).update(`${id}.${timestamp}.${entry.body}`).digest('base64');
+    const substituted=createHmac('sha256','a'.repeat(32)).update(`wrong.${timestamp}.${entry.body}`).digest('base64');
+    assert(entry.headers['webhook-signature']==='v1,'+signature && signature!==substituted,'independent receiver verifies raw body and actual id');
+    assert(received.has(id)===(index>=2),'receiver deduplicates only retries'); received.add(id);
+    assert(JSON.parse(entry.body).eventId==='restart-delivery','both subscriptions carry same occurrence');
+  }
+  assert((await restarted.unsubscribe(hook2)).ok,'isolate loss fixture');
+  const logBeforeLoss=await restarted.deliveryLog();
+  await restarted.setFault('before'); await restarted.injectStop(stop('loss-before',Date.now()));
+  try { await restarted.dispatch(); } catch { /* simulated DO loss */ }
+  const reservedBefore=(await restarted.messages()).find((m:{eventId:string})=>m.eventId==='loss-before');
+  assert(reservedBefore?.attempts===1,'loss before request leaves committed reservation');
+  assert((await restarted.deliveryLog()).length===logBeforeLoss.length,'loss before request makes no HTTP call');
+  await restarted.setFault('after'); await restarted.injectStop(stop('loss-after',Date.now()));
+  try { await restarted.dispatch(); } catch { /* receiver accepted, result was lost */ }
+  const reservedAfter=(await restarted.messages()).find((m:{eventId:string})=>m.eventId==='loss-after');
+  assert(reservedAfter?.attempts===1,'loss after acceptance leaves committed reservation');
+  const lossLog=await restarted.deliveryLog();
+  assert(lossLog.some((x:{body:string})=>JSON.parse(x.body).eventId==='loss-after'),'receiver accepted before result loss');
+  const beforeId=reservedBefore.id, afterId=reservedAfter.id;
+  deliverySocket.close();
+  await alarmHarness.update({workers:[{config:{name:'alarm-test',main:'.wrangler/tmp/alarm-fixture.mjs',compatibility_date:'2026-11-01',durable_objects:{bindings:[{name:'NODE',class_name:'TestBroker'}]},migrations:[{tag:'v1',new_sqlite_classes:['TestBroker']}]}}]});
+  const recoveredEnv=await alarmHarness.getWorker().getEnv();
+  const recovered=recoveredEnv.NODE.get(recoveredEnv.NODE.idFromName('alarm-node'));
+  const persisted=await recovered.messages();
+  assert(persisted.some((m:{id:string;attempts:number})=>m.id===beforeId && m.attempts===1) && persisted.some((m:{id:string;attempts:number})=>m.id===afterId && m.attempts===1),'both ambiguous reservations survive restart');
+  const rc=await recovered.fetch('http://node/',{headers:{Upgrade:'websocket'}}); const rs=rc.webSocket; assert(rs,'loss recovery socket'); rs.accept();
+  rs.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') rs.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));});
+  for (let i=0;i<100;i++) { if ((await recovered.inspectGrant(grant1Id)).authorized) break; await new Promise(resolve=>setTimeout(resolve,10)); }
+  await recovered.forceDue(); await recovered.dispatch();
+  const recoveredLog=await recovered.deliveryLog();
+  for (const id of [beforeId,afterId]) {
+    const retry=recoveredLog.find((x:{headers:Record<string,string>;messages:Array<{id:string;attempts:number}>})=>x.headers['webhook-id']===id && x.messages.some((m:{id:string;attempts:number})=>m.id===id && m.attempts===2));
+    assert(retry,'retry retains id and counts ambiguous attempt');
+  }
+  rs.close();
 } finally {
   await alarmHarness.close();
 }
