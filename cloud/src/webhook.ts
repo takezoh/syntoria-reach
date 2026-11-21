@@ -17,8 +17,19 @@ export async function sign(secret:string, id:string, timestamp:string, body:stri
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(`${id}.${timestamp}.${body}`)));
   return 'v1,' + btoa(String.fromCharCode(...mac));
 }
-export function destination(url:string, allowlist:string | undefined):Outcome<URL> {
+export function localCallback(parsed:URL, issuer:string | undefined):boolean {
+  try {
+    const access = new URL(issuer!);
+    return access.origin === issuer && access.protocol === 'http:' && ['127.0.0.1','localhost','[::1]'].includes(access.hostname) &&
+      parsed.protocol === 'http:' && ['127.0.0.1','localhost','[::1]'].includes(parsed.hostname);
+  } catch { return false; }
+}
+export function destination(url:string, allowlist:string | undefined, issuer?:string):Outcome<URL> {
   let parsed:URL; try { parsed = new URL(url); } catch { return {ok:false,error:'invalid_params'}; }
+  if (localCallback(parsed,issuer)) {
+    if (parsed.username || parsed.password || !allowlist?.split(',').map(x=>x.trim()).includes(parsed.origin)) return {ok:false,error:'callback_endpoint'};
+    return {ok:true,value:parsed};
+  }
   if (parsed.protocol !== 'https:') return {ok:false,error:'invalid_params'};
   const host = parsed.hostname.replace(/^\[|\]$/g,'');
   if (parsed.username || parsed.password || ipaddr.isValid(host) || parsed.port || !allowlist?.split(',').map(x=>x.trim()).includes(parsed.origin)) return {ok:false,error:'callback_endpoint'};
@@ -96,14 +107,14 @@ async function resolvePublic(resolver:Resolver, host:string, signal:AbortSignal)
   if (!addresses.length) return {ok:false,error:'resolution_failed'};
   return addresses.some(a=>!publicAddress(a)) ? {ok:false,error:'callback_endpoint'} : {ok:true,value:null};
 }
-export function safeHttps(allowlist:string | undefined, resolver:Resolver = workersResolver, transport:Transport = fetch):SafeHttps {
+export function safeHttps(allowlist:string | undefined, resolver:Resolver = workersResolver, transport:Transport = fetch, issuer?:string):SafeHttps {
   return { async deliver(url,secret,subscriptionId,messageId,now,body,expires,eligible) {
-    const dest = destination(url,allowlist); if (!dest.ok) return {status:'terminal',category:'callback_endpoint'};
+    const dest = destination(url,allowlist,issuer); if (!dest.ok) return {status:'terminal',category:'callback_endpoint'};
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(),5000);
     const timeout = new Promise<never>((_,reject) => controller.signal.addEventListener('abort',()=>reject(new DOMException('timeout','TimeoutError')),{once:true}));
     try {
-      const resolved = await resolvePublic(resolver,dest.value.hostname,controller.signal);
+      const resolved = localCallback(dest.value,issuer) ? {ok:true as const,value:null} : await resolvePublic(resolver,dest.value.hostname,controller.signal);
       if (!resolved.ok) return {status:resolved.error === 'callback_endpoint' ? 'terminal' : 'retryable',category:resolved.error === 'callback_endpoint' || resolved.error === 'timeout' ? resolved.error : 'resolution_failed'};
       if (Date.now() >= expires || !await eligible() || Date.now() >= expires) return {status:'deferred'};
       const timestamp = String(Math.floor(now/1000));
@@ -112,11 +123,11 @@ export function safeHttps(allowlist:string | undefined, resolver:Resolver = work
       return {status:response.status === 410 || response.status === 413 ? 'terminal' : 'retryable',category:response.status >= 500 ? 'http_5xx' : response.status >= 400 ? 'http_4xx' : 'http_other'};
     } catch (e) { const category = failure(e); return {status:'retryable',category:category === 'timeout' || category === 'tls_error' ? category : 'connection_refused'}; } finally { clearTimeout(timer); }
   }, async verify(url,secret,subscriptionId,nonce,messageId,now) {
-    const dest = destination(url,allowlist); if (!dest.ok) return dest;
+    const dest = destination(url,allowlist,issuer); if (!dest.ok) return dest;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(),5000);
     try {
-      const resolved = await resolvePublic(resolver,dest.value.hostname,controller.signal);
+      const resolved = localCallback(dest.value,issuer) ? {ok:true as const,value:null} : await resolvePublic(resolver,dest.value.hostname,controller.signal);
       if (!resolved.ok) return resolved;
       const body = JSON.stringify({type:'verification',challenge:nonce});
       const timestamp = String(Math.floor(now/1000));

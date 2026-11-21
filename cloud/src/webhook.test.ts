@@ -25,6 +25,22 @@ const transport:Transport = async (target,init) => {
 const id = 'msg_verification_123', nonce = 'nonce';
 async function verify(port:SafeHttps, target=url) { return port.verify(target,secret,'sub',nonce,id,100000); }
 const port = () => safeHttps('https://example.test',resolver,transport);
+for (const issuer of ['https://access.example.test', 'http://example.test', 'http://127.0.0.1:4444/path']) {
+  let invoked = false;
+  const p = safeHttps('http://127.0.0.1:4321', async () => { invoked=true; return answer(); }, async () => { invoked=true; return new Response(); }, issuer);
+  assert(!(await verify(p,'http://127.0.0.1:4321/callback')).ok);
+  assert.equal(invoked,false);
+}
+{
+  let resolved = false;
+  const p = safeHttps('http://127.0.0.1:4321', async () => { resolved=true; return answer(); }, transport, 'http://127.0.0.1:4444');
+  assert((await verify(p,'http://127.0.0.1:4321/callback')).ok);
+  assert.equal(resolved,false);
+  const denied = await verify(p,'http://127.0.0.1:4322/callback');
+  assert(!denied.ok && denied.error === 'callback_endpoint');
+  assert.equal(resolved,false);
+  calls=[];
+}
 assert(secretBytes(secret));
 assert.equal(secretBytes('whsec_YQ=='),null);
 const signature = await sign(secret,id,'100','body');

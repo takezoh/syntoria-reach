@@ -46,7 +46,7 @@ export class NodeBroker extends DurableObject<Env> {
   private readerEnds = new Map<string, 'forbidden' | 'expired' | 'limit' | 'closed'>();
 
   protected webhookPort(): SafeHttps {
-    return safeHttps((this.env as Env & {WEBHOOK_ALLOWED_ORIGINS?:string}).WEBHOOK_ALLOWED_ORIGINS);
+    return safeHttps((this.env as Env & {WEBHOOK_ALLOWED_ORIGINS?:string}).WEBHOOK_ALLOWED_ORIGINS, undefined, undefined, this.env.ACCESS_TEAM_DOMAIN);
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -242,7 +242,7 @@ export class NodeBroker extends DurableObject<Env> {
     if (!events.valid(input) || (input.mode === 'webhook' && events.lease(options) === null)) return {ok:false,error:'invalid_params'};
     if (input.mode === 'webhook') {
       if (!secretBytes(input.secret)) return {ok:false,error:'invalid_params'};
-      const allowed = destination(input.callback!, (this.env as Env & {WEBHOOK_ALLOWED_ORIGINS?:string}).WEBHOOK_ALLOWED_ORIGINS);
+      const allowed = destination(input.callback!, (this.env as Env & {WEBHOOK_ALLOWED_ORIGINS?:string}).WEBHOOK_ALLOWED_ORIGINS, this.env.ACCESS_TEAM_DOMAIN);
       if (!allowed.ok) return allowed;
     }
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(events.key(input)));

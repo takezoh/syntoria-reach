@@ -1,4 +1,5 @@
 import { type GrantInput, MAX_EVENTS, type Principal, type Profile, type Result, type Stop, type WebhookOptions } from './events.ts';
+import { localCallback } from './webhook.ts';
 
 const NAME = 'agent.session_state_changed';
 const descriptor = {
@@ -41,7 +42,7 @@ export async function eventsWire(method:string, params:unknown, profile:Profile,
     if (!p.delivery || typeof p.delivery !== 'object' || typeof p.delivery.url !== 'string') return {error:invalid()};
     if (method === 'events/subscribe' && p.delivery.mode !== 'webhook') return {error:error(-32026,'Unsupported',{feature:'deliveryMode',value:p.delivery.mode})};
     if (method === 'events/unsubscribe' && p.delivery.mode !== undefined && p.delivery.mode !== 'webhook') return {error:error(-32026,'Unsupported',{feature:'deliveryMode',value:p.delivery.mode})};
-    try { if (new URL(p.delivery.url).protocol !== 'https:') return {error:invalid()}; } catch { return {error:invalid()}; }
+    try { const url = new URL(p.delivery.url); if (url.protocol !== 'https:' && !localCallback(url,principal.issuer)) return {error:invalid()}; } catch { return {error:invalid()}; }
     input.callback = p.delivery.url;
     if (method === 'events/subscribe') input.secret = p.delivery.secret;
   }
