@@ -42,6 +42,7 @@ type Pending = { ws: WebSocket; method: string; resolve: (reply: Reply) => void;
 export class NodeBroker extends DurableObject<Env> {
   private pending = new Map<string, Pending>();
   private waiters = new Set<() => void>();
+  private readerVersion = 0;
   private readerEnds = new Map<string, 'forbidden' | 'expired' | 'limit' | 'closed'>();
 
   protected webhookPort(): SafeHttps {
@@ -52,10 +53,10 @@ export class NodeBroker extends DurableObject<Env> {
     super(ctx, env);
     // The daemon's keepalive is answered without waking the object.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
-    ctx.blockConcurrencyWhile(async () => { await this.change(s => [events.removeReaders(s, []), null]); });
+    ctx.blockConcurrencyWhile(async () => { await this.change(s => [events.removeReaders(s), null]); });
   }
 
-  private wakeReaders(): void { for (const wake of this.waiters) wake(); this.waiters.clear(); }
+  private wakeReaders(): void { this.readerVersion++; for (const wake of this.waiters) wake(); this.waiters.clear(); }
 
   // Accepts the daemon's WebSocket. The Worker has checked the node token.
   // A new connection replaces the old one (the daemon reconnected).
@@ -152,6 +153,8 @@ export class NodeBroker extends DurableObject<Env> {
       for (const [k,v] of await tx.list<events.State["events"][string]>({prefix:"event/"})) state.events[k.slice(6)] = v;
       for (const [k,v] of await tx.list<events.State["dedupe"][string]>({prefix:"dedupe/"})) state.dedupe[k.slice(7)] = v;
       for (const [k,v] of await tx.list<events.Verification>({prefix:"verification/"})) state.pending[k.slice(13)] = v;
+      for (const [k,v] of await tx.list<events.Control>({prefix:"control/"})) state.controls[k.slice(8)] = v;
+      for (const [k,v] of await tx.list<number>({prefix:"proof/"})) state.cache[k.slice(6)] = v;
       const [next, result] = fn(state);
       for (const [prefix, before, after] of [
         ["message/", state.messages, next.messages],
@@ -159,6 +162,8 @@ export class NodeBroker extends DurableObject<Env> {
         ["event/", state.events, next.events],
         ["dedupe/", state.dedupe, next.dedupe],
         ["verification/", state.pending, next.pending],
+        ["control/", state.controls, next.controls],
+        ["proof/", state.cache, next.cache],
       ] as const) {
         for (const id of Object.keys(before)) if (!(id in after)) await tx.delete(prefix + id);
         for (const [id, value] of Object.entries(after)) {
@@ -166,7 +171,7 @@ export class NodeBroker extends DurableObject<Env> {
         }
       }
       if (next.seq !== state.seq) await tx.put("seq", next.seq);
-      const deadlines = [...Object.values(next.messages).filter(m => m.status !== 'abandoned' && next.grants[m.grant]?.authorized).map(m => m.due), ...Object.values(next.grants).map(g => g.expires), ...Object.values(next.dedupe).map(d => d.admitted + events.DEDUPE_MS), ...Object.values(next.pending).map(p => p.expires)];
+      const deadlines = [...Object.values(next.messages).filter(m => next.grants[m.grant]?.authorized && next.grants[m.grant]?.deliveryActive !== false).map(m => m.due), ...Object.values(next.controls).flatMap(c => c.body.type === 'terminated' || next.grants[c.subscription]?.authorized ? [c.due,c.expires] : [c.expires]), ...Object.values(next.cache), ...Object.values(next.grants).map(g => g.expires), ...Object.values(next.dedupe).map(d => d.admitted + events.DEDUPE_MS), ...Object.values(next.pending).map(p => p.expires)];
       if (deadlines.length) await tx.setAlarm(Math.min(...deadlines));
       else await tx.deleteAlarm();
       const ended = Object.values(state.grants).filter(g => g.reader && !next.grants[g.id]).map(g => ({id:g.id, reason:g.expires <= Date.now() ? 'expired' as const : reason}));
@@ -178,6 +183,32 @@ export class NodeBroker extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    for (;;) {
+      const control = await this.change(state => {
+        const n = events.expire(state,Date.now());
+        const c = Object.values(n.controls).find(x => x.due <= Date.now() && (x.body.type === 'terminated' || n.grants[x.subscription]?.authorized));
+        if (!c) return [n,null];
+        if (c.attempts >= 10) { delete n.controls[c.id]; return [n,null]; }
+        c.attempts++; c.due = Date.now() + Math.min(1000 * 2 ** (c.attempts-1),60000);
+        return [n,structuredClone(c)];
+      });
+      if (!control) break;
+      const outcome = await this.webhookPort().deliver(control.url,control.secret,control.subscription,control.id,Date.now(),JSON.stringify(control.body),control.expires,async () => {
+        const current = await this.ctx.storage.get<events.Control>('control/' + control.id);
+        if (!current || current.attempts !== control.attempts) return false;
+        if (current.body.type === 'terminated') return true;
+        const grant = await this.ctx.storage.get<events.Grant>('grant/' + current.subscription);
+        return !!grant && grant.authorized && grant.expires > Date.now();
+      });
+      await this.change(state => {
+        const n=events.expire(state,Date.now()), c=n.controls[control.id];
+        if (c && c.attempts === control.attempts) {
+          if (outcome.status === 'accepted' || outcome.status === 'terminal' || (outcome.status === 'retryable' && c.attempts >= 10)) delete n.controls[c.id];
+          else if (outcome.status === 'deferred') c.attempts--;
+        }
+        return [n,null];
+      });
+    }
     for (;;) {
       const reserved = await this.change(state => events.reserve(state, Date.now()));
       if (!reserved) break;
@@ -207,7 +238,7 @@ export class NodeBroker extends DurableObject<Env> {
     return 'unavailable';
   }
 
-  async subscribe(input: events.GrantInput): Promise<events.Result<Omit<events.Grant, 'secret'>>> {
+  async subscribe(input: events.GrantInput): Promise<events.Result<Omit<events.Grant, 'secret'> | events.WebhookResult>> {
     if (!events.valid(input)) return {ok:false,error:'invalid_params'};
     if (input.mode === 'webhook') {
       if (!secretBytes(input.secret)) return {ok:false,error:'invalid_params'};
@@ -218,39 +249,44 @@ export class NodeBroker extends DurableObject<Env> {
     const subscriptionId = 'sub_' + Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
     const now = Date.now();
     const ws = this.ctx.getWebSockets().find(s => s.readyState === WebSocket.OPEN);
-    const answer = await this.authorize(input, now + 300_000);
+    const answer = await this.authorize(input, now + events.LEASE_MS);
     const decision = ws && ws.readyState === WebSocket.OPEN && this.ctx.getWebSockets().includes(ws) ? answer : 'unavailable';
     if (input.mode !== 'webhook') return this.change(state => events.subscribe(state, input, Date.now(), subscriptionId, decision));
     const pendingKey = events.verificationKey(input);
-    const id = crypto.randomUUID(), nonce = crypto.randomUUID() + crypto.randomUUID();
+    const id = crypto.randomUUID(), nonce = crypto.randomUUID() + crypto.randomUUID(), terminatedId = `msg_terminated_${crypto.randomUUID()}`;
     const reservedAt = Date.now();
     const reserved = await this.change<events.Result<string>>(state => {
       const next = events.expire(state, reservedAt);
       const existing = Object.values(next.grants).find(g => !g.reader && events.key(g) === events.key(input));
-      if (decision === 'denied') { delete next.pending[pendingKey]; const [updated] = events.subscribe(next,input,reservedAt,id,decision); return [updated,{ok:false,error:'forbidden'}]; }
+      if (decision === 'denied') { delete next.pending[pendingKey]; return [existing ? events.deny(next,existing.id,reservedAt,terminatedId) : next,{ok:false,error:'forbidden'}]; }
       if (!existing && decision !== 'allowed') return [next,{ok:false as const,error:'unavailable' as const}];
+      if (next.cache[pendingKey] > reservedAt) return [next,{ok:true as const,value:''}];
       if (next.pending[pendingKey]) return [next,{ok:false as const,error:'unavailable' as const}];
       if (!existing && Object.keys(next.grants).length + Object.keys(next.pending).length >= events.MAX_GRANTS) return [next,{ok:false as const,error:'limit' as const}];
-      next.pending[pendingKey] = {id,key:events.key(input),nonce,secret:input.secret!,expires:existing ? Math.min(existing.expires,reservedAt+300_000) : reservedAt+300_000};
+      next.pending[pendingKey] = {id,key:events.key(input),nonce,secret:input.secret!,expires:existing ? Math.min(existing.expires,reservedAt+events.LEASE_MS) : reservedAt+events.LEASE_MS};
       return [next,{ok:true as const,value:existing?.id ?? subscriptionId}];
     });
     if (!reserved.ok) return reserved;
-    const checked = await this.webhookPort().verify(input.callback!,input.secret!,reserved.value,nonce,`msg_verification_${crypto.randomUUID()}`,Date.now());
+    const checked = reserved.value === '' ? {ok:true as const,value:null} : await this.webhookPort().verify(input.callback!,input.secret!,reserved.value,nonce,`msg_verification_${crypto.randomUUID()}`,Date.now());
     const completedAt = Date.now();
     const currentDecision = ws && ws.readyState === WebSocket.OPEN && this.ctx.getWebSockets().includes(ws) ? decision : 'unavailable';
-    return this.change<events.Result<Omit<events.Grant, 'secret'>>>(state => {
+    return this.change<events.Result<events.WebhookResult>>(state => {
       const next = events.expire(state,completedAt);
-      if (next.pending[pendingKey]?.id !== id) return [next,{ok:false,error:'unavailable'}];
-      delete next.pending[pendingKey];
+      if (reserved.value !== '') {
+        if (next.pending[pendingKey]?.id !== id) return [next,{ok:false,error:'unavailable'}];
+        delete next.pending[pendingKey];
+      } else if (!(next.cache[pendingKey] > completedAt)) return [next,{ok:false,error:'unavailable'}];
       if (!checked.ok) return [next,checked];
       const [updated,result] = events.subscribe(next,input,completedAt,subscriptionId,currentDecision);
       if (!result.ok) return [updated,result];
-      const {secret: _secret, ...value} = result.value;
+      if (reserved.value !== '') updated.cache[pendingKey] = result.value.expires;
+      const value = events.webhookResult(updated,result.value);
+      result.value.truncated = false;
       return [updated,{ok:true,value}];
     });
   }
 
-  async refresh(input: events.GrantInput): Promise<events.Result<Omit<events.Grant, 'secret'>>> {
+  async refresh(input: events.GrantInput): Promise<events.Result<Omit<events.Grant, 'secret'> | events.WebhookResult>> {
     return this.subscribe(input);
   }
 
@@ -266,12 +302,12 @@ export class NodeBroker extends DurableObject<Env> {
     return this.change(state => events.poll(state, input, cursor, batch, Date.now(), crypto.randomUUID(), maxAgeMs));
   }
 
-  // Records are newline-delimited JSON for the wire adapter; framing on the
+  // Newline-delimited records are active, event, keepalive, or terminated.
   // The wire closes the reader on every request exit, including abort.
   async openReader(input: events.GrantInput, cursor: string | null): Promise<events.Result<ReadableStream<Uint8Array>>> {
     if (!events.valid(input) || input.mode !== 'push' || (cursor !== null && typeof cursor !== 'string')) return {ok:false,error:'invalid_params'};
     const ws = this.ctx.getWebSockets().find(s => s.readyState === WebSocket.OPEN);
-    const decision = await this.authorize(input, Date.now() + 300_000);
+    const decision = await this.authorize(input, Date.now() + events.LEASE_MS);
     const active = ws && ws.readyState === WebSocket.OPEN && this.ctx.getWebSockets().includes(ws);
     const id = crypto.randomUUID();
     const opened = await this.change(s => events.openReader(s, input, Date.now(), id, active ? decision : 'unavailable', cursor));
@@ -279,6 +315,7 @@ export class NodeBroker extends DurableObject<Env> {
     const encoder = new TextEncoder();
     let initial = true;
     let closed = false;
+    let seenVersion = -1;
     const cleanup = async () => {
       if (closed) return;
       closed = true; this.wakeReaders();
@@ -296,11 +333,12 @@ export class NodeBroker extends DurableObject<Env> {
           let wake!: () => void;
           const signal = new Promise<void>(resolve => { wake = resolve; this.waiters.add(resolve); });
           try {
-            const result = await this.change(s => {
+            const version = this.readerVersion;
+            const result = seenVersion !== version || Date.now() >= opened.value.grant.expires ? await this.change(s => {
               if (this.ctx.getWebSockets().some(ws => ws.readyState === WebSocket.OPEN)) return events.readReader(s, id, Date.now());
               const next = events.expire(s, Date.now());
               return [next, {ok:false as const,error:next.grants[id] ? 'unavailable' as const : 'not_found' as const}];
-            });
+            }) : {ok:true as const,value:null};
             if (!result.ok && result.error !== 'unavailable') {
               const reason = this.readerEnds.get(id) ?? 'expired';
               if (reason !== 'closed') controller.enqueue(encoder.encode(JSON.stringify({type:'terminated',reason})+'\n'));
@@ -310,6 +348,7 @@ export class NodeBroker extends DurableObject<Env> {
               controller.enqueue(encoder.encode(JSON.stringify({type:'event',...result.value})+'\n'));
               return;
             }
+            seenVersion = version;
             let timer: ReturnType<typeof setTimeout> | undefined;
             const heartbeat = new Promise<'heartbeat'>(resolve => { timer = setTimeout(() => resolve('heartbeat'), 1000); });
             const outcome = await Promise.race([signal.then(() => 'wake' as const), heartbeat]);
@@ -353,7 +392,8 @@ export class NodeBroker extends DurableObject<Env> {
       if (g.expires <= Date.now()) continue;
       const decision = await this.authorize(g, g.expires);
       if (ws.readyState !== WebSocket.OPEN || !this.ctx.getWebSockets().includes(ws)) return;
-      await this.change(current => [events.setAuthorization(current, g.id, decision, Date.now()), null], decision === 'denied' ? 'forbidden' : undefined);
+      const terminatedId = `msg_terminated_${crypto.randomUUID()}`;
+      await this.change(current => [decision === 'denied' ? events.deny(current,g.id,Date.now(),terminatedId) : events.setAuthorization(current, g.id, decision, Date.now()), null], decision === 'denied' ? 'forbidden' : undefined);
       this.wakeReaders();
     }
   }

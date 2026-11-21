@@ -117,12 +117,32 @@ assert(!effects.includes('ack:failed'),'storage failure does not ack');
     [only,reserved]=e.reserve(only,time); assert(reserved && reserved.message.attempts===attempt,'bounded attempt '+attempt);
     only=e.delivered(only,reserved.key,attempt,{status:'retryable',category:'timeout'}); time=reserved.message.due;
   }
-  assert(Object.values(only.messages)[0].lastOutcome==='timeout' && Object.values(only.messages)[0].status==='abandoned','last category retained on abandonment');
+  assert(!Object.keys(only.messages).length && !only.grants.one.events.length && only.grants.one.lastOutcome==='timeout' && only.grants.one.deliveryActive===false,'exhaustion removes the message and records delivery failure');
+  const status=e.webhookResult(only,only.grants.one);
+  assert(status.deliveryStatus.lastError==='timeout' && !status.deliveryStatus.active && JSON.parse(atob(status.cursor)).position===only.seq,'exhaustion releases the watermark');
   [only,reserved]=e.reserve(only,time); assert(!reserved,'no eleventh attempt');
   [only,reserved]=e.reserve(only,301000); assert(!reserved && !Object.keys(only.messages).length,'expiry removes messages');
   let cap=e.empty(); [cap]=e.subscribe(cap,hook,1000,'cap-hook','allowed');
   for (let n=0;n<=e.MAX_EVENTS;n++) [cap]=e.admit(cap,stop('cap-hook-'+n,1001),1001,{'cap-hook':'id'+n});
+  const gap=Object.values(cap.controls)[0];
+  assert(cap.grants['cap-hook'].truncated && gap.body.type==='gap' && gap.id.startsWith('msg_gap_'),'standard eviction queues gap and marks truncation');
+  assert(e.webhookResult(cap,cap.grants['cap-hook']).truncated,'refresh projection reports eviction');
   [cap,reserved]=e.reserve(cap,1001); assert(reserved && reserved.message.eventId==='cap-hook-1','eviction cannot leave orphan message');
+  let terminal=e.empty(); [terminal]=e.subscribe(terminal,hook,1000,'terminal','allowed');
+  [terminal]=e.admit(terminal,stop('gone',1001),1001,{terminal:'msg-gone'});
+  [terminal]=e.admit(terminal,stop('after-gone',1001),1001,{terminal:'msg-after'});
+  [terminal,reserved]=e.reserve(terminal,1001); assert(reserved,'terminal reserve');
+  terminal=e.delivered(terminal,reserved.key,1,{status:'terminal',category:'http_4xx'});
+  const terminalStatus=e.webhookResult(terminal,terminal.grants.terminal);
+  assert(!terminal.messages[JSON.stringify(['terminal','gone'])] && terminalStatus.deliveryStatus.lastError==='http_4xx' && terminalStatus.deliveryStatus.active && JSON.parse(atob(terminalStatus.cursor)).position===1,'terminal failure releases cursor and reports status');
+  [terminal,reserved]=e.reserve(terminal,1001);
+  assert(reserved?.message.eventId==='after-gone','terminal failure does not suspend later events');
+  assert(e.publicError('callback_endpoint')==='connection_refused' && e.publicError('resolution_failed')==='connection_refused' && e.publicError('http_other')==='http_4xx','internal errors map to public categories');
+  terminal=e.deny(terminal,'terminal',1002,'msg_terminated_random');
+  assert(!terminal.grants.terminal && terminal.controls.msg_terminated_random.body.type==='terminated','denial retains only termination control');
+  let chatOnly=e.empty(); [chatOnly]=e.subscribe(chatOnly,chat,1000,'chat-only','allowed');
+  chatOnly=e.deny(chatOnly,'chat-only',1001,'msg_terminated_chat');
+  assert(!Object.keys(chatOnly.controls).length,'ChatGPT denial has no control envelope');
 }
 {
   let state=e.empty(); let grant:e.Result<e.Grant>; let batch:e.Result<{events:e.Stop[];cursor:string;truncated:boolean;hasMore:boolean;nextPollMs:number}>;
@@ -137,7 +157,7 @@ assert(!effects.includes('ack:failed'),'storage failure does not ack');
   let reserved:ReturnType<typeof e.reserve>[1]; [h,reserved]=e.reserve(h,1001); assert(reserved,'reserved before pause');
   h=e.delivered(h,reserved.key,1,{status:'deferred'});
   const msg=Object.values(h.messages)[0];
-  assert(msg.attempts===0 && msg.lastOutcome===null && msg.status==='pending','pre-send suspension does not consume or invent an outcome');
+  assert(!!msg && msg.attempts===0 && msg.lastOutcome===null,'pre-send suspension does not consume or invent an outcome');
 }
 console.log('events tests passed');
 
@@ -154,7 +174,7 @@ assert(!ps.grants.reader1 && ps.events['push-shared'].grants.join() === 'reader2
 assert(opened.ok && opened.value.truncated && opened.value.cursor!==oldCursor && !ps.grants.reader3.events.length,'old cursor cannot recover');
 let read: e.Result<{event:e.Stop;cursor:string}|null>;
 [ps,read]=e.readReader(ps,'reader2',10_002); assert(read.ok && read.value?.event.eventId==='push-shared','other reader receives shared occurrence');
-ps=e.removeReaders(ps,[]); assert(!Object.keys(ps.grants).length && ps.dedupe['push-shared'].grants.length===0,'restart removes readers and membership');
+ps=e.removeReaders(ps); assert(!Object.keys(ps.grants).length && ps.dedupe['push-shared'].grants.length===0,'restart removes readers and membership');
 let solo=e.empty();
 [solo,opened]=e.openReader(solo,push,20_000,'solo','allowed',null); assert(opened.ok,'solo reader');
 [solo,ack]=e.admit(solo,stop('resend',20_001),20_001); assert(ack,'first admission');
@@ -207,6 +227,21 @@ try {
   await readerOne.cancel();
   const delivered = decode((await readerTwo.read()).value);
   assert(delivered.type === 'event' && delivered.event.eventId === 'push-do', 'other reader receives shared event');
+  holdAuthorization = true;
+  const pushReconnect = await stub.fetch('http://node/', {headers:{Upgrade:'websocket'}});
+  assert(pushReconnect.webSocket, 'push reconnect');
+  socket = pushReconnect.webSocket; connectHandler();
+  const pushAuthorization = await nextAuthorization();
+  for (const id of ['queued-a','queued-b']) {
+    await new Promise<void>(resolve => { receivedAck=()=>resolve(); socket.send(JSON.stringify(stop(id,Date.now()))); });
+  }
+  socket.send(JSON.stringify({id:pushAuthorization.id,result:{decision:'allowed'}}));
+  holdAuthorization = false;
+  for (const id of ['queued-a','queued-b']) {
+    const record = await Promise.race([readerTwo.read(),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('queued push timeout')),3000))]);
+    const item = decode(record.value);
+    assert(item.type === 'event' && item.event.eventId === id, 'push drains queued events after one wake');
+  }
   const reopened = await stub.openReader(push,activeOne.cursor);
   assert(reopened.ok, 'replacement reader');
   const replacementReader = reopened.value.getReader();
@@ -267,6 +302,9 @@ const bundled = await build({stdin:{contents:`
 import { NodeBroker } from './src/broker.ts';
 import { safeHttps } from './src/webhook.ts';
 export class TestBroker extends NodeBroker {
+  changes = 0;
+  change(...args) { this.changes++; return super.change(...args); }
+  changeCount() { return this.changes; }
   failChallenge = false;
   holdChallenge = false;
   releaseChallenge() { this.resumeChallenge?.(); this.holdChallenge=false; }
@@ -275,7 +313,7 @@ export class TestBroker extends NodeBroker {
   webhookPort() { const port = safeHttps('https://example.test', async () => ({a:['8.8.8.8'],aaaa:[]}), async (_url,init) => {
     if (this.holdChallenge) await new Promise(resolve => { this.resumeChallenge=resolve; });
     const body=JSON.parse(init.body);
-    if (body.type === 'verification') return new Response(JSON.stringify({challenge:this.failChallenge ? 'wrong' : body.challenge}));
+    if (body.type === 'verification') { await this.ctx.storage.put('challenge-count',(await this.ctx.storage.get('challenge-count') ?? 0)+1); return new Response(JSON.stringify({challenge:this.failChallenge ? 'wrong' : body.challenge})); }
     const messages=[...(await this.ctx.storage.list({prefix:'message/'})).values()];
     const headers=Object.fromEntries(new Headers(init.headers));
     const log=await this.ctx.storage.get('test-log') ?? [];
@@ -291,9 +329,11 @@ export class TestBroker extends NodeBroker {
   async setChallengeFailure(value) { this.failChallenge = value; }
   async setDeliveryStatus(value) { await this.ctx.storage.put('test-status',value); }
   async deliveryLog() { return await this.ctx.storage.get('test-log') ?? []; }
+  async challengeCount() { return await this.ctx.storage.get('challenge-count') ?? 0; }
   async forceDue() { for (const [key,value] of await this.ctx.storage.list({prefix:'message/'})) { value.due=Date.now()-1; await this.ctx.storage.put(key,value); } }
   async dispatch() { await this.alarm(); }
   async messages() { return [...(await this.ctx.storage.list({prefix:'message/'})).values()]; }
+  async controls() { return [...(await this.ctx.storage.list({prefix:'control/'})).values()]; }
   async injectStop(stop) { await this.webSocketMessage({send() {}}, JSON.stringify(stop)); }
   async overflowReader(id, stop) {
     const grant = await this.ctx.storage.get('grant/' + id);
@@ -345,6 +385,18 @@ try {
     if (frame.method === 'events.authorize') socket.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));
     if (frame.type === 'turn_stop_ack') finishAlarmAck?.();
   });
+  const idlePush=await object.openReader(push,null); assert(idlePush.ok,'idle reader opens');
+  const idleReader=idlePush.value.getReader();
+  const idleActive=JSON.parse(new TextDecoder().decode((await idleReader.read()).value));
+  const idleFirst=JSON.parse(new TextDecoder().decode((await idleReader.read()).value));
+  assert(idleFirst.type==='keepalive','idle reader sends keepalive');
+  const idleChanges=await object.changeCount();
+  for (let i=0;i<3;i++) assert(JSON.parse(new TextDecoder().decode((await idleReader.read()).value)).type==='keepalive','idle heartbeat');
+  assert(await object.changeCount()===idleChanges,'keepalives do not read durable state');
+  await object.injectStop(stop('idle-wake',Date.now()));
+  const idleEvent=JSON.parse(new TextDecoder().decode((await idleReader.read()).value));
+  assert(idleEvent.type==='event' && idleEvent.event.eventId==='idle-wake','real event wakes idle reader');
+  await object.closeReader(push,idleActive.id); await idleReader.cancel();
   const webhook = {...base,mode:'webhook' as const,callback:'https://example.test/hook',secret:'whsec_'+btoa('a'.repeat(32))};
   await object.armChallenge();
   const inFlightWebhook = object.subscribe(webhook);
@@ -362,10 +414,23 @@ try {
   await object.setChallengeFailure(false);
   const subscribed = await object.subscribe(webhook);
   assert(subscribed.ok && !JSON.stringify(subscribed).includes(webhook.secret), 'webhook subscribe hides secret');
+  const challengeCount = await object.challengeCount();
   const refreshedWebhook = await object.refresh(webhook);
   assert(refreshedWebhook.ok && !JSON.stringify(refreshedWebhook).includes(webhook.secret), 'webhook refresh hides secret');
+  const secondWebhook = {...webhook,arguments:{...webhook.arguments,session_id:'other-session'}};
+  assert((await object.subscribe(secondWebhook)).ok && await object.challengeCount()===challengeCount,'live proof is shared across refresh and arguments');
+  await object.unsubscribe(secondWebhook);
   assert((await object.inspectGrant(subscribed.value.id)).secret === webhook.secret, 'webhook grant retains secret');
+  const beforeUnsubscribeLog=(await object.deliveryLog()).length;
   assert((await object.unsubscribe(webhook)).ok, 'webhook fixture cleanup');
+  await object.dispatch();
+  assert(!(await object.controls()).length && (await object.deliveryLog()).length===beforeUnsubscribeLog,'unsubscribe sends no termination');
+  assert((await object.subscribe(webhook)).ok && await object.challengeCount()===challengeCount+1,'last unsubscribe clears proof');
+  await object.unsubscribe(webhook);
+  const expiringHook=await object.subscribe(webhook); assert(expiringHook.ok,'expiring webhook opens');
+  const beforeExpiryLog=(await object.deliveryLog()).length;
+  await object.expireAndFire(expiringHook.value.id);
+  assert(!(await object.controls()).length && (await object.deliveryLog()).length===beforeExpiryLog,'expiry sends no termination');
   const first = await object.subscribe(base);
   assert(first.ok, 'alarm fixture first grant');
   await new Promise(resolve => setTimeout(resolve,10));
@@ -444,9 +509,14 @@ try {
   const expiring=await object.openReader(push,null); assert(expiring.ok,'expiring reader opens');
   const expiryReader=expiring.value.getReader();
   const expiryActive=JSON.parse(new TextDecoder().decode((await expiryReader.read()).value));
+  const offlineClosed=new Promise<void>(resolve=>socket4.addEventListener('close',()=>resolve()));
+  socket4.close(); await offlineClosed;
   await object.expireAndFire(expiryActive.id);
   const expiryEnd=await expiryReader.read();
-  assert(!expiryEnd.done && JSON.parse(new TextDecoder().decode(expiryEnd.value)).reason==='expired','expiry has a distinct reason');
+  assert(!expiryEnd.done && JSON.parse(new TextDecoder().decode(expiryEnd.value)).reason==='expired' && (await expiryReader.read()).done,'offline expiry closes the reader');
+  const resumedSocketResponse=await object.fetch('http://node/',{headers:{Upgrade:'websocket'}});
+  const resumedSocket=resumedSocketResponse.webSocket; assert(resumedSocket,'reader tests reconnect'); resumedSocket.accept();
+  resumedSocket.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') resumedSocket.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));});
   const full=await object.openReader(push,null); assert(full.ok,'full reader opens');
   const fullReader=full.value.getReader();
   const fullActive=JSON.parse(new TextDecoder().decode((await fullReader.read()).value));
@@ -460,7 +530,7 @@ try {
   await lostReader.cancel();
   for (let i=0;i<40 && await object.hasGrant(lostActive.id);i++) await new Promise(resolve=>setTimeout(resolve,100));
   assert(!(await object.hasGrant(lostActive.id)),'lost stream is reconciled without an event');
-  socket4.close();
+  resumedSocket.close();
   const beforeRestart=await object.fetch('http://node/',{headers:{Upgrade:'websocket'}});
   const socket5=beforeRestart.webSocket; assert(socket5,'restart fixture socket'); socket5.accept();
   socket5.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') socket5.send(JSON.stringify({id:frame.id,result:{decision:'allowed'}}));});
@@ -540,7 +610,21 @@ try {
     const retry=recoveredLog.find((x:{headers:Record<string,string>;messages:Array<{id:string;attempts:number}>})=>x.headers['webhook-id']===id && x.messages.some((m:{id:string;attempts:number})=>m.id===id && m.attempts===2));
     assert(retry,'retry retains id and counts ambiguous attempt');
   }
+  const beforeTermination=await recovered.deliveryLog();
   rs.close();
+  const denialConnection=await recovered.fetch('http://node/',{headers:{Upgrade:'websocket'}});
+  const denialSocket=denialConnection.webSocket; assert(denialSocket,'webhook denial socket'); denialSocket.accept();
+  denialSocket.addEventListener('message',(message:{data:string})=>{const frame=JSON.parse(message.data); if(frame.method==='events.authorize') denialSocket.send(JSON.stringify({id:frame.id,result:{decision:'denied'}}));});
+  for (let i=0;i<100 && await recovered.hasGrant(grant1Id);i++) await new Promise(resolve=>setTimeout(resolve,10));
+  assert(!(await recovered.hasGrant(grant1Id)),'webhook denial removes grant');
+  await recovered.dispatch();
+  const terminationLog=(await recovered.deliveryLog()).slice(beforeTermination.length);
+  assert(terminationLog.length===1 && JSON.parse(terminationLog[0].body).type==='terminated','denial sends one termination control');
+  const entry=terminationLog[0], id=entry.headers['webhook-id'], timestamp=entry.headers['webhook-timestamp'];
+  assert(id.startsWith('msg_terminated_') && entry.headers['webhook-signature']==='v1,'+createHmac('sha256','a'.repeat(32)).update(`${id}.${timestamp}.${entry.body}`).digest('base64'),'independent receiver verifies termination');
+  await recovered.dispatch();
+  assert((await recovered.deliveryLog()).length===beforeTermination.length+1,'accepted termination is not repeated');
+  denialSocket.close();
 } finally {
   await alarmHarness.close();
 }

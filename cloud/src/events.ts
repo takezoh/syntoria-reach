@@ -7,7 +7,7 @@ export const MAX_EVENTS = 256;
 export const MAX_BATCH = 100;
 export const MAX_DEDUPE = 2048;
 export const DEDUPE_MS = 24 * 60 * 60 * 1000;
-const LEASE_MS = 300_000;
+export const LEASE_MS = 300_000;
 // Node and Cloudflare clocks are assumed NTP-synchronized. The 30-second
 // tolerance favors delivery: an early stop can duplicate the read-once result,
 // whereas dropping a real stop loses its notification.
@@ -18,17 +18,35 @@ export type Principal = { issuer: string; subject: string };
 export type Profile = 'standard' | 'chatgpt';
 export type GrantInput = { principal: Principal; node: string; name: string; arguments: { node: string; session_id: string }; profile: Profile; mode: 'poll' | 'push' | 'webhook'; callback?: string; secret?: string };
 export type Stop = { type: 'turn_stop'; eventId: string; session_id: string; state: 'idle' | 'waiting_on_human' | 'exited' | 'unknown'; observed_at: string };
-export type Grant = GrantInput & { id: string; created: number; expires: number; authorized: boolean; events: string[]; floor: number; reader?: true };
+export type Grant = GrantInput & { id: string; created: number; expires: number; authorized: boolean; events: string[]; floor: number; reader?: true; deliveryActive?: boolean; lastOutcome?: DeliveryCategory | null; truncated?: boolean };
 type Entry = { stop: Stop; seq: number; grants: string[] };
 type Dedupe = { admitted: number; grants: string[] };
 export type Verification = { id:string; key:string; nonce:string; secret:string; expires:number };
 export type DeliveryCategory = 'callback_endpoint' | 'resolution_failed' | 'timeout' | 'tls_error' | 'connection_refused' | 'http_4xx' | 'http_5xx' | 'http_other';
+export type PublicError = 'connection_refused' | 'timeout' | 'tls_error' | 'http_4xx' | 'http_5xx' | 'challenge_failed';
+// No callback connection, including a forbidden destination or DNS failure,
+// maps to connection_refused; other non-2xx below 500 maps to http_4xx.
+export function publicError(error: DeliveryCategory): PublicError {
+  if (error === 'callback_endpoint' || error === 'resolution_failed') return 'connection_refused';
+  if (error === 'http_other') return 'http_4xx';
+  return error;
+}
+export type WebhookResult = {id:string; refreshBefore:string; cursor:string; truncated:boolean; deliveryStatus:{active:boolean;lastError:PublicError|null}};
+export function webhookResult(s: State, g: Grant): WebhookResult {
+  return {id:g.id,refreshBefore:new Date(g.expires).toISOString(),cursor:watermark(s,g),truncated:!!g.truncated,deliveryStatus:{active:g.deliveryActive !== false,lastError:g.lastOutcome ? publicError(g.lastOutcome) : null}};
+}
+export function watermark(s:State,g:Grant):string {
+  const messages = Object.values(s.messages).filter(m => m.grant === g.id);
+  const position = messages.length ? Math.min(...messages.map(m => m.seq)) - 1 : s.seq;
+  return btoa(JSON.stringify({grant:g.id,position}));
+}
 export type DeliveryResult = {status:'accepted'} | {status:'deferred'} | {status:'terminal'|'retryable'; category:DeliveryCategory};
-export type Message = { grant:string; eventId:string; id:string; seq:number; attempts:number; due:number; status:'pending'|'abandoned'; lastOutcome:DeliveryCategory | null };
-export type State = { messages: Record<string, Message>; grants: Record<string, Grant>; events: Record<string, Entry>; dedupe: Record<string, Dedupe>; pending: Record<string, Verification>; seq: number };
+export type Message = { grant:string; eventId:string; id:string; seq:number; attempts:number; due:number; lastOutcome:DeliveryCategory | null };
+export type Control = {subscription:string; url:string; secret:string; id:string; expires:number; attempts:number; due:number; body:{type:'gap';cursor:string}|{type:'terminated';error:{code:number;message:string}}};
+export type State = { messages: Record<string, Message>; controls:Record<string,Control>; cache:Record<string,number>; grants: Record<string, Grant>; events: Record<string, Entry>; dedupe: Record<string, Dedupe>; pending: Record<string, Verification>; seq: number };
 export type Category = 'unavailable' | 'forbidden' | 'not_found' | 'invalid_params' | 'limit' | 'callback_endpoint' | 'resolution_failed' | 'timeout' | 'tls_error' | 'connection_refused' | 'challenge_failed';
 export type Result<T> = { ok: true; value: T } | { ok: false; error: Category };
-export const empty = (): State => ({ messages: {}, grants: {}, events: {}, dedupe: {}, pending: {}, seq: 0 });
+export const empty = (): State => ({ messages: {}, controls:{}, cache:{}, grants: {}, events: {}, dedupe: {}, pending: {}, seq: 0 });
 export const key = (g: GrantInput): string => JSON.stringify([g.principal.issuer, g.principal.subject, g.node, g.name, g.arguments.node, g.arguments.session_id, g.profile, g.mode, g.mode === 'webhook' ? g.callback : null]);
 export function valid(g: GrantInput): boolean {
   return !!(g && g.principal && typeof g.principal.issuer === 'string' && g.principal.issuer &&
@@ -54,11 +72,18 @@ function remove(s: State, id: string): void {
     d.grants = d.grants.filter(g => g !== id);
   }
   for (const [key, message] of Object.entries(s.messages)) if (message.grant === id) delete s.messages[key];
+  for (const [key, control] of Object.entries(s.controls)) if (control.subscription === id && control.body.type === 'gap') delete s.controls[key];
   delete s.grants[id];
+  if (g.mode === 'webhook' && !Object.values(s.grants).some(x => x.mode === 'webhook' && verificationKey(x) === verificationKey(g))) delete s.cache[verificationKey(g)];
 }
-export function removeReaders(s: State, live: string[]): State {
+export function deny(s:State,id:string,now:number,messageId:string):State {
+  const n=expire(s,now), g=n.grants[id];
+  if (g && g.mode === 'webhook' && g.profile === 'standard') n.controls[messageId] = {subscription:g.id,url:g.callback!,secret:g.secret!,id:messageId,expires:g.expires,attempts:0,due:now,body:{type:'terminated',error:{code:-32024,message:'Forbidden'}}};
+  remove(n,id); return n;
+}
+export function removeReaders(s: State): State {
   const n = structuredClone(s);
-  for (const g of Object.values(n.grants)) if (g.reader && !live.includes(g.id)) remove(n, g.id);
+  for (const g of Object.values(n.grants)) if (g.reader) remove(n, g.id);
   return n;
 }
 export function closeReader(s: State, id: string): State {
@@ -88,6 +113,8 @@ export function expire(s: State, now: number): State {
   const n = structuredClone(s);
   for (const g of Object.values(n.grants)) if (g.expires <= now) remove(n, g.id);
   for (const [id, pending] of Object.entries(n.pending)) if (pending.expires <= now) delete n.pending[id];
+  for (const [id, control] of Object.entries(n.controls)) if (control.expires <= now) delete n.controls[id];
+  for (const [id, until] of Object.entries(n.cache)) if (until <= now || !Object.values(n.grants).some(g => g.mode === 'webhook' && verificationKey(g) === id)) delete n.cache[id];
   for (const [id, d] of Object.entries(n.dedupe)) if (d.admitted + DEDUPE_MS <= now) delete n.dedupe[id];
   return n;
 }
@@ -99,7 +126,10 @@ export function subscribe(s: State, input: GrantInput, now: number, id: string, 
     if (decision === 'denied') { remove(n, existing.id); return [n, {ok:false,error:'forbidden'}]; }
     existing.expires = now + LEASE_MS;
     existing.authorized = decision === 'allowed';
-    if (input.mode === 'webhook') existing.secret = input.secret;
+    if (input.mode === 'webhook') {
+      existing.secret = input.secret; existing.deliveryActive = true;
+      for (const control of Object.values(n.controls)) if (control.subscription === existing.id && control.body.type === 'gap') { control.secret = input.secret!; control.expires = existing.expires; }
+    }
     return [n, {ok:true,value:existing}];
   }
   if (decision !== 'allowed') return [n, {ok:false,error:decision === 'denied' ? 'forbidden' : 'unavailable'}];
@@ -135,6 +165,16 @@ export function admit(s: State, stop: Stop, now: number, ids: Record<string,stri
       g.floor = Math.max(g.floor, row.seq);
       row.grants = row.grants.filter(id => id !== g.id);
       if (!row.grants.length) delete n.events[oldest];
+      if (g.mode === 'webhook') {
+        g.truncated = true;
+        if (g.profile === 'standard') {
+          const control = Object.values(n.controls).find(c => c.subscription === g.id && c.body.type === 'gap' && c.attempts === 0);
+          const id = control?.id ?? `msg_gap_${ids[g.id]}`;
+          if (!ids[g.id]) throw new Error('missing gap message id');
+          n.controls[id] = control ?? {subscription:g.id,url:g.callback!,secret:g.secret!,id,expires:g.expires,attempts:0,due:now,body:{type:'gap',cursor:''}};
+          n.controls[id].body = {type:'gap',cursor:watermark(n,g)};
+        }
+      }
     }
   }
   const eligible = matching.filter(g => !!n.grants[g.id]);
@@ -145,7 +185,7 @@ export function admit(s: State, stop: Stop, now: number, ids: Record<string,stri
       if (g.mode === 'webhook') {
         const id = g.profile === 'chatgpt' ? stop.eventId : ids[g.id];
         if (!id) throw new Error('missing webhook message id');
-        n.messages[JSON.stringify([g.id,stop.eventId])] = {grant:g.id,eventId:stop.eventId,id,seq:n.seq,attempts:0,due:now,status:'pending',lastOutcome:null};
+        n.messages[JSON.stringify([g.id,stop.eventId])] = {grant:g.id,eventId:stop.eventId,id,seq:n.seq,attempts:0,due:now,lastOutcome:null};
       }
     }
     const dedupeIds = Object.keys(n.dedupe);
@@ -199,13 +239,16 @@ export async function acknowledge(stop: Stop, commit: (stop: Stop) => Promise<un
 }
 
 export function reserve(s:State, now:number): [State, {key:string; message:Message; grant:Grant; stop:Stop; cursor:string} | null] {
-  const n = expire(s,now);
+  let n = expire(s,now);
   for (const [key,m] of Object.entries(n.messages)) {
     const g = n.grants[m.grant];
-    if (!g || !g.authorized || m.status === 'abandoned' || m.due > now) continue;
-    if (m.attempts >= 10) { m.status = 'abandoned'; continue; }
+    if (!g || !g.authorized || g.deliveryActive === false || m.due > now) continue;
+    if (m.attempts >= 10) {
+      n = delivered(n,key,m.attempts,{status:'retryable',category:m.lastOutcome ?? 'connection_refused'});
+      return [n,null];
+    }
     m.attempts++; m.due = now + Math.min(1000 * 2 ** (m.attempts - 1), 60000);
-    const unresolved = Object.values(n.messages).filter(x => x.grant === g.id && x.status !== 'abandoned');
+    const unresolved = Object.values(n.messages).filter(x => x.grant === g.id);
     const position = Math.min(...unresolved.map(x => x.seq)) - 1;
     const cursor = btoa(JSON.stringify({grant:g.id,position}));
     return [n,{key,message:structuredClone(m),grant:structuredClone(g),stop:structuredClone(n.events[m.eventId].stop),cursor}];
@@ -216,11 +259,12 @@ export function delivered(s:State, key:string, attempt:number, outcome:DeliveryR
   const n = structuredClone(s), m = n.messages[key];
   if (!m || m.attempts !== attempt) return n;
   if (outcome.status === 'deferred') { m.attempts--; return n; }
-  if (outcome.status === 'accepted') {
+  if (outcome.status === 'accepted' || outcome.status === 'terminal' || (outcome.status === 'retryable' && m.attempts >= 10)) {
     delete n.messages[key];
     const g = n.grants[m.grant], row = n.events[m.eventId];
+    if (g && outcome.status !== 'accepted') { if (outcome.status === 'retryable') g.deliveryActive = false; g.lastOutcome = outcome.category; }
     if (g) g.events = g.events.filter(id => id !== m.eventId);
     if (row) { row.grants = row.grants.filter(id => id !== m.grant); if (!row.grants.length) delete n.events[m.eventId]; }
-  } else { m.lastOutcome = outcome.category; if (outcome.status === 'terminal' || m.attempts >= 10) m.status = 'abandoned'; }
+  } else { m.lastOutcome = outcome.category; const g = n.grants[m.grant]; if (g) g.lastOutcome = outcome.category; }
   return n;
 }
