@@ -8,7 +8,7 @@ import { z } from "zod";
 import { failure, nodeBroker, type Reply, unknownOutcome } from "./broker";
 import type { Nodes } from "./nodes";
 import type { Principal, Profile } from "./events";
-import { eventsWire } from "./events-wire";
+import { eventsWire, readerNotification } from "./events-wire";
 
 // The MCP endpoint. list_nodes lists the nodes with the agents each one can
 // run; every other tool forwards one Reach method, with the same arguments
@@ -151,7 +151,9 @@ export async function mcp(request: Request, env: Env, nodes: Nodes, principal: P
       if (message.method === "server/discover") return respond({result:{resultType:"complete",supportedVersions:["2026-07-28"],serverInfo:{name:"syntoria-reach",version:"0.2.0"},instructions:INSTRUCTIONS,capabilities:{tools:{},...(profile === "chatgpt" ? {events:{}} : {extensions:{"io.modelcontextprotocol/events":{}}})}}});
       if (eventMethod) {
         if (!supportedEvents) return respond({error:{code:-32601,message:"Method not found"}});
+        if (profile === "standard" && ["events/poll","events/stream","events/subscribe","events/unsubscribe"].includes(message.method) && (!request.headers.get("Mcp-Name") || request.headers.get("Mcp-Name") !== message.params?.name)) return Response.json({jsonrpc:"2.0",id:message.id,error:{code:-32020,message:"Header mismatch"}}, {status:400});
         const value = await eventsWire(message.method,message.params,profile,principal,nodes, n => nodeBroker(env,n));
+        if (value.stream) return streamEvents(value.stream, message.id, message.params, request.signal);
         if (modern && value.result && typeof value.result === "object") value.result = {...value.result,resultType:"complete"};
         return respond(value);
       }
@@ -246,4 +248,54 @@ async function listNodes(env: Env, nodes: Nodes): Promise<CallToolResult> {
     }),
   );
   return { content: [{ type: "text", text: JSON.stringify({ nodes: entries }) }] };
+}
+
+function streamEvents(source: ReadableStream<Uint8Array>, id: string | number, params: any, signal: AbortSignal): Response {
+  const reader = source.getReader();
+  const encoder = new TextEncoder(), decoder = new TextDecoder();
+  // The granted interval stays between a floor that bounds frame and timer
+  // churn and a ceiling below common intermediary idle timeouts.
+  const heartbeatMs = Math.min(Math.max(params.heartbeatMs ?? 30000, 1000), 55000);
+  let cursor = '', buffer = '', ended = false, active = false, terminated = false;
+  let lastFrame = Date.now();
+  let pending: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
+  let controller: ReadableStreamDefaultController<Uint8Array>;
+  const cleanup = () => { if (ended) return; ended = true; signal.removeEventListener('abort', abort); void reader.cancel().catch(() => {}); };
+  const abort = () => { cleanup(); try { controller.error(new Error('Request aborted')); } catch {} };
+  const send = (value: unknown) => { controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`)); lastFrame = Date.now(); };
+  const notify = (method: string, data: object) => send({jsonrpc:'2.0',method:`notifications/events/${method}`,params:{...data,_meta:{'io.modelcontextprotocol/subscriptionId':id}}});
+  const body = new ReadableStream<Uint8Array>({
+    start(c) { controller = c; signal.addEventListener('abort',abort,{once:true}); if (signal.aborted) abort(); },
+    async pull(c) {
+      try {
+        while (!ended) {
+          const end = buffer.indexOf('\n');
+          if (end >= 0) {
+            const record = JSON.parse(buffer.slice(0,end)); buffer = buffer.slice(end+1);
+            const notice = readerNotification(record, params.arguments.node, 'standard');
+            if (notice) {
+              if (notice.cursor !== undefined) cursor = notice.cursor;
+              if (notice.method === 'active') active = true;
+              if (notice.method === 'terminated') terminated = true;
+              notify(notice.method, notice.method === 'active' ? {...notice.data,heartbeatMs} : notice.data);
+              return;
+            }
+            continue;
+          }
+          pending ??= reader.read();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = active && !terminated ? new Promise<'heartbeat'>(resolve => { timer = setTimeout(() => resolve('heartbeat'), Math.max(0,heartbeatMs - (Date.now()-lastFrame))); }) : undefined;
+          const chunk = timeout ? await Promise.race([pending,timeout]) : await pending;
+          if (timer) clearTimeout(timer);
+          if (ended) return;
+          if (chunk === 'heartbeat') { notify('heartbeat',{cursor}); return; }
+          pending = undefined;
+          if (chunk.done) { send({jsonrpc:'2.0',id,result:{resultType:'complete'}}); cleanup(); c.close(); return; }
+          buffer += decoder.decode(chunk.value,{stream:true});
+        }
+      } catch (error) { cleanup(); c.error(error); }
+    },
+    cancel() { cleanup(); }
+  }, {highWaterMark:0});
+  return new Response(body,{headers:{'content-type':'text/event-stream','cache-control':'no-cache'}});
 }
