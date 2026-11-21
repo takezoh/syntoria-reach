@@ -329,6 +329,25 @@ type AgentStatus struct {
 	ReplyTruncated bool
 }
 
+// Turn identifies a Reach-delivered prompt independently of its payload.
+type Turn struct {
+	ClientID, OperationID, SessionID string
+}
+
+// TurnUnknown is the stop state of a Reach-prompted turn whose outcome no
+// daemon observed: a previous daemon ended between delivering the prompt and
+// recording that it watches the turn. The other stop states are the agent
+// states idle, waiting_on_human and exited.
+const TurnUnknown = "unknown"
+
+// TurnStop is an immutable observation awaiting relay.
+type TurnStop struct {
+	EventID    string    `json:"eventId"`
+	SessionID  string    `json:"session_id"`
+	State      string    `json:"state"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
 // How Reach talks to an agent it runs as a process in a local workspace.
 const (
 	ProtocolClaude = "claude" // Claude Code stream-json

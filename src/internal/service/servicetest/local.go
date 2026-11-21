@@ -113,6 +113,7 @@ type fakeAgent struct {
 	state  string
 	reply  string
 	prompt int
+	done   chan struct{}
 }
 
 func (a *Agents) Start(_ context.Context, id, dir string, ag core.Agent) error {
@@ -136,7 +137,7 @@ func (a *Agents) Status(id string) (*core.AgentStatus, error) {
 	if !ok {
 		return nil, core.ErrNotFound
 	}
-	st := &core.AgentStatus{AgentSession: core.AgentSession{ID: id, State: s.state}}
+	st :=&core.AgentStatus{AgentSession: core.AgentSession{ID: id, State: s.state}}
 	if s.state == core.AgentIdle {
 		st.Reply = s.reply
 	}
@@ -158,12 +159,48 @@ func (a *Agents) Prompt(id, text string) error {
 	return nil
 }
 
-func (a *Agents) Stop(id string) error {
+func (a *Agents) PromptObserved(id, text string, stopped func(func() string) error) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, ok := a.sessions[id]; !ok {
+	s, ok := a.sessions[id]
+	if !ok {
+		a.mu.Unlock()
 		return core.ErrNotFound
 	}
+	if s.state != core.AgentIdle {
+		a.mu.Unlock()
+		return core.Errorf(core.CodeInvalidState, "agent is not idle")
+	}
+	s.prompt++
+	s.reply = "echo: " + text
+	s.state = core.AgentWorking
+	s.done = make(chan struct{})
+	done := s.done
+	a.mu.Unlock()
+	go func() {
+		// Like the runtime, a failed record only leaves the turn armed.
+		_ = stopped(func() string { return core.AgentIdle })
+		a.mu.Lock()
+		s.state = core.AgentIdle
+		close(done)
+		a.mu.Unlock()
+	}()
+	return nil
+}
+
+func (a *Agents) Stop(id string) error {
+	a.mu.Lock()
+	s, ok := a.sessions[id]
+	if !ok {
+		a.mu.Unlock()
+		return core.ErrNotFound
+	}
+	done := s.done
+	a.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	delete(a.sessions, id)
 	return nil
 }

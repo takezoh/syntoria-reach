@@ -25,6 +25,16 @@ type Store interface {
 	Finish(clientID, operationID, state string, result any, errCode, errMessage string) (*core.Operation, error)
 	GetOperation(clientID, operationID string) (*core.Operation, error)
 	Audit(core.AuditRecord) error
+	BeginTurn(core.Turn) error
+	ArmTurn(core.Turn) error
+	ArmedTurns() ([]core.Turn, error)
+	PendingTurns() ([]core.Turn, error)
+	ClosePendingTurn(core.Turn, core.TurnStop) error
+	ArmPendingTurn(core.Turn, core.TurnStop) error
+	CloseTurn(core.Turn, core.TurnStop) error
+	DisarmTurn(core.Turn) error
+	PendingTurnStops() ([]core.TurnStop, error)
+	DeleteTurnStop(string) error
 
 	// WorkspaceBusy reports whether a workspace has running jobs.
 	// Workspaces and agent sessions are the workspace backend's.
@@ -119,10 +129,12 @@ type NewID func(prefix string) string
 
 // Deps are the adapters the service uses.
 type Deps struct {
-	Store      Store
-	OpenFiles  OpenFiles
-	RunCommand RunCommand
-	Jobs       Jobs
-	Workspaces Workspaces
-	NewID      NewID
+	Store        Store
+	OpenFiles    OpenFiles
+	RunCommand   RunCommand
+	Jobs         Jobs
+	Workspaces   Workspaces
+	NewID        NewID
+	Now          func() time.Time
+	ObserveTurns bool
 }

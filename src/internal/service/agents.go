@@ -81,6 +81,13 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 	}
 	ctx = context.WithoutCancel(ctx)
 	return s.operation(c, "send_agent_prompt", req.OperationID, req, rec, func() (any, error) {
+		s.turnMu.Lock()
+		defer s.turnMu.Unlock()
+		if s.observeTurns {
+			if err := s.observeSessionTurns(ctx, req.SessionID); err != nil {
+				return nil, err
+			}
+		}
 		st, err := s.session(ctx, req.SessionID)
 		if err != nil {
 			return nil, err
@@ -103,9 +110,31 @@ func (s *Service) SendAgentPrompt(ctx context.Context, c *Client, req SendAgentP
 		case core.AgentWorking:
 			return nil, core.Errorf(core.CodeInvalidState, "the agent is not waiting for a prompt: read_agent_output until state is idle")
 		}
-		stages, err := s.workspaces.Prompt(ctx, req.SessionID, req.Text)
-		if err != nil {
+		turn := core.Turn{ClientID: c.ID, OperationID: req.OperationID, SessionID: req.SessionID}
+		if err := s.store.BeginTurn(turn); err != nil {
 			return nil, err
+		}
+		var stages []string
+		if local, ok := s.workspaces.(interface {
+			PromptObserved(context.Context, string, string, func(func() string) error) ([]string, error)
+		}); ok {
+			stages, err = local.PromptObserved(ctx, req.SessionID, req.Text, func(state func() string) error {
+				s.turnMu.Lock()
+				defer s.turnMu.Unlock()
+				return s.closeTurn(turn, state())
+			})
+		} else {
+			stages, err = s.workspaces.Prompt(ctx, req.SessionID, req.Text)
+		}
+		if err != nil {
+			// The failed operation removes its pending intent when it is finished.
+			return nil, err
+		}
+		if err := s.store.ArmTurn(turn); err != nil {
+			return nil, &turnPersistenceError{err}
+		}
+		if s.observeTurns {
+			_ = s.observeTurn(ctx, turn)
 		}
 		return PromptResult{SessionID: req.SessionID, Stages: stages}, nil
 	})
@@ -216,4 +245,24 @@ func (s *Service) session(ctx context.Context, id string) (*core.AgentStatus, er
 
 func sessionNotFound(id string) error {
 	return core.Errorf(core.CodeNotFound, "agent session %q not found", id)
+}
+
+// AuthorizeEvents uses the same permission and session reachability as reading output.
+// The backend reply stays inside the node and is never returned or logged here.
+func (s *Service) AuthorizeEvents(ctx context.Context, c *Client, id string) string {
+	if !slices.Contains(c.perms, core.PermAgentRun) {
+		return "denied"
+	}
+	_, err := s.workspaces.Session(ctx, id)
+	if errors.Is(err, core.ErrNotFound) {
+		return "denied"
+	}
+	if err != nil {
+		var e *core.Error
+		if errors.As(err, &e) && e.Code == core.CodeNotFound {
+			return "denied"
+		}
+		return "unavailable"
+	}
+	return "allowed"
 }

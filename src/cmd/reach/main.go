@@ -61,6 +61,9 @@ func run() error {
 	d, agents := deps(cfg, st)
 	svc := service.New(cfg, d)
 	defer svc.Close()
+	if err := svc.ReconcilePendingTurns(context.Background()); err != nil {
+		return err
+	}
 	controllerSpecs := make([]remote.ControllerSpec, 0, len(cfg.Controllers))
 	clientTokens := make(map[string]string, len(cfg.Clients))
 	for _, cl := range cfg.Clients {
@@ -101,6 +104,7 @@ func run() error {
 	controllers.StartControllers(ctx, cfg.Socket, clientTokens)
 
 	go cleanup(ctx, svc)
+	go watchTurns(ctx, svc)
 
 	connector := make(chan struct{})
 	if r := cfg.Remote; r != nil {
@@ -108,7 +112,7 @@ func run() error {
 		if !ok {
 			return errors.New("remote: unknown client " + r.Client) // config.Validate rules this out
 		}
-		c := &remote.Connector{URL: r.URL, Token: r.Token, Handler: func(ctx context.Context, method string, params []byte) (any, error) {
+		c := &remote.Connector{URL: r.URL, Token: r.Token, PendingTurnStops: svc.PendingTurnStops, AckTurnStop: svc.AckTurnStop, TurnStopChanges: svc.TurnStopChanges(), AuthorizeEvents: func(ctx context.Context, id string) string { return svc.AuthorizeEvents(ctx, client, id) }, Handler: func(ctx context.Context, method string, params []byte) (any, error) {
 			if method == "list_controllers" || method == "list_controller_tools" || method == "call_controller_tool" {
 				return controllers.Handle(ctx, method, params)
 			}
@@ -131,6 +135,14 @@ func run() error {
 		return err
 	}
 	return nil
+}
+
+// watchTurns resumes durable observations on startup and checks again at a
+// bounded interval. The prompt path also observes immediately after arming.
+func watchTurns(ctx context.Context, svc *service.Service) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	svc.WatchTurns(ctx, t.C)
 }
 
 // cleanupInterval is how often workspaces are checked for removal.
@@ -179,10 +191,12 @@ func deps(cfg *config.Config, st *store.Store) (service.Deps, *agent.Runtime) {
 			}
 			return f, nil
 		},
-		RunCommand: command.Run,
-		Jobs:       job.NewRunner(filepath.Join(stateDir, "jobs")),
-		Workspaces: workspaces,
-		NewID:      ids.New,
+		RunCommand:   command.Run,
+		Jobs:         job.NewRunner(filepath.Join(stateDir, "jobs")),
+		Workspaces:   workspaces,
+		NewID:        ids.New,
+		Now:          time.Now,
+		ObserveTurns: cfg.Orca != nil,
 	}, agents
 }
 

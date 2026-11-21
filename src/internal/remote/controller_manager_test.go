@@ -111,7 +111,17 @@ func TestControllerCallPreservesControllerIdentityAndReconcilesLostReply(t *test
 	effects := map[string]int{}
 	calls := map[string]int{}
 	lost := false
+	// The fixture's handler runs on server goroutines; the test reads the
+	// same maps, so both sides take mu.
+	var mu sync.Mutex
+	count := func(m map[string]int, k string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return m[k]
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		var req struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
@@ -197,12 +207,12 @@ func TestControllerCallPreservesControllerIdentityAndReconcilesLostReply(t *test
 		t.Fatalf("first operation call: %v", err)
 	}
 	_, conflictErr := call("run", map[string]string{"operation_id": "op-1", "payload": "changed"})
-	if conflictErr == nil || !strings.Contains(conflictErr.Error(), core.CodeControllerError) || !strings.Contains(conflictErr.Error(), "operation_conflict") || strings.Contains(conflictErr.Error(), "token-sentinel") || effects["op-1"] != 1 {
-		t.Fatalf("changed payload did not preserve the Controller conflict: err=%v effects=%d", conflictErr, effects["op-1"])
+	if conflictErr == nil || !strings.Contains(conflictErr.Error(), core.CodeControllerError) || !strings.Contains(conflictErr.Error(), "operation_conflict") || strings.Contains(conflictErr.Error(), "token-sentinel") || count(effects, "op-1") != 1 {
+		t.Fatalf("changed payload did not preserve the Controller conflict: err=%v effects=%d", conflictErr, count(effects, "op-1"))
 	}
 	_, lostErr := call("run", map[string]string{"operation_id": "lost-op-1", "payload": "effect"})
-	if lostErr == nil || !strings.Contains(lostErr.Error(), core.CodeResultUnknown) || calls["lost-op-1"] != 1 {
-		t.Fatalf("lost reply did not remain unknown without a retry: err=%v calls=%d", lostErr, calls["lost-op-1"])
+	if lostErr == nil || !strings.Contains(lostErr.Error(), core.CodeResultUnknown) || count(calls, "lost-op-1") != 1 {
+		t.Fatalf("lost reply did not remain unknown without a retry: err=%v calls=%d", lostErr, count(calls, "lost-op-1"))
 	}
 	status, statusErr := call("get_status", map[string]string{"operation_id": "lost-op-1"})
 	if statusErr != nil {
@@ -218,7 +228,7 @@ func TestControllerCallPreservesControllerIdentityAndReconcilesLostReply(t *test
 	if err := json.Unmarshal(status.(json.RawMessage), &observed); err != nil {
 		t.Fatal(err)
 	}
-	if observed.StructuredContent.OperationID != "lost-op-1" || observed.StructuredContent.State != "succeeded" || observed.StructuredContent.EffectCount != 1 || calls["lost-op-1"] != 1 {
-		t.Fatalf("Controller reconciliation did not show the single effect: status=%+v calls=%d", observed.StructuredContent, calls["lost-op-1"])
+	if observed.StructuredContent.OperationID != "lost-op-1" || observed.StructuredContent.State != "succeeded" || observed.StructuredContent.EffectCount != 1 || count(calls, "lost-op-1") != 1 {
+		t.Fatalf("Controller reconciliation did not show the single effect: status=%+v calls=%d", observed.StructuredContent, count(calls, "lost-op-1"))
 	}
 }

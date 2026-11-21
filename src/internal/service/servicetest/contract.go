@@ -13,6 +13,134 @@ import (
 // relies on. It runs against the SQLite store and against the fake, each
 // case with a store returned by open.
 func StoreContract(t *testing.T, open func(t *testing.T) service.Store) {
+	t.Run("turns", func(t *testing.T) {
+		s := open(t)
+		turn := core.Turn{ClientID: "c", OperationID: "p", SessionID: "s"}
+		stop := core.TurnStop{EventID: "e", SessionID: "s", State: core.AgentIdle, ObservedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+		if err := s.BeginTurn(turn); err != nil {
+			t.Fatal(err)
+		}
+		if ts, err := s.ArmedTurns(); err != nil || len(ts) != 0 {
+			t.Fatalf("pending is not armed: %v %v", ts, err)
+		}
+		if err := s.CloseTurn(turn, stop); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ArmTurn(turn); err != nil {
+			t.Fatal(err)
+		}
+		if ts, err := s.ArmedTurns(); err != nil || len(ts) != 1 || ts[0] != turn {
+			t.Fatalf("armed: %v %v", ts, err)
+		}
+		if err := s.CloseTurn(turn, stop); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CloseTurn(turn, core.TurnStop{EventID: "duplicate"}); err != nil {
+			t.Fatal(err)
+		}
+		if ts, _ := s.ArmedTurns(); len(ts) != 0 {
+			t.Fatalf("still armed: %v", ts)
+		}
+		if stops, err := s.PendingTurnStops(); err != nil || len(stops) != 1 || stops[0] != stop {
+			t.Fatalf("stops: %v %v", stops, err)
+		}
+		other := core.Turn{ClientID: "other", OperationID: "p", SessionID: "other-session"}
+		if err := s.BeginTurn(other); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ArmTurn(other); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CloseTurn(other, stop); err == nil {
+			t.Fatal("duplicate event ID accepted")
+		}
+		if ts, err := s.ArmedTurns(); err != nil || len(ts) != 1 || ts[0] != other {
+			t.Fatalf("failed close lost armed turn: %v %v", ts, err)
+		}
+		stop.EventID = "e2"
+		stop.SessionID = other.SessionID
+		if err := s.CloseTurn(other, stop); err != nil {
+			t.Fatal(err)
+		}
+		lost := core.Turn{ClientID: "c", OperationID: "lost", SessionID: "lost"}
+		if err := s.BeginTurn(lost); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DisarmTurn(lost); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ArmTurn(lost); err != nil {
+			t.Fatalf("pending turn removed: %v", err)
+		}
+		if err := s.DisarmTurn(lost); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DisarmTurn(lost); err != nil {
+			t.Fatal(err)
+		}
+		if ts, err := s.ArmedTurns(); err != nil || len(ts) != 0 {
+			t.Fatalf("lost turn: %v %v", ts, err)
+		}
+		if stops, err := s.PendingTurnStops(); err != nil || len(stops) != 2 {
+			t.Fatalf("loss forged a stop: %v %v", stops, err)
+		}
+		if err := s.DeleteTurnStop("e"); err != nil {
+			t.Fatal(err)
+		}
+		if stops, _ := s.PendingTurnStops(); len(stops) != 1 || stops[0].EventID != "e2" {
+			t.Fatalf("not deleted: %v", stops)
+		}
+	})
+	t.Run("pending reconciliation", func(t *testing.T) {
+		s := open(t)
+		a := core.Turn{ClientID: "c", OperationID: "a", SessionID: "a"}
+		b := core.Turn{ClientID: "c", OperationID: "b", SessionID: "b"}
+		for _, tr := range []core.Turn{a, b} {
+			if err := s.BeginTurn(tr); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stop := core.TurnStop{EventID: "e", SessionID: "a", State: core.TurnUnknown, ObservedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+		if err := s.ClosePendingTurn(a, stop); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ClosePendingTurn(b, stop); err == nil {
+			t.Fatal("duplicate event accepted")
+		}
+		pending, err := s.PendingTurns()
+		if err != nil || len(pending) != 1 || pending[0] != b {
+			t.Fatalf("rollback: %v %v", pending, err)
+		}
+		if err := s.ClosePendingTurn(a, stop); err != nil {
+			t.Fatal(err)
+		}
+		stops, err := s.PendingTurnStops()
+		if err != nil || len(stops) != 1 || stops[0] != stop {
+			t.Fatalf("stops: %v %v", stops, err)
+		}
+		if err := s.ArmPendingTurn(b, stop); err == nil {
+			t.Fatal("duplicate event accepted")
+		}
+		if armed, err := s.ArmedTurns(); err != nil || len(armed) != 0 {
+			t.Fatalf("armed after rollback: %v %v", armed, err)
+		}
+		working := core.TurnStop{EventID: "e2", SessionID: "b", State: core.TurnUnknown, ObservedAt: stop.ObservedAt}
+		if err := s.ArmPendingTurn(b, working); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ArmPendingTurn(b, core.TurnStop{EventID: "e3"}); err != nil {
+			t.Fatal(err)
+		}
+		if pending, err := s.PendingTurns(); err != nil || len(pending) != 0 {
+			t.Fatalf("pending after arm: %v %v", pending, err)
+		}
+		if armed, err := s.ArmedTurns(); err != nil || len(armed) != 1 || armed[0] != b {
+			t.Fatalf("armed: %v %v", armed, err)
+		}
+		if stops, err := s.PendingTurnStops(); err != nil || len(stops) != 2 || stops[1] != working {
+			t.Fatalf("stops after arm: %v %v", stops, err)
+		}
+	})
 	t.Run("operations", func(t *testing.T) {
 		s := open(t)
 		op, created, err := s.Admit("c", "op", "run_command", "h1")

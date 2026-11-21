@@ -52,12 +52,16 @@ type ws struct {
 
 // Service is the Reach application service.
 type Service struct {
-	store      Store
-	openFiles  OpenFiles
-	runCommand RunCommand
-	jobs       Jobs
-	workspaces Workspaces
-	newID      NewID
+	store        Store
+	openFiles    OpenFiles
+	runCommand   RunCommand
+	jobs         Jobs
+	workspaces   Workspaces
+	newID        NewID
+	now          func() time.Time
+	observeTurns bool
+	turnMu       sync.Mutex
+	turnStops    chan struct{}
 
 	commands []string     // executables run_command and start_job may run
 	agents   []core.Agent // agents start_agent_session may start, as configured
@@ -80,17 +84,20 @@ type openRoot struct {
 // New returns the service for cfg using the adapters in d.
 func New(cfg *config.Config, d Deps) *Service {
 	s := &Service{
-		store:      d.Store,
-		openFiles:  d.OpenFiles,
-		runCommand: d.RunCommand,
-		jobs:       d.Jobs,
-		workspaces: d.Workspaces,
-		newID:      d.NewID,
-		commands:   cfg.Commands,
-		agents:     cfg.Agents,
-		files:      map[string]openRoot{},
-		users:      map[string]int{},
-		removing:   map[string]bool{},
+		store:        d.Store,
+		openFiles:    d.OpenFiles,
+		runCommand:   d.RunCommand,
+		jobs:         d.Jobs,
+		workspaces:   d.Workspaces,
+		newID:        d.NewID,
+		now:          d.Now,
+		observeTurns: d.ObserveTurns,
+		turnStops:    make(chan struct{}, 1),
+		commands:     cfg.Commands,
+		agents:       cfg.Agents,
+		files:        map[string]openRoot{},
+		users:        map[string]int{},
+		removing:     map[string]bool{},
 	}
 	for _, c := range cfg.Clients {
 		s.clients = append(s.clients, &Client{ID: c.ID, token: c.Token, perms: c.Allow})
@@ -385,6 +392,14 @@ func (s *Service) operation(c *Client, kind, opID string, req any, rec core.Audi
 	}
 
 	result, doErr := do()
+	var uncertain *turnPersistenceError
+	if errors.As(doErr, &uncertain) {
+		msg := "prompt delivered but turn tracking could not be recorded"
+		if _, err := s.store.Finish(c.ID, opID, core.StateUnknown, nil, core.CodeResultUnknown, msg); err != nil {
+			return nil, core.Errorf(core.CodeResultUnknown, "prompt delivered but operation outcome could not be recorded")
+		}
+		return nil, core.Errorf(core.CodeResultUnknown, "%s", msg)
+	}
 	state, code, msg := core.StateSucceeded, "", ""
 	if doErr != nil {
 		e := classify(doErr)

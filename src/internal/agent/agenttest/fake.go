@@ -101,6 +101,12 @@ func fakeCodex() {
 			switch text {
 			case "crash":
 				os.Exit(3)
+			case "invalid-json":
+				fmt.Fprintln(os.Stdout, "{invalid")
+				continue
+			case "close-stdout":
+				os.Stdout.Close()
+				continue
 			case "hang":
 				hanging = turn
 				continue

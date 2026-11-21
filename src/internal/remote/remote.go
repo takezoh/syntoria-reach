@@ -12,6 +12,11 @@
 // {"id", "error": {"code", "message"}}. The ID correlates the two on one
 // connection and is unrelated to operation IDs. The daemon also sends
 // "ping", which the gateway answers with "pong".
+// events.authorize is an ordinary request with session_id, subscription_key,
+// expires_at; its result is {"decision":"allowed|denied|unavailable"}.
+// Unsolicited {"type":"turn_stop", "eventId", "session_id", "state",
+// "observed_at"} is acknowledged by {"type":"turn_stop_ack", "eventId"}.
+// These unsolicited frames have no id; node identity is the connection.
 package remote
 
 import (
@@ -38,9 +43,13 @@ type Handler func(ctx context.Context, method string, params []byte) (any, error
 
 // Connector keeps one connection to the gateway open while Run runs.
 type Connector struct {
-	URL     string // ws:// or wss:// connect endpoint of the gateway
-	Token   string // node token, sent as a bearer token
-	Handler Handler
+	URL              string // ws:// or wss:// connect endpoint of the gateway
+	Token            string // node token, sent as a bearer token
+	Handler          Handler
+	AuthorizeEvents  func(context.Context, string) string
+	PendingTurnStops func() ([]core.TurnStop, error)
+	AckTurnStop      func(string) error
+	TurnStopChanges  <-chan struct{}
 
 	// The connector pings every PingInterval and treats the connection as
 	// dead when nothing arrives for three intervals. Reconnection waits
@@ -107,6 +116,10 @@ func (c *Connector) session(ctx context.Context) (connected bool, err error) {
 	connCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	go keepalive(connCtx, conn, interval)
+	if c.PendingTurnStops != nil {
+		go c.relay(connCtx, conn)
+	}
+	unknownTypes := map[string]bool{}
 	for {
 		readCtx, cancelRead := context.WithTimeout(connCtx, 3*interval)
 		typ, data, err := conn.Read(readCtx)
@@ -120,8 +133,23 @@ func (c *Connector) session(ctx context.Context) (connected bool, err error) {
 		if typ != websocket.MessageText || string(data) == "pong" {
 			continue
 		}
+		var frame struct {
+			Type    string `json:"type"`
+			EventID string `json:"eventId"`
+		}
+		if json.Unmarshal(data, &frame) == nil && frame.Type != "" {
+			if frame.Type == "turn_stop_ack" && frame.EventID != "" && c.AckTurnStop != nil {
+				if err := c.AckTurnStop(frame.EventID); err != nil {
+					return true, err
+				}
+			} else if frame.Type != "turn_stop_ack" && !unknownTypes[frame.Type] {
+				unknownTypes[frame.Type] = true
+				slog.Warn("ignoring unknown gateway frame type", "type", frame.Type)
+			}
+			continue
+		}
 		var req request
-		if err := json.Unmarshal(data, &req); err != nil || req.ID == "" {
+		if err := json.Unmarshal(data, &req); err != nil || req.ID == "" || req.Method == "" {
 			slog.Warn("ignoring a malformed message from the gateway")
 			continue
 		}
@@ -133,7 +161,24 @@ func (c *Connector) session(ctx context.Context) (connected bool, err error) {
 
 func (c *Connector) serve(ctx context.Context, conn *websocket.Conn, req request) {
 	out := response{ID: req.ID}
-	result, err := c.Handler(ctx, req.Method, req.Params)
+	var result any
+	var err error
+	if req.Method == "events.authorize" && c.AuthorizeEvents != nil {
+		var p struct {
+			SessionID       string `json:"session_id"`
+			SubscriptionKey string `json:"subscription_key"`
+			ExpiresAt       string `json:"expires_at"`
+		}
+		if json.Unmarshal(req.Params, &p) != nil || p.SessionID == "" || p.SubscriptionKey == "" || p.ExpiresAt == "" {
+			err = core.Errorf(core.CodeInvalidRequest, "invalid events.authorize params")
+		} else {
+			result = struct {
+				Decision string `json:"decision"`
+			}{c.AuthorizeEvents(ctx, p.SessionID)}
+		}
+	} else {
+		result, err = c.Handler(ctx, req.Method, req.Params)
+	}
 	if err == nil {
 		out.Result, err = json.Marshal(result)
 	}
@@ -175,4 +220,54 @@ func or(d, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+// relay scans on connection and after committed changes. A failed scan or send
+// ends the connection so the next connection retries the durable outbox.
+func (c *Connector) relay(ctx context.Context, conn *websocket.Conn) {
+	sent := map[string]bool{}
+	for {
+		stops, err := c.PendingTurnStops()
+		if err != nil {
+			conn.CloseNow()
+			return
+		}
+		pending := make(map[string]bool, len(stops))
+		for _, stop := range stops {
+			pending[stop.EventID] = true
+		}
+		for id := range sent {
+			if !pending[id] {
+				delete(sent, id)
+			}
+		}
+		for _, stop := range stops {
+			if sent[stop.EventID] {
+				continue
+			}
+			frame := struct {
+				Type string `json:"type"`
+				core.TurnStop
+			}{"turn_stop", stop}
+			frame.ObservedAt = frame.ObservedAt.UTC()
+			b, err := json.Marshal(frame)
+			if err != nil {
+				conn.CloseNow()
+				return
+			}
+			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+			err = conn.Write(wctx, websocket.MessageText, b)
+			cancel()
+			if err != nil {
+				conn.CloseNow()
+				return
+			}
+			sent[stop.EventID] = true
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.TurnStopChanges:
+		}
+	}
 }

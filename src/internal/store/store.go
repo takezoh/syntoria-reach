@@ -110,6 +110,13 @@ var migrations = []string{
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL
 	);`,
+	`CREATE TABLE reach_turns (
+		client_id TEXT NOT NULL, operation_id TEXT NOT NULL, session_id TEXT NOT NULL,
+		armed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(client_id, operation_id)
+	);
+	CREATE TABLE turn_stops (
+		event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, state TEXT NOT NULL, observed_at TEXT NOT NULL
+	);`,
 }
 
 // Open opens (creating if needed) the database at path and applies migrations.
@@ -193,11 +200,26 @@ func (s *Store) Finish(clientID, operationID, state string, result any, errCode,
 			return nil, err
 		}
 	}
-	_, err := s.db.Exec(`UPDATE operations
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE operations
 		SET state = ?, result = ?, error_code = ?, error_message = ?, updated_at = ?
 		WHERE client_id = ? AND operation_id = ? AND state = ?`,
 		state, raw, errCode, errMessage, s.now().UnixMilli(), clientID, operationID, core.StateRunning)
 	if err != nil {
+		return nil, err
+	}
+	if n, e := res.RowsAffected(); e != nil {
+		return nil, e
+	} else if n == 1 && state == core.StateFailed {
+		if _, err = tx.Exec(`DELETE FROM reach_turns WHERE client_id=? AND operation_id=? AND armed=0`, clientID, operationID); err != nil {
+			return nil, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetOperation(clientID, operationID)

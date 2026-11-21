@@ -197,3 +197,59 @@ func TestCut(t *testing.T) {
 		}
 	}
 }
+
+type controlledTurnHarness struct{ returned chan struct{} }
+
+func (h *controlledTurnHarness) open(context.Context, string) error { return nil }
+func (h *controlledTurnHarness) prompt(context.Context, string, func(string, string)) (string, error) {
+	<-h.returned
+	return "", errors.New("protocol failed")
+}
+func (h *controlledTurnHarness) close(context.Context) error { return nil }
+func (h *controlledTurnHarness) done() <-chan struct{}       { return h.returned }
+
+func TestTurnStopUsesExitObservedBeforeCommit(t *testing.T) {
+	for _, exited := range []bool{false, true} {
+		t.Run(map[bool]string{false: "error first", true: "exit before commit"}[exited], func(t *testing.T) {
+			h := &controlledTurnHarness{returned: make(chan struct{})}
+			sess := &session{id: "s", h: h, exited: make(chan struct{})}
+			m := &Runtime{sessions: map[string]*session{"s": sess}}
+			callback := make(chan struct{})
+			commit := make(chan struct{})
+			got := make(chan string, 1)
+			if err := m.PromptObserved("s", "text", func(state func() string) error { close(callback); <-commit; got <- state(); return nil }); err != nil {
+				t.Fatal(err)
+			}
+			close(h.returned)
+			select {
+			case <-callback:
+			case <-time.After(time.Second):
+				t.Fatal("callback blocked on process exit")
+			}
+			if exited {
+				close(sess.exited)
+			}
+			close(commit)
+			select {
+			case state := <-got:
+				want := core.AgentIdle
+				if exited {
+					want = core.AgentExited
+				}
+				if state != want {
+					t.Fatalf("got %s want %s", state, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("no stop")
+			}
+			if !exited {
+				close(sess.exited)
+			}
+			select {
+			case state := <-got:
+				t.Fatalf("second stop: %s", state)
+			default:
+			}
+		})
+	}
+}

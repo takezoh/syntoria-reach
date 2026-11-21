@@ -78,7 +78,11 @@ func (c *rpc) read() {
 			ch <- m
 		}
 	}
-	c.fail(errors.Join(errClosed, sc.Err()))
+	if err := sc.Err(); err != nil {
+		c.fail(fmt.Errorf("read harness: %w", err))
+		return
+	}
+	c.fail(errClosed)
 }
 
 func (c *rpc) fail(err error) {

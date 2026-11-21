@@ -69,6 +69,7 @@ type session struct {
 	ongoing   chan struct{} // closed when the turn in progress ended; nil if none
 	reply     string
 	truncated bool
+	stopping  bool // Stop is ending the session; the turn's stop is its exit
 }
 
 // New returns a runtime that keeps each session's agent stderr in a file
@@ -153,17 +154,17 @@ func (m *Runtime) Status(id string) (*core.AgentStatus, error) {
 		return nil, err
 	}
 	st := &core.AgentStatus{AgentSession: core.AgentSession{ID: id}}
-	select {
-	case <-sess.exited:
-		st.State = core.AgentExited
-		return st, nil
-	default:
-	}
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	if sess.opening || sess.ongoing != nil {
 		st.State = core.AgentWorking
 		return st, nil
+	}
+	select {
+	case <-sess.exited:
+		st.State = core.AgentExited
+		return st, nil
+	default:
 	}
 	st.State, st.Reply, st.ReplyTruncated = core.AgentIdle, sess.reply, sess.truncated
 	return st, nil
@@ -174,6 +175,11 @@ func (m *Runtime) Status(id string) (*core.AgentStatus, error) {
 // Once the turn ends, the session keeps the agent's last message of it, or
 // the failure that ended it.
 func (m *Runtime) Prompt(id, text string) error {
+	return m.PromptObserved(id, text, nil)
+}
+
+// PromptObserved reports the first turn stop before clearing ongoing state.
+func (m *Runtime) PromptObserved(id, text string, stopped func(func() string) error) error {
 	sess, err := m.get(id)
 	if err != nil {
 		return err
@@ -217,6 +223,27 @@ func (m *Runtime) Prompt(id, text string) error {
 		mu.Unlock()
 		reply, truncated := cut(reply, MaxReply)
 		sess.mu.Lock()
+		stopping := sess.stopping
+		sess.mu.Unlock()
+		if stopping {
+			<-sess.exited
+		}
+		state := func() string {
+			select {
+			case <-sess.exited:
+				return core.AgentExited
+			default:
+				return core.AgentIdle
+			}
+		}
+		// A failed record leaves the turn armed; the service's watcher records
+		// it from the session state later, so the session stays usable.
+		if stopped != nil {
+			if err := stopped(state); err != nil {
+				slog.Error("record agent turn stop", "session", id, "err", err)
+			}
+		}
+		sess.mu.Lock()
 		sess.reply, sess.truncated, sess.ongoing = reply, truncated, nil
 		sess.mu.Unlock()
 		close(ongoing)
@@ -229,11 +256,13 @@ func (m *Runtime) Prompt(id, text string) error {
 func (m *Runtime) Stop(id string) error {
 	m.mu.Lock()
 	sess, ok := m.sessions[id]
-	delete(m.sessions, id)
 	m.mu.Unlock()
 	if !ok {
 		return core.ErrNotFound
 	}
+	sess.mu.Lock()
+	sess.stopping = true
+	sess.mu.Unlock()
 	m.closeSession(sess)
 	sess.mu.Lock()
 	ongoing := sess.ongoing
@@ -241,6 +270,9 @@ func (m *Runtime) Stop(id string) error {
 	if ongoing != nil {
 		<-ongoing
 	}
+	m.mu.Lock()
+	delete(m.sessions, id)
+	m.mu.Unlock()
 	if err := os.Remove(sess.log); err != nil && !os.IsNotExist(err) {
 		slog.Warn("cannot remove an agent log", "path", sess.log, "err", err)
 	}

@@ -1,0 +1,443 @@
+{
+  "goal": "Revise the contract-level architecture for MCP Events notifying Reach-prompted turn stops (idle, waiting_on_human, exited) and unknown observation after a lost arm; preserve unchanged decisions and plan only remaining implementation. Goal node mcp-events-design; goal digest d517df1e9bd29eb5d64eaf6b4e08dfe70159d89473419af0a316851638b02f0e. This plan is not evidence of deployed Events support.",
+  "scope": {
+    "in": [
+      "Accepted outcome: one stop occurrence per known Reach prompt turn; node detection on Orca by current-state reads after delivered/turn_started, and on local agents by their protocol. Daemon, existing per-node Durable Object, gateway Worker and authenticated MCP wire are included. A leftover unarmed pending turn produces one unknown occurrence on daemon startup on either backend; this is an observation gap, not a witnessed stop. Where turns are observed by current-state reads (Orca), a pending turn whose session reads working at that startup stays observed, so its later stop is notified as usual.",
+      "Accepted wire: SEP-3415 poll, push and webhook plus the ChatGPT webhook-only profile, retaining every existing tool name, argument and read path. The supported standard revision is 2026-07-28; later revision support requires demonstrated protocol capability rather than an arbitrary version allowlist.",
+      "Inline authority provenance (request-supplied, not independently observed): user-request-20261119 asks for MCP Events; user-answer-delivery-20261119 says webhook and all of poll/push/webhook; user-answer-clients-20261119 says ChatGPT webhook and the standard. user-answer-scope-20261120 and the current Request accept known-start/current-state detection and exclude intermediate progress, terminal-started turns and human waits resolved before the next read.",
+      "Inline retained user decisions, prior-plan-20261120: subscriber authorization equals read_agent_output; cloud holds notification info only; events/* takes no operation_id; subscription TTL maximum five minutes with Access reauthorization on refresh, offline refresh of an unexpired key, node reauthorization on reconnect, and hours-long turns while refreshed. Retained architecture choices: SQLite outbox until broker acknowledgement, existing node DO for durable subscriptions/replay/delivery, Worker wire adapter, no additional DO/KV/Queue; /mcp?events=chatgpt registration; thin 2026-07-28 adapter around the SDK 1.32.2 tool surface; at most ten webhook attempts per eventId; the former IP-pinning G-Egress is superseded by the explicitly accepted nonconformance and owner allowlist; G-Profile is partially observed, with unsubscribe still unverified.",
+      "Inline authoritative answer q-retention: \"When a subscription expires (or is unsubscribed or rejected), its undelivered records are deleted from the cloud side; nothing is recoverable after expiry.\" Event, retry and dedupe retention is bounded by that subscription expiry plus the minimum needed to finish an already in-flight attempt. No post-expiry retry or replay period. Recovery is re-subscribe then read current state once using get_agent_session/read_agent_output, including when the turn stopped before subscription.",
+      "External wire authorities, read 2026-11-20: SEP-3415 Final at https://modelcontextprotocol.io/seps/3415-events-extension (official source read at https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/docs/seps/3415-events-extension.mdx), and ChatGPT at https://developers.openai.com/plugins/build/mcp-events. Their method schemas, envelopes, canonical identity, error data, lifecycle, signing and routing requirements are incorporated by reference; Reach supplies event semantics and retention, not a replacement protocol. The Final SEP is the requested baseline; changes in a later living specification require reassessment rather than silent adoption.",
+      "Observation boundary: this revision statically inspected current service/store/startup, remote request/relay, gateway instructions, gate fixtures, cloud scripts and remote E2E seams. Supplied authority survey document hashes remain provenance, not a current Git revision assertion. Baseline plan SHA-256 9787fb87df5bf52f663503df9106ce409f91d95636797d64e7945abc78098916. Request-supplied branch history identifies ee00556, 57e9bdf, 012ecd3, fa5e9cf and 2093c25; Git revision is not independently verified. No live probe, deployment or implementation suite was run for this document revision. Supplied real-agent/production observations below are attributed to the requester, not independently reproduced.",
+      "Governing explicit/accepted confirmed authorities: ARCHITECTURE.md:16-25 separates MCP/transport/execution, requires runtime authorization, idempotent effects and unknown outcomes after transport failure; :87 forbids treating memory as persistence; :99 and PRODUCT.md:115 limit Reach to execution facts; :202-221 governs idle-only prompt delivery, turn_started, missing sessions and local lifecycle; :243-262 governs Access, remote.client, sandbox/settings responsibility and sensitive-data handling; :268-276 keeps state authoritative on-node and requires a separate cloud retention contract. src/internal/archtest/arch_test.go:46-88 explicitly governs pure decisions, ports and transport-only connector. .gitignore:10-12 excludes deployment settings. These remain binding; no authority document is edited.",
+      "Conflict inventory retained from the survey: README.md:163 cloud-stores-nothing and a literal notification-inclusive reading of ARCHITECTURE.md:206 conflict with the later supplied user authorization for bounded notification records. The later decision governs notifications only, not copies of session truth. ARCHITECTURE.md:256 session-owner wording conflicts with :212 nonownership and service/agents.go read authorization; the explicit Events=read_agent_output decision resolves this seam without adding starter ownership. The old working payload enum is superseded by stop-only. Access change-package non-goal is scoped to that package, not a repository-wide Events ban. No additional approval to edit any of these documents is implied.",
+      "Revision evidence and boundary: on this review, the official SEP-3415 Signature scheme requires a high-entropy message webhook-id independent of eventId (official source lines 603-610); the OpenAI MCP Events signing table separately specifies webhook-id equal to body eventId (lines 1160-1171). These are profile-specific authoritative contracts, not a single interchangeable identity rule. SEP request-scoped push lifetime plus q-retention governs deletion at request end; no permission for post-request replay was supplied. The four supplied findings are addressed as two corrections in the existing owners and acceptance cases; no observed production failure or executed implementation test is claimed.",
+      "Revision authority (inline sources in the current request): user-direction-20261120 approves startup unknown occurrences, definite-failure pending cleanup, arm-only failure finishing the operation unknown, and caller read-once instructions; Reach supports both Orca and local backends. user-direction-20261121 approves arming such a pending turn when its session reads working at startup, and instructing callers to resend with a new operation_id when an idle reply does not answer the prompt they sent. user-answer-egress-20261120 selects owner-allowlisted origins. q-egress-contract explicitly decides: \"keep the owner allowlist and the current Workers boundary\" and record that the gateway \"does not conform\" to SEP-3415 / OpenAI delivery-time validated-IP connection with original-host TLS. Only that delivery-time requirement is relaxed; no authority document edit or additional safety exception is authorized.",
+      "Supplied verified facts, 2026-11-20: g-session-loss holds for real Orca + Claude Code normal idle once, terminal closed mid-turn becoming not_found with disarm/no stop, local graceful daemon stop witnessing exited, and local crash restart disarming without stop. Local crash is approximated by abandoning runtime, not real SIGKILL. g-start-reconciliation fails: delivered prompt with lost arm remains pending, startup MarkRunningUnknown changes its operation to unknown, same-ID replay returns stored unknown, and nothing arms/notifies the pending turn. Existing instructions lead only to get_operation/resend. Orca last prompt text/start time do not establish safe recovery; repeated text risks false positives and is backend-specific. These results settle the gates as observations, not successful acceptance of the missing startup behavior.",
+      "G-Profile supplied production observation, ChatGPT Work/dots, 2026-11-20 06:50–08:49 UTC: ?events=chatgpt retained on server/discover x2, initialize x105, tools/list, events/list, events/subscribe x63 (one create plus 62 refreshes about every 90 seconds before a two-minute refreshBefore). Subscribe used name/arguments/delivery/cursor, webhook mode and secret, no ttlMs. Callback host is deliberately redacted here under the repository constraint; deployment allowlist example is https://callback.example.invalid only. SDK 1.32.2 answered discover 400, then the client fell back to initialize 2025-11-25. Refreshes stopped after user unsubscribe, but the unsubscribe request itself was not captured. This does not prove the new 2026-07-28 adapter or unsubscribe query preservation.",
+      "Egress evidence is requester-supplied, including q-egress-contract and workerd issue #6903 (https://github.com/cloudflare/workerd/issues/6903), not a new local observation: production Workers cannot pin a validated IP with separate SNI/certificate hostname; node:tls servername is not forwarded and startTls expectedServerHostname is unsupported. Supplied 2026-11-20 DoH observation places the probed callback behind a CNAME under cdn.cloudflare.net with shared Cloudflare anycast A/AAAA; connect() blocks Cloudflare and private addresses. Pinning is unavailable and not meaningful for that observed endpoint. fetch() private-address blocking is undocumented; global_fetch_strictly_public is available but does not prove validated-IP pinning. Exact-origin allowlisting trusts the allowed hostname DNS owner or Cloudflare to direct delivery, originating at Cloudflare edge rather than the owner LAN. It is not equivalent to the external delivery-time guarantee. External wire authority remains binding except for this quoted user-authorized nonconformance.",
+      "Current review disposition, delivery-time address validation: the previous candidate omitted an independent SEP-3415 webhook-security obligation. Restore DNS/address validation before challenge and each delivery/retry in the existing broker-delivery owner; no extra unit or configurable policy is added. Authority is the incorporated SEP-3415 delivery-time validation requirement; q-egress-contract authorizes only the validated-IP connection/original-host TLS nonconformance. The concrete discriminator is an allowlisted hostname returning a stable non-public address: no callback request may occur. Resolver failure is not evidence of a public destination. DNS preflight cannot bind hostname fetch to the checked addresses, so the declared rebinding/pinning limitation remains. Production resolver fidelity is unverified and must be established on the actual Worker path before webhook acceptance; local tests alone do not close it."
+    ],
+    "out": [
+      "Implementation code, authority-document edits, MCP client changes, live deployments or tests requiring external accounts, Controller/DaVinci design, additional authentication flows and per-AI identities.",
+      "Terminal-started Orca turns, progress notifications, prompt/reply contents in cloud records, work-success inference, ordered Orca transition history, full-session event history, post-expiry recovery and automatic replay of a prompt with uncertain acceptance.",
+      "Exactly-once network delivery and guaranteed observation of a stop erased before a current-state read. A logical occurrence is unique, but a lost webhook acknowledgement can cause duplicate deliveries with the same eventId. Missing state is not automatically exited."
+    ]
+  },
+  "decisions": [
+    {
+      "id": "stop-only",
+      "decision": "Keep event name agent.session_state_changed, now defined as a Reach-prompted turn stopping or an explicitly unknown observation after startup reconciliation. inputSchema is an object with required nonempty string node and session_id and additionalProperties:false. payloadSchema is an object requiring node:string, session_id:string, state:enum[idle,waiting_on_human,exited,unknown], observed_at:ISO-8601 date-time with timezone, additionalProperties:false. No prompt, reply, question text, operation_id, caller workflow or success verdict. The occurrence timestamp equals the node observation time, not an invented exact transition time; eventId is the durable node-generated turn-stop identity. For unknown, observed_at is the startup reconciliation observation time, never a claimed completion time; unknown never claims delivery, completion, exit or success.",
+      "rationale": "Necessary accepted observable outcome: an armed turn produces at most one occurrence at its first observed stop. Once waiting_on_human has been notified, resuming that same turn does not produce a second idle notification. A wait that disappears between reads is not observed; the eventual stop is notified. Preserve the prior event name because no old Events API is implemented, not through an earlier-schema reader. The corrected meaning replaces working and broad state-change semantics. user-direction-20261120 corrects the earlier silent pending gap: each previous-daemon unarmed pending turn must produce exactly one unknown logical occurrence, even though its execution outcome is unknown. Transport can duplicate that occurrence under its stable eventId.",
+      "owner": "user",
+      "alternatives": [
+        {
+          "option": "Notify all state transitions or terminal-started turns",
+          "rejected_because": "Contradicts the corrected scope; creates intermediate notifications and a history requirement."
+        },
+        {
+          "option": "Notify only idle",
+          "rejected_because": "Loses the explicitly requested human-wait and exited outcomes."
+        }
+      ],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "ARCHITECTURE.md:202-221"
+      ]
+    },
+    {
+      "id": "node-turn-owner",
+      "decision": "The service owns admission, authorization and a durable per-session Reach-turn marker; backends own interpreting current state/protocol facts. Existing prompt-operation identity is reused privately to deduplicate the known turn, never added to events/* or payloads. Serialize Reach prompt admission and observation for a session. Persist a pending-start intent before delivery; on backend confirmation persist armed before returning delivered, then observe immediately and on a bounded schedule while armed. Before admitting another Reach prompt, observe/close the prior armed turn under the same serialization. Commit the first stopped observation and its outbox occurrence atomically, disarm, and never rearm for an idempotent operation replay. At daemon start, before new prompt admission and on both backends, atomically append one unknown occurrence to the SQLite outbox and delete each previous-daemon unarmed pending row. Where turns are observed by current-state reads, read the session first: if it reads working, append the unknown occurrence and arm the row in the same transaction instead of deleting it; a failed or not_found read is not evidence and deletes the row, and a session that already has an armed turn is not armed again, since a prompt is admitted only while the session is not working. Transaction rollback retains the pending row and no occurrence; a committed transaction leaves no pending row to generate a second occurrence on another restart. Do not rearm from Orca prompt history. Delete a pending row when send_agent_prompt returns a definite failure; a transport/confirmation uncertainty is not definite failure. If delivery succeeded and only ArmTurn fails, retain pending, finish the operation as unknown with result_unknown immediately, and return result_unknown; same-ID replay never types again. Existing MarkRunningUnknown remains for a process lost before operation completion.",
+      "rationale": "Necessary tracking prevents idle-before-start, fast-completion and duplicate-operation false events; a bare timer without a marker cannot distinguish user terminal activity. Observation requires no history. Poll schedule and batching are private to node-observation, with cancellable I/O through ports and no unbounded parallel reads. A pending intent is not proof of delivered. A crash between external start and durable confirmation remains uncertain; the failed g-start-reconciliation is resolved by unknown, not recovery. Do not introduce a second turn/session source of truth.",
+      "owner": "proposed",
+      "alternatives": [
+        {
+          "option": "Broker polls node state for every subscriber",
+          "rejected_because": "Repeats execution semantics in cloud, couples completion to connectivity and multiplies reads; lower code locality and worse disconnect behavior."
+        },
+        {
+          "option": "Orca transition journal or new upstream subscription adapter",
+          "rejected_because": "Optional for full history, unsupported as necessary here; current-state detection is explicitly accepted and simpler."
+        },
+        {
+          "option": "Memory-only armed bit",
+          "rejected_because": "Loses known starts on daemon restart, violating retained durable observation intent."
+        },
+        {
+          "option": "Recover pending by matching Orca last prompt text and state start time",
+          "rejected_because": "Rejected by user-direction-20261120: Reach is not Orca-only and repeated prompt text can identify the wrong turn."
+        },
+        {
+          "option": "Delete uncertain pending silently or restore armed without positive evidence",
+          "rejected_because": "The former loses the approved unknown occurrence; the latter can manufacture stop facts for an unconfirmed turn. A working read at startup is the evidence that arms a pending turn: the stop that follows is a stop witnessed on that session, and the caller tells from the reply whether it answers its prompt."
+        },
+        {
+          "option": "Leave a pending turn that reads working unarmed and have the caller read until it stops",
+          "rejected_because": "Rejected by user-direction-20261121: it returns that case to polling, against the goal of notifying turn stops."
+        }
+      ],
+      "source_refs": [
+        "src/internal/service/agents.go:59-125",
+        "src/internal/orcaws/orcaws.go:289-368",
+        "src/internal/agent/agent.go:172-224",
+        "src/internal/store/store.go"
+      ]
+    },
+    {
+      "id": "durable-relay",
+      "decision": "Use the existing node SQLite store for armed/pending-start markers and an outbox of immutable stopped occurrences. Use the existing node DO durable storage for principal-scoped subscription grants, short-lived event rows, replay membership and delivery attempts. Worker remains stateless. Implemented internal WSS contracts, distinct from MCP: events.authorize is an ordinary correlated request/result using the existing envelope, with params {session_id,subscription_key,expires_at} and result {decision:allowed|denied|unavailable}, under remote.client using the read_agent_output policy; the existing id correlates request/result; do not add a separate request_id protocol. Node-to-broker frame {type:turn_stop,eventId,session_id,state,observed_at}; broker-to-node frame {type:turn_stop_ack,eventId}. Node identity comes from the authenticated WSS, not the message. Reconnect carries current unexpired grants for node reauthorization before delivery resumes. Existing request/reply frames, ping and prompt receipts retain their meaning.",
+      "rationale": "The retained layout is necessary under the supplied prior decision. Without the SQLite outbox a stop observed offline is lost; without DO persistence a gateway redeploy erases accepted subscriptions and retry state. An ack means matching records are durably committed or the event has no eligible subscription and has been definitively discarded, never merely queued in memory. It does not mean the client consumed the event. The connector only transports messages; decisions remain in service/broker. No new registry, queue service or generalized event bus.",
+      "owner": "user",
+      "alternatives": [
+        {
+          "option": "Worker memory only",
+          "rejected_because": "Contradicts durable state decision and loses state on normal instance loss."
+        },
+        {
+          "option": "New global DO, Queue or KV event bus",
+          "rejected_because": "Not selected: no required independent outcome beyond the existing node DO; increases synchronization and deployment cost. Reconsider only on demonstrated capacity failure."
+        },
+        {
+          "option": "Deliver callbacks directly from the daemon",
+          "rejected_because": "Not selected under retained Worker egress/DO responsibility; would move callback credentials and delivery policy to another trust boundary."
+        }
+      ],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "ARCHITECTURE.md:73-89",
+        "src/internal/remote/remote.go",
+        "cloud/src/broker.ts"
+      ]
+    },
+    {
+      "id": "retention-and-replay",
+      "decision": "Every cloud event row belongs to one or more still-live subscription/reader leases; there is no global historical archive. Webhook grants default to five minutes and never exceed five minutes, including null/no-expiry suggestions. Existing successful refresh extends the same grant and live records; it does not recover deleted records. On expiry, unsubscribe, push request end/cancel/disconnect or authorization rejection, atomically make the grant ineligible and delete its undelivered event, retry and dedupe membership. Shared bytes remain only for another independently live grant and cannot be read through the removed one. A running network attempt may finish under a fixed request deadline; no new attempt starts after invalidation, and its residual state is deleted immediately on completion/deadline. Persistent DO alarms enforce deadlines independently of incoming requests; pending verification records and secrets have the same bound.",
+      "rationale": "Necessary user retention decision, not a proposal for an extra grace period. The client owns its last cursor. The broker owns the retained records and a safe acknowledged-or-abandoned watermark, not a new authoritative client checkpoint. Poll uses an implicit reader lease established by cursor:null and renewed by authenticated polls, idle expiry at five minutes; this is internal bookkeeping, not events/subscribe or a new argument. Push uses only a request-scoped reader: cancellation, disconnect, normal request end and redeploy-induced request loss terminate that subscription and delete its undelivered/replay/dedupe membership, even before its authorization deadline. There is no reconnect lease or replay grace period. A replacement stream is a newly authorized subscription; an old non-null cursor returns active with truncated:true and a fresh position, without any record from the ended reader. The client then reads current state once with get_agent_session/read_agent_output. Other live subscriptions may retain shared event bytes, but the replacement cannot access their membership or backfill the ended reader. A disconnect whose detection is delayed is cleaned up when the failed heartbeat/write or request-lifecycle reconciliation establishes request end; notification delivery cannot resume under that old reader. An open stream is closed at its authorization deadline (at most five minutes) so it cannot bypass reauthorization; reconnect uses the standard stream method. No data from expired or ended reader membership is exposed even if another subscription retained the same event. Null/absent cursor starts now; expired history yields the profile-defined gap/truncated response and a fresh position, never resurrects records. Offline node replay may match only a still-live grant established before the observed stop, after node reauthorization. A fresh subscription does not backfill earlier stops; subscribe-then-read-once handles that race.",
+      "owner": "user",
+      "alternatives": [
+        {
+          "option": "Keep events for a fixed post-expiry recovery window",
+          "rejected_because": "Explicitly rejected by q-retention."
+        },
+        {
+          "option": "Only cursor:null in every mode, no replay storage",
+          "rejected_because": "Not selected for all modes: live webhook grants and active poll leases still need their bounded replay/delivery bookkeeping under the prior decision. That does not authorize retaining a terminated push subscription. Removing only post-request push retention preserves every accepted outcome through new-stream-then-read-once recovery."
+        },
+        {
+          "option": "Retain an ended push reader until its previous deadline to replay on reconnect",
+          "rejected_because": "requires_user_authority and not adopted: SEP-3415 ends the subscription with the request, and q-retention requires deletion on subscription termination. No accepted outcome requires this extra state; delete it and use the accepted re-subscribe-then-read-once recovery. This resolves both push-retention review findings without a new authority decision."
+        }
+      ],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "ARCHITECTURE.md:268-276"
+      ]
+    },
+    {
+      "id": "wire-profiles",
+      "decision": "One gateway and common tool catalog serve /mcp for standard Events and existing tools, and /mcp?events=chatgpt for ChatGPT Events and the identical tools. The profile is selected from the registration URL on every request, never User-Agent or subscription payload guessing. Standard discovery advertises capabilities.extensions[\"io.modelcontextprotocol/events\"]={} for 2026-07-28 with a static one-event catalog and delivery [poll,push,webhook]. ChatGPT initialize and 2026-07-28 server/discover advertise top-level capabilities.events={} and delivery [webhook]; events/poll and events/stream are not advertised or accepted there. No list-change extension is needed for a static catalog. Standard older-revision requests retain the existing tools path and do not advertise standard Events. ChatGPT initialization-style Events is the explicitly requested separate profile, not standard Events on an older revision.",
+      "rationale": "Necessary specified client difference: mixing capability shapes or callback errors produces a plausible valid-looking but unusable integration. SDK 1.32.2 cannot supply the 2026-07-28 core itself. Keep a thin explicit HTTP/JSON-RPC 2026-07-28 adapter for discovery, per-request capabilities, request/result handling and tools methods using the same catalog/forwarder. Do not relabel an old SDK transport as a new protocol, duplicate tool definitions, add a second auth service or change tool arguments. Support the inspected revision, apply core unsupported-revision handling to unimplemented revisions, and adopt later revisions only after capability/contract verification. Events unsupported at a given endpoint/revision returns method-not-found, not tool success. G-Profile supports retaining the query profile for the captured methods; unsubscribe remains a release check. ChatGPT tries 2026-07-28 server/discover first; its adapter must advertise top-level capabilities.events and complete the same-profile lifecycle end to end. If that adapter rejects ChatGPT, ChatGPT acceptance fails and release is blocked for that profile; the observed SDK 1.32.2 fallback to initialize 2025-11-25 does not establish adapter support or authorize automatic fallback profile.",
+      "owner": "user",
+      "alternatives": [
+        {
+          "option": "Upgrade SDK and use its official Events support",
+          "rejected_because": "Viable alternative only when observed to implement both profiles and required revision; current supplied SDK lacks them. An upgrade is reversible but broader than this bounded adapter."
+        },
+        {
+          "option": "One ambiguous endpoint advertises both capability dialects",
+          "rejected_because": "No demonstrated discriminator for identical method names with different error/control behavior; leaves the client contract indeterminate."
+        },
+        {
+          "option": "Drop standard push/poll, or drop legacy tools",
+          "rejected_because": "Contradicts explicit delivery and tool-preservation requirements."
+        }
+      ],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "cloud/package.json",
+        "cloud/src/mcp.ts",
+        "cloud/src/index.ts"
+      ]
+    },
+    {
+      "id": "wire-methods",
+      "decision": "The external SEP and OpenAI references in scope define exact method shapes and remain authoritative over implementation. events/list exposes the one descriptor with profile-specific delivery modes. Standard events/poll consumes name, arguments, cursor and standard optional bounds; cursor:null bootstraps now, results contain events, cursor, truncated, hasMore and nextPollMs. No prompt-operation ID or explicit poll subscribe exists. events/stream is POST SSE and consumes the standard cursor/age/heartbeat arguments; send active first, event notifications and periodic protocol heartbeat notifications (not SSE comments), request-id correlation metadata, and the standard final result on a writable server close. Abort or other request end terminates that push subscription and deletes its undelivered/replay/dedupe membership; it does not stop the agent. Reopening a stream never revives the ended subscription. Subscribe/unsubscribe are webhook lifecycle methods using name, arguments, delivery URL and the defined mutable fields, not the derived subscription ID as request input. Return authoritative refreshBefore, cursor and truncated as specified; enforce canonical principal/URL/name/arguments identity. Changed secret is never identity and does not rewind live delivery. Emit standard gap and terminated envelopes only in the standard profile, never to ChatGPT. SEP errors use its named categories and provisional mapping including NotFound -32023, Forbidden -32024 and CallbackEndpointError -32027; ChatGPT CallbackEndpointError is -32015. Use the exact respective specification for the remaining error codes/data; do not translate these into successful tool results.",
+      "rationale": "Necessary externally governed contract; copied protocol schemas and a Reach-specific subscribe wrapper would add synchronization without an independent outcome. Acceptance must compare actual HTTP frames with the cited baseline, including routing via Mcp-Name and standard subscription-argument header mirroring when specified. Reach arguments do not add routing annotations; argument node selects the DO and Mcp-Name remains the protocol event-name header, not a node identifier. Local fixtures must distinguish schema-valid frames from a working lifecycle.",
+      "owner": "source",
+      "alternatives": [],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "cloud/src/mcp.ts"
+      ]
+    },
+    {
+      "id": "authorization-and-egress",
+      "decision": "Every Events request, including list, refresh and discovery, passes existing Access assertion validation. Carry its verified issuer/subject principal into the broker key; do not use asserted text, callback possession or client-selected subscription IDs as identity. The daemon executes authorization as configured remote.client, exactly as read_agent_output (agent.run and reachable Reach session), without starter ownership or extra event permission. Initial grant needs online node authorization. An unexpired existing grant can refresh while offline after Access validation; mark it awaiting node reauthorization and suspend dispatch after disconnect until reconnect authorization succeeds. Denial invalidates/deletes that grant; transient offline/unavailable does not mean denied or turn-stopped. Access reauthorization on refresh and expiry bounds stale authority; no immediate revocation claim. Do not persist Access JWTs.",
+      "rationale": "Necessary accepted security boundary; a second OAuth flow and permission ownership by callback receiver are unsupported. Worker outbound delivery uses a caller-defined safe-HTTPS port returning accepted, retryable failure, terminal failure or verification failure. Production adapter requires HTTPS only, rejects IP literals, and requires exact parsed origin (scheme, hostname and effective port) membership in owner-managed gateway configuration. Missing/empty allowlist permits no destinations. Use a placeholder only in tracked examples; actual origins and secrets are deployment settings. No wildcard, suffix, path or subscription-supplied authorization of an origin. Apply this before challenge and every delivery; use redirect:manual and classify 3xx as failure without following Location. Independently of origin allowlisting, resolve the destination hostname and validate all resulting IPv4 and IPv6 addresses before the endpoint challenge and immediately before every delivery attempt, including retries. Reject non-public destinations, including loopback, private, link-local, multicast, unspecified and reserved addresses, including equivalent IPv4-mapped IPv6 forms; mixed public/non-public answers are rejected. Follow resolution aliases to address results; an empty, incomplete or failed resolution cannot authorize a callback request. Do not reuse a subscription-time DNS result as delivery-time validation. The Worker HTTPS adapter owns resolution and address classification through its external-capability port; use a production-capable resolver path and shared fake/adapter contract cases, not an unverified library premise. If resolution fails, return verification failure for activation or a retryable delivery failure within the existing attempt/expiry bounds; a forbidden address is a terminal callback-endpoint rejection. No callback HTTP request is made on either failure. Retain normal TLS hostname verification. This preflight rejects an allowlisted hostname that stably resolves to a non-public address, but hostname fetch can resolve again after validation: rebinding/check-to-connect races remain unprevented without pinning. It therefore does not establish the external validated-address connection requirement. Enable global_fetch_strictly_public; retain signed endpoint challenge and Standard Webhooks signing. Disallowed subscriptions return CallbackEndpointError (-32027 standard, -32015 ChatGPT) without outbound request. These controls do not implement validated-IP pinning. Per q-egress-contract the gateway explicitly does not conform to SEP-3415/OpenAI delivery-time validated-IP/original-host TLS requirements. Supplied Workers and callback-DNS facts in scope explain why. This limited nonconformance is user-authorized; no other exception is added. Secrets and callback URLs remain restricted notification metadata and never enter logs, cursors, payloads or tracked real deployment settings.",
+      "owner": "user",
+      "alternatives": [
+        {
+          "option": "Validated IP pinning with original-host SNI and certificate verification in production Workers",
+          "rejected_because": "Required by the external contracts but unavailable according to supplied runtime evidence; old G-Egress does not hold, not a passing gate."
+        },
+        {
+          "option": "Move delivery to daemon",
+          "rejected_because": "Explicitly rejected in q-egress-contract: exposes owner LAN to SSRF and puts subscription secrets on the node."
+        },
+        {
+          "option": "Move egress to another service/runtime",
+          "rejected_because": "Not selected by q-egress-contract; potentially preserves external conformance but changes the accepted boundary, adds operational complexity and requires separate user authority. Current selection preserves Workers with declared nonconformance."
+        },
+        {
+          "option": "Omit delivery-time DNS/address validation because exact-origin allowlisting and strict-public fetch are enabled",
+          "rejected_because": "Unsupported additional safety relaxation: q-egress-contract only authorizes inability to connect to the validated IP with original-host TLS. An allowlisted hostname can stably resolve to a forbidden address; feasible preflight validation rejects that path even though it cannot prevent rebinding."
+        }
+      ],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "cloud/src/access.ts:36-55",
+        "cloud/src/index.ts:34-49",
+        "src/internal/service/agents.go:132-179",
+        "ARCHITECTURE.md:243-262"
+      ],
+      "invalidated_by": "User withdraws the explicit nonconformance decision, allowed-origin ownership is not trusted, or the production execution path fails the retained safeguards; do not silently claim equivalent protection or switch egress boundaries."
+    },
+    {
+      "id": "webhook-delivery",
+      "decision": "Validate the client-supplied whsec_ secret and perform the specifications' signed, single-use verification challenge before activation. Bound verification cache by principal+URL and the live grants, and clear/reverify when its proof is unavailable; varying arguments must not flood challenges. Keep eventId as the immutable occurrence identity shared across subscriptions and delivery modes. In the standard SEP-3415 profile, generate a high-entropy, header-safe webhook-id independently for each message (one occurrence on one subscription, or one control envelope); never derive it from eventId. Persist it with that subscription message before its first dispatch and reuse it across retries, DO restarts and live refreshes. Use only ASCII letters, digits, underscore and hyphen; control-envelope IDs follow the specified msg_<type>_<random> form. Sign the exact serialized body bytes with Standard Webhooks using that message webhook-id, fresh signing time/signature, X-MCP-Subscription-Id and required JSON content type. The explicitly supported ChatGPT profile follows its different documented header rule: event deliveries use webhook-id equal to body eventId; verification uses its own message ID. Do not apply that ChatGPT equality rule to standard deliveries or alter the occurrence eventId to simulate message identity. Never forward Access assertion, node token or extra callback Authorization. Broker durable attempt records and alarms own scheduling, per-event completion and safe cursor progression; Worker adapter owns only validated HTTPS effects and response classification. A retry reservation is committed before the request so a DO restart cannot reset its budget. Retry exponentially only while eligible, at most ten network attempts per eventId per subscription including ambiguous in-flight attempts, and no later than grant expiry. Do not reset that budget on refresh. Honor the external protocol's terminal response classifications. On exhaustion abandon that event, record delivery_failed as an internal diagnostic and expose only specification-defined deliveryStatus/category fields on refresh; never a successful stop-delivery claim. A refresh can reactivate future delivery without resurrecting expired or exhausted records.",
+      "rationale": "Necessary bounded retry/security contract retained from the prior decision; at-least-once applies only while the receiver acknowledges within this budget and grant. 2xx means endpoint accepted, not that ChatGPT or its LLM acted. The adapter deadline is finite and chosen within Worker execution limits; the exact timeout/backoff coefficients are bounded local discretion in broker-delivery, preserving ten attempts, expiry, cancellation and categorized failures. Broker occurrence deduplication uses subscription identity plus immutable eventId. Standard receiver transport deduplication uses the independent webhook-id, so two subscriptions matching the same occurrence cannot suppress each other; retries of one message do collapse. ChatGPT follows its separate documented header rule and routes with X-MCP-Subscription-Id; local tests can establish the sent profile-specific contract but do not prove hosted receiver deduplication. This resolves the two overlapping eventId/webhook-id wire and signature findings through one message-identity correction, with independent receiver checks owned by broker-delivery and profile integration by mcp-wire. The external authorities differ by profile, so neither rule is generalized to the other. No circuit-breaker layer or additional monitoring service is justified.",
+      "owner": "user",
+      "alternatives": [
+        {
+          "option": "Use eventId (or a derivation of it) as the standard webhook-id",
+          "rejected_because": "Contradicts the SEP-3415 message-ID MUST and allows a receiver to drop a second subscription's legitimate delivery. A correct HMAC alone does not discriminate this error."
+        },
+        {
+          "option": "Generate a fresh standard webhook-id on every retry",
+          "rejected_because": "Defeats message retry deduplication; persist the first independently generated message ID instead."
+        }
+      ],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "cloud/src/broker.ts",
+        "cloud/src/access.ts"
+      ]
+    },
+    {
+      "id": "failure-limits-and-gates",
+      "decision": "Disconnect pauses transmission but not agent work or node observation. Orca armed markers survive daemon restart and resume current-state reads; known local sessions do not survive and are not_found. Persisted stop occurrences survive either restart. Local process exit observed while daemon runs, including explicit stop, must be recorded before session deletion and becomes exited only for an armed turn; daemon death alone is not a witnessed exit. Orca terminal disappearance remains disarm-without-stop; unarmed previous-daemon pending starts instead yield the approved unknown occurrence, never manufactured exited events; one whose Orca session reads working is armed again with it. Repeated read errors keep the marker armed and report unavailable; they never emit idle. Persisted outbox items are retried under the same eventId; expired/denied destinations are discarded by broker, not replayed into fresh grants. A DO restart/redeploy resumes still-live webhook grants and poll leases and their alarms, replaces stale webhook attempt leases without resetting attempts or message IDs and may redeliver an ambiguously acknowledged webhook request. It must not revive ended push readers. An interrupted SSE ends its subscription; cleanup deletes its membership. A new stream uses the standard cursor request but cannot recover old-reader records: a stale cursor yields active with truncated:true and a fresh position, and recovery reads current state once. No prompt is resent automatically.",
+      "rationale": "Necessary distinction between execution fact, observation gap and transport state. Ordinary tool semantics remain intact. The node outbox stores only notification fields and minimal provenance until durable ack; on reconnect old entries without an eligible live grant are acknowledged as discarded, then removed. Observation without subscribers may produce at most the finite number of accepted Reach turns; production disk exhaustion is explicit unavailable/result_unknown with no false delivered guarantee, not unlimited memory buffering. Recorded gates: g-session-loss holds within the supplied approximation boundary; g-start-reconciliation fails and its accepted replacement is startup unknown. Old G-Egress pinning gate is removed as a precondition, with explicit nonconformance retained. G-Profile is partially observed; unsubscribe, new-adapter end-to-end behavior and g-capacity remain evidence gaps. They do not grant live execution or authorize contract weakening.",
+      "owner": "proposed",
+      "alternatives": [],
+      "source_refs": [
+        "ARCHITECTURE.md:20-25",
+        "ARCHITECTURE.md:202-221",
+        "src/internal/agent/agent.go",
+        "src/internal/orcaws/orcaws.go",
+        "src/internal/remote/remote.go",
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json"
+      ]
+    },
+    {
+      "id": "minimal-responsibilities",
+      "decision": "Use three distinct units in order: node-observation, broker-delivery, mcp-wire. Each owns implementation and verification of its own behavior. Shared interfaces above permit work against contract fakes; dependencies below consume completed implementations for integration, not permission to define a parallel interface. No separate contract-document, security, retry, schema, outbox, or test-only unit: each would partially overlap an existing owner and require synchronized invariant copies. Keep changed validation/state transition/projection decisions pure with time, identifiers and read state as inputs, returning intended effects. Extend existing functions/types; use ports per external capability in caller terms, production adapters at existing composition roots, and contract-equivalent fakes. Local reversible choices (table layout, timer interval, small helper placement) belong to the carrier unit provided public semantics, authority and resource limits hold; changed wire/failure/ownership needs escalation. The three units below are remaining work, not reimplementation of completed node arming, observation and relay. node-observation also owns the gateway instruction text because it completes the same unknown caller behavior; mcp-wire consumes it and is ordered after it transitively.",
+      "rationale": "Necessary units preserve distinct node execution truth, cloud notification lifetime and client protocol outcomes. Consolidating all three into one session loses independent language/runtime and trust-boundary assessment; splitting within one of them adds handoffs without an independent accepted outcome. Removed: G-Orca ordered-history gate, intermediate working events, generic session-transition collector, full-history replay, and any terminal-turn tracking. Optional algorithms/layout remain delegated. Unsupported: new buses, auth stacks, configurable single-value profiles or hidden compatibility readers. Any unobserved safety/platform premise or fallback remains requires_user_authority if resolving it changes a boundary; evidence gathering alone belongs to caller. Review disposition: the two overlapping message-ID/signature findings are resolved in webhook-delivery and its broker/receiver acceptance; the two overlapping push-retention findings are resolved by deleting the reconnect retention mechanism in retention-and-replay and its broker/wire acceptance. No new unit, recovery store, post-termination grace period or authority edit is added. The prior survey conflicts and q-retention remain projected above; unaffected decisions are retained; the current request supersedes only the pending/unknown, caller, egress, discovery and gate meanings described above. Necessity classification: accepted unknown/cleanup/read-once, notification retention, authorization and profile outcomes are necessary: deleting each respectively loses crash-gap notification, leaves stale pending/running, strands callers, loses grants or bypasses access/wire interpretation. Their implementation details are proposed, not independently necessary. The three responsibility contexts are distinct (node truth, cloud lifetime/delivery, MCP wire); instruction text partially overlaps wire placement but has one semantic owner. Table/helper placement and timer algorithms are optional delegated discretion. Additional buses, Orca history and new auth layers are unsupported. New product behavior, recovery guarantees or safety boundary changes require user authority. No new document or test-only unit is warranted.",
+      "owner": "proposed",
+      "alternatives": [],
+      "source_refs": [
+        "src/internal/archtest/arch_test.go:46-88",
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json"
+      ]
+    },
+    {
+      "id": "unknown-caller-contract",
+      "decision": "Gateway instructions require: after an unknown event or a result_unknown from send_agent_prompt, call read_agent_output once for that session. If working, wait for the next event. If idle and its reply does not answer the prompt sent, the prompt did not reach the agent: resend it with a new operation_id; otherwise do not resend. Subscriptions are per session, survive daemon restart while refreshed, and need no re-subscription for this case. Retain normal expiry/re-subscribe/read-once rules and existing operation inspection for other uncertain tool outcomes. Reach never resends the prompt itself.",
+      "rationale": "Necessary user-direction-20261120 correction: get_operation or same-ID resend can only return stored unknown and never leads to reading output. A lost-arm turn whose session reads working at startup is armed again (node-turn-owner), so its next event follows. A read that fails at startup, or an arm-only persistence failure in a running daemon, leaves a working turn without a next event until a later daemon start. Reach cannot tell a prompt that never reached the agent from a turn that ended before restart; only the caller can, from whether the idle reply answers its prompt, and a misjudgment repeats the work once. A missing session returns the existing not_found, not a successful completion. Failed reads remain explicit failures; Reach adds no polling, retry or fallback.",
+      "owner": "user",
+      "alternatives": [
+        {
+          "option": "Only get_operation or same-ID resend after send_agent_prompt result_unknown",
+          "rejected_because": "Observed stored unknown cannot yield the required output read."
+        }
+      ],
+      "source_refs": [
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json",
+        "cloud/src/mcp.ts",
+        "src/cmd/reach/main.go",
+        "src/internal/service/gate_test.go"
+      ]
+    }
+  ],
+  "units": [
+    {
+      "id": "node-observation",
+      "responsibility": "Own the remaining unknown-turn startup reconciliation, definite-failure cleanup, immediate operation unknown completion and caller instructions, with their verification on both backends.",
+      "repository": "/home/dev/.cache/dev-skills/worktrees/8dd49f7a196e4dc3326a65d86815024abb9feca0baf6c9fe2616fbd3d20fc161/mcp-events-design-v3-4d40adef5b88d894",
+      "paths": [
+        "src/internal/core",
+        "src/internal/service",
+        "src/internal/store",
+        "src/cmd/reach/main.go",
+        "cloud/src/mcp.ts"
+      ],
+      "contract": "Extend existing service/store/startup rather than repeat implemented arming/watcher/outbox/relay. Consume existing SQLite, backend prompt result, operation store, clock/ID ports. Own the node-turn-owner startup transaction and failure classification: process only previous-daemon unarmed pending rows before serving new prompts; append unknown and delete pending atomically, or, where turns are observed by reads and the session reads working, append unknown and arm pending atomically. Keep persisted armed/session-loss behavior and ordinary events.authorize/turn_stop/ack contracts. Finish arm-only failure unknown immediately and preserve pending; delete pending on definite failure only. Own unknown-caller-contract instruction text in cloud/src/mcp.ts without tool schema changes. Pure decisions receive state/time/IDs; store effects use the existing port, extended in caller terms with a matching fake and shared SQLite contract cases. Startup storage failure prevents readiness/admission, retains durable evidence and surfaces the failure rather than reporting reconciliation success.",
+      "failure_behavior": "Crash before reconciliation commit leaves pending and no occurrence; crash after commit leaves exactly one immutable unknown outbox occurrence and no pending. Further startup cannot regenerate it, even after acknowledgement removes the outbox row. Failed transaction never deletes the sole surviving pending evidence. If finishing operation unknown itself fails, return explicit persistence/result uncertainty; do not claim a persisted terminal operation, retain pending, and existing startup MarkRunningUnknown handles unfinished operations. Cleanup failure cannot be reported as completed definite-failure cleanup. Unknown confirmation is not definite failure. Keep fa5e9cf behavior: local completion recording failure leaves tracking armed and session usable for later watcher record/disarm; do not fabricate exits or replay effects.",
+      "acceptance": [
+        {
+          "observe": "Extend src/internal/service/gate_test.go arm-commit failure fixture and existing service/store tests. For Orca and local prompt producers inject successful delivery followed only by ArmTurn failure: before restart get_operation is unknown and same-ID replay sends no prompt again. Restart with pending: assert one state=unknown outbox record, pending deletion, startup observation timestamp. With turns observed by reads and the session reading working, assert the row armed with the same single unknown record and its later stop recorded once; an idle, unreadable or unobserved session, or one that already has an armed turn, is not armed. Fault-inject reconciliation transaction before/after commit, restart twice and inspect SQLite, then ack/delete and restart again: exactly one logical occurrence, never regenerated. Distinguish already armed rows (resume/disarm under existing rules) from pending rows.",
+          "rejects": "Rejects running until restart, insert/delete split writes, duplicate occurrences on repeated restart, pending deletion without a durable occurrence, arming without a working read, Orca-only recovery and unknown interpreted as completion. Existing gate reproduces the gap; proposed new assertions are not executed evidence. SQLite/fake contracts cannot prove production agent or DO behavior."
+        },
+        {
+          "observe": "Inject definite prompt failure after BeginTurn and assert failed operation with no pending and no startup unknown; inject uncertain delivery and assert pending retained, never replayed, with startup unknown. Preserve normal idle-once, waiting-on-human-once, lost-session disarm and local completion-recording failure behavior using existing service, localws and agent fixtures. Run relevant Go service/store/core tests plus archtest; gate-tag fixtures require their documented environment and authority, not an unconditional live invocation.",
+          "rejects": "Rejects deleting uncertain intent as definite failure, leaking failed intents into later unknown events, changing armed disappearance to exited, or making local sessions unusable on stop-recording failure. A real SIGKILL remains unverified; approximate crash is not that proof."
+        },
+        {
+          "observe": "At cloud/src/mcp.ts instruction construction inspect the exposed instructions and assert both unknown event and send_agent_prompt result_unknown direct one read_agent_output; working directs event wait, and refreshed per-session subscription does not require re-subscribe after restart. Check that an idle reply that does not answer the sent prompt directs a resend with a new operation_id, and that no other prompt retry is added. node-observation owns these instruction assertions; mcp-wire owns later integrated event/read exercise.",
+          "rejects": "Rejects unchanged get_operation-only guidance, instructions that resubscribe per turn/restart, polling loops, and claiming that a lost arm is restored without a working read. Instruction assertions cannot prove a real LLM follows them."
+        }
+      ],
+      "depends_on": [],
+      "evidence_refs": [
+        "src/internal/service/agents.go",
+        "src/internal/service/ports.go",
+        "src/internal/service/agents_test.go:185-219",
+        "src/internal/orcaws/orcaws.go:289-368",
+        "src/internal/orca/orcatest/fake.go",
+        "src/internal/localws/localws.go",
+        "src/internal/agent/agent.go:158-247",
+        "src/internal/agent/agenttest/fake.go",
+        "src/internal/store/store.go",
+        "src/internal/remote/remote.go",
+        "src/internal/archtest/arch_test.go",
+        "src/cmd/reach/main.go",
+        "src/internal/store/turns.go",
+        "src/internal/service/turns.go",
+        "src/internal/service/service.go",
+        "src/internal/service/gate_test.go",
+        "cloud/src/mcp.ts"
+      ]
+    },
+    {
+      "id": "broker-delivery",
+      "responsibility": "Own durable cloud subscription authorization/lifetime, occurrence admission/replay and bounded signed webhook delivery, including their verification.",
+      "repository": "/home/dev/.cache/dev-skills/worktrees/8dd49f7a196e4dc3326a65d86815024abb9feca0baf6c9fe2616fbd3d20fc161/mcp-events-design-v3-4d40adef5b88d894",
+      "paths": [
+        "cloud/src/broker.ts",
+        "cloud/src/events.ts",
+        "cloud/src/webhook.ts",
+        "cloud/src/events.test.ts",
+        "cloud/src/webhook.test.ts",
+        "cloud/package.json",
+        "cloud/package-lock.json",
+        "cloud/wrangler.jsonc"
+      ],
+      "contract": "Extend existing node DO; events.ts/webhook.ts are proposed local module placements, not new services. Consume authenticated principal/node context, node authorization and occurrence contracts, DO durable storage/alarm/clock/ID and safe-HTTPS ports. Offer validated catalog-independent lifecycle operations, poll batches, stream reader notifications and specification-neutral categorized delivery results to mcp-wire. Persist subscription key, profile, grant deadline, authorization status, verification proof lifetime, notification records, per-message standard webhook-id, attempt budget/next-due/ack-or-abandon status and live replay membership. Message ID generation consumes the existing ID capability and is persisted with the attempt record, not a separate identity service. Cursors bind to principal, node, event arguments and reader scope; they carry no credentials or event contents and cannot grant access. The client persists last cursor; broker retains only live-grant delivery bookkeeping. Stable occurrence identity unifies every delivery mode. Expiry deletion is atomic and alarm-driven, including shared-row reference removal. Push request end/cancel/disconnect invalidates its reader and deletes its membership; pending cleanup after Worker/DO loss must reconcile dead request ownership before permitting new reads or dispatch. Persistent bookkeeping is not evidence that a request is still live. A replacement stream cannot use an old reader cursor to recover records, including bytes retained for a different live subscriber. Owner-configured exact-origin HTTPS allowlisting and all retained safeguards in authorization-and-egress replace the infeasible IP-pinning precondition; g-capacity remains before declaring deployable limits. Update wrangler only for the existing DO storage migration/alarm needs, enable global_fetch_strictly_public and add only the owner callback-origin configuration input; never add services/accounts or tracked real origins. Accept and relay unknown without treating it as a stopped session; a refreshed session subscription spans daemon restarts and successive turns. Consume the implemented ordinary events.authorize request/result, not a new request_id message. The existing safe-HTTPS capability includes fresh hostname resolution/address validation for challenge and every delivery attempt as specified in authorization-and-egress; broker-delivery owns its production resolver integration, matching fake and shared contract cases. Resolver choice is bounded implementation discretion only if it exposes complete address results/failures on the actual Worker path; inability to provide that capability blocks webhook acceptance and must be returned, never replaced by a permissive default.",
+      "failure_behavior": "Initial subscribe offline returns unavailable, not a grant based on a cached capability list. Existing unexpired offline refresh is accepted after Access, dispatch suspended pending reconnect authorization. Invalid principal/key/cursor never leaks another grant. Acknowledgement follows durable event admission/discard; duplicate receipt acknowledges without new delivery. On storage failure no ack/success is returned. Cloud redeploy cannot erase still-live webhook grants/poll leases, their budgets or message IDs, or skip unacknowledged events with an advanced cursor. Ended push subscriptions are deleted, not restored from those durable records. Expiry/denial and push request termination halt new dispatch and delete affected membership; unsubscribe does not affect an agent or other subscribers. Callback verification and egress failure return profile-neutral categories for the wire adapter. Retry exhaustion is observable on refresh; no raw response oracle. Standard gap/termination and ChatGPT suppression are profile-aware outputs, not extra event types. Invalid/unlisted callback origin is CallbackEndpointError before any network effect, with profile mapping owned by mcp-wire; recheck before dispatch and never follow redirects. Configuration changes cannot grant a destination through subscription data. DNS resolution failure, empty/incomplete answers or any forbidden address prevents callback HTTP dispatch even for an allowlisted origin. Activation returns categorized callback verification failure; delivery distinguishes terminal forbidden-address rejection from transient resolution failure under the existing bounded retry/expiry policy. Neither becomes successful delivery or an attempt to a previously cached address.",
+      "acceptance": [
+        {
+          "observe": "Add deterministic DO storage/clock/HTTPS-port contract cases and run them against both fakes and workerd adapters. Deliver an event, lose ack, restart DO, re-deliver; assert one durable record and stable ID, then consume through poll, push and webhook. Keep a failed early event plus a succeeding later one and refresh; assert watermark never passes unresolved delivery. For standard webhook, send the same occurrence to two distinct subscriptions at the same independent receiver, with retries and a DO restart between attempts. Assert identical body eventId but distinct high-entropy header-safe webhook-id values across subscriptions, the same webhook-id for each message's retries, and correct X-MCP-Subscription-Id routing. The receiver independently computes HMAC over the actual header message ID, signing timestamp and raw body bytes and deduplicates globally by webhook-id: both initial subscription deliveries must be accepted, each retry suppressed, and a substituted message ID must fail signature verification.",
+          "rejects": "Rejects ack-before-commit, delivery-mode-specific IDs, dedupe across unrelated subscriptions, memory-only replay and unsafe cursor advancement. Fake-only success cannot prove DO transaction/alarm/hibernation behavior. Specifically rejects eventId-as-webhook-id, deterministic IDs derived from eventId, fresh IDs per retry and signatures over eventId instead of the actual message ID. Randomness sourcing must be inspected/contract-tested; a single pair of unequal samples alone cannot prove entropy."
+        },
+        {
+          "observe": "Clock-driven cases cover a multi-hour turn with repeated five-minute refresh, offline refresh, reconnect denial, boundary-time expiry, unsubscribe during a request, last shared subscriber deletion, expired cursor reuse and refresh after expiry. Inspect durable rows, recorded effects and returned gap/status. For push, queue a stop while two readers share its underlying event, then cancel/disconnect one reader before consumption and reconnect before its former deadline with its old cursor. Assert immediate logical invalidation, deletion of that reader's durable event/replay/dedupe membership, no ended-reader delivery from either cloud rows or late node outbox replay, active with truncated:true and a fresh cursor on replacement, and one authoritative state read for recovery. The other independently live reader still receives its event. Repeat with normal request completion and Worker/DO recreation; verify cleanup after dead-request reconciliation and no revival.",
+          "rejects": "Rejects extending expiry into a recovery period, retaining orphan secrets/dedupe, delivery while reauthorization is pending, and exposing retained bytes via an expired grant. The turn duration is simulated; no live hours-long execution is needed. Rejects retaining ended readers until their former deadlines, authorizing backfill through another subscriber's retained bytes, or treating request loss as an active durable subscription. These checks cover the smaller delete-and-read-once design; they do not promise recovery of every missed occurrence."
+        },
+        {
+          "observe": "Add shared fake/production HTTPS-port cases at existing DO/Worker seams for owner allowlist: allowed exact HTTPS origin succeeds with signed challenge; absent/empty allowlist, HTTP, IPv4/IPv6 literals, deceptive suffix, different origin/port and unlisted host produce no network call and callback-endpoint failure. Use placeholder fixtures only. An allowed receiver returning 3xx is contacted once with redirect manual and its Location is never requested. Verify challenge echo, signature, TLS error classification and global_fetch_strictly_public deployment configuration. Recheck destination authorization for delivery as well as verification. On the same production HTTPS-adapter entry point, use a controlled resolver and recorded callback transport: an allowlisted origin resolves public at challenge and private at delivery; assert fresh resolution and zero delivery requests. Also exercise stable private A, private AAAA, IPv4-mapped private IPv6, mixed public/private answers, alias-to-private, empty/incomplete answers and resolution timeout. Assert challenge refusal or the specified delivery failure category and no callback dispatch; include a public-to-private change between retry attempts to reject validation only on activation or first send. A complete public answer plus valid signed challenge/delivery remains accepted. Run these contract cases against the fake and production adapter with controlled resolution; separately, under granted hosted authority, verify resolver availability and address/failure interpretation on the actual production Worker execution path.",
+          "rejects": "Rejects permissive empty configuration, string-prefix origin checks, subscription-controlled allowlist, unsigned challenge, redirect traversal and treating a failed send as success. These are new capability fixtures; cloud/package.json currently offers type checking only. Local fakes/workerd cannot prove production fetch address blocking, DNS ownership or IP pinning. The explicitly accepted external nonconformance remains even if every local test passes. Specifically rejects skipping DNS validation for allowed hosts, checking only one address/family, cached activation-only validation, ignoring failed resolution and relying on global_fetch_strictly_public alone. A resolver/transport fixture can prove preflight rejection and per-attempt invocation, but cannot prove that hostname fetch connects to the checked address; a public preflight followed by rebinding remains an explicit residual counterexample. Resolver integration and hosted fidelity are new evidence gaps, not passed results; existing cloud type checking cannot discriminate them."
+        },
+        {
+          "observe": "Persist attempt reservations, inject Worker/DO loss before and after HTTP acceptance, send retryable responses, terminal responses and timeouts; inspect invocation count <=10 per subscription/event and no dispatch at/after expiry. New cloud tests must have an explicit deterministic package script consumed by the integration unit; retain existing npm run check for type validity.",
+          "rejects": "Rejects retry-budget reset on redeploy/refresh, infinite retry, success on timeout and new post-expiry attempts. Existing cloud check is type checking, not behavioral or hosted verification."
+        }
+      ],
+      "depends_on": [
+        {
+          "unit": "node-observation",
+          "reason": "Consumes completed node unknown/cleanup behavior and existing authorize/occurrence/ack frames for restart integration; contract fakes permit independent local development. node-observation owns gateway instruction changes before later wire edits."
+        }
+      ],
+      "evidence_refs": [
+        "cloud/src/broker.ts",
+        "cloud/src/access.ts",
+        "cloud/package.json",
+        "cloud/wrangler.jsonc",
+        "src/internal/remote/remote.go",
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json"
+      ]
+    },
+    {
+      "id": "mcp-wire",
+      "responsibility": "Own authenticated standard/ChatGPT MCP wire integration, preservation of tools and end-to-end remote-boundary verification.",
+      "repository": "/home/dev/.cache/dev-skills/worktrees/8dd49f7a196e4dc3326a65d86815024abb9feca0baf6c9fe2616fbd3d20fc161/mcp-events-design-v3-4d40adef5b88d894",
+      "paths": [
+        "cloud/src/index.ts",
+        "cloud/src/access.ts",
+        "cloud/src/mcp.ts",
+        "cloud/src/events-wire.ts",
+        "cloud/src/events-wire.test.ts",
+        "src/cmd/reach/remote_e2e_test.go"
+      ],
+      "contract": "Consume broker-delivery lifecycle/read/delivery results and existing Access verifier/tool forwarder; offer exact standard and ChatGPT HTTP contracts in wire-profiles and wire-methods. Extend the authenticated identity handoff from Access without replacing its issuer/audience/subject/owner checks or remote.client mapping. The adapter selects profile per URL, preserves SEP-3415 independent webhook message IDs versus the ChatGPT eventId-equality header rule, applies core revision semantics, converts categorized broker failures to the respective JSON-RPC errors, routes Mcp-Name consistently with the method/event arguments, and shares the existing tool catalog across old and new revision adapters. Host-facing descriptors explain stop-only meaning and subscribe-then-read-once; no MCP client code is changed. Remaining release checks: uncaptured G-Profile unsubscribe, real 2026-07-28 discover-first ChatGPT integration, retained production egress safeguards under declared nonconformance, and preceding units for integration. Protocol scaffolding is only what these methods and unchanged tools require, not a general SDK replacement. The ChatGPT 2026-07-28 adapter must accept server/discover with top-level capabilities.events, retain the query profile through tools and event lifecycle, then deliver unknown and permit unchanged read_agent_output. If rejected, report ChatGPT support unaccepted; do not rely on the old SDK fallback or introduce another profile. Preserve node-owned instruction meaning when editing the shared mcp.ts file.",
+      "failure_behavior": "Access 401/403/503 remain distinguishable before event routing; unavailable node/backend is not an empty successful complete history. Invalid schemas return protocol errors. Unsupported methods/modes/revisions follow the external contract, not auto-fallback to another profile. SSE abort/redeploy ends the subscription and deletes that reader's undelivered/replay/dedupe membership while leaving the node turn untouched; a new stream cannot recover its deleted records even before the old deadline. Standard-only control envelopes never reach ChatGPT. Expired subscriptions do not recover history: caller re-subscribes and reads authoritative state once. Tool transport errors retain existing result_unknown semantics and do not replay prompts.",
+      "acceptance": [
+        {
+          "observe": "Extend remote_e2e_test.go signed-assertion/workerd harness with raw Events HTTP clients and independent webhook receiver. Discover/list on each profile; use all standard delivery modes and ChatGPT webhook. Start a Reach prompt on fake Orca/local protocol, observe only contracted stop/unknown payloads, then read reply through unchanged read_agent_output. Check tools/list schemas and representative calls across old/new revisions against the current catalog. Start ChatGPT-profile tests specifically at 2026-07-28 server/discover, assert top-level capabilities.events, then tools/list, subscribe, refreshed subscription across daemon restart, unknown event and one existing read_agent_output. Reject discover failure even if a separate initialize test succeeds. The end-to-end seam verifies connection of units, without duplicating their local checks.",
+          "rejects": "Rejects SDK relabeling without a working 2026-07-28 path, profile mixing, renamed tool arguments, reply text in notifications and completion dependent on LLM polling. The harness currently tests workerd, fake Orca, local backend and signed assertions, not real clients."
+        },
+        {
+          "observe": "Send malformed/absent Access assertions, wrong principal, unknown session, duplicate refresh with reordered argument keys, wrong Mcp-Name routing, callback challenge failure and unsupported mode. Inspect HTTP/JSON-RPC responses and receiver effects, including -32027 standard versus -32015 ChatGPT. Decode stream active/event/heartbeat/correlation/final frames; abort and assert agent continues. At the real HTTP boundary, verify standard deliveries preserve independent per-subscription webhook-id values and ChatGPT deliveries follow its documented webhook-id=eventId rule. The independent receiver selects the secret by subscription header and verifies each actual message signature; profile routing must not reuse the wrong identity/signing rule.",
+          "rejects": "Rejects authentication bypass, duplicate subscriptions from JSON key order, wrong node/name routing, successful-looking error results, comment-only heartbeats and client disconnect cancelling execution. Matching JSON shape without these adversarial cases is insufficient. Rejects making the standard equality mistake survive behind a correct signer or silently changing the explicitly supported ChatGPT wire."
+        },
+        {
+          "observe": "At the actual remote endpoint force daemon disconnect/restart, DO object recreation, Worker replacement, webhook lost acknowledgement and expiry. Assert outcomes plus storage deletion and stable IDs. Stop before subscription and expire during a turn; exercise subscribe-then-read-once and show no historical recovery promise. From src run REACH_E2E_GATEWAY=1 go test ./cmd/reach -run TestRemoteE2E after cloud dependencies are prepared; cloud npm run check and the new deterministic cloud test script are also required for implementation acceptance. Cancel a push stream with an unconsumed stop, reconnect with its last cursor before its former deadline and verify no old event, active/truncated recovery metadata and the accepted new-stream-then-read-once state observation; repeat after gateway replacement.",
+          "rejects": "Rejects relying solely on component checks, inability to open a fresh authorized subscription after redeploy and claims that deleted history can be read through old cursors. The opt-in env var is required: a skipped TestRemoteE2E is not a passing Events integration observation."
+        },
+        {
+          "observe": "With separately granted hosted-test authority, exercise real Access OAuth and ChatGPT on the new 2026-07-28 discover-first adapter through subscription, challenge, unknown receipt, output read, refresh and unsubscribe. Capture whether unsubscribe retains ?events=chatgpt; observe its response and deletion, not merely cessation of refreshes. Verify standard hosted SSE liveness and production retained egress safeguards, recording sanitized environment/adapter/frames. Reuse the supplied G-Profile captured-method evidence; do not repeat that probe absent changed inputs. Until these checks pass, report new-adapter/hosted acceptance unverified; do not claim external IP-pinning conformity. Include evidence that the actual Worker resolver/HTTPS adapter rejects a controlled allowlisted hostname returning non-public addresses before callback dispatch; preserve the distinction between this feasible validation and unavailable connection pinning.",
+          "rejects": "Rejects promoting local fake issuer/workerd success into hosted OAuth, ChatGPT/dots or production SSRF proof. No live execution is authorized or claimed by this plan; claude.ai has no Events requirement and keeps its read tools. The supplied real Orca observations apply to the listed cases only; local tests cannot prove real SIGKILL, arbitrary capacity, hosted unsubscribe or production receiver acceptance."
+        }
+      ],
+      "depends_on": [
+        {
+          "unit": "broker-delivery",
+          "reason": "Consumes durable broker lifecycle, reader and categorized delivery contracts and completed Worker HTTPS adapter for remote wire integration. This also orders any later required shared cloud package wiring; do not edit broker-owned files concurrently."
+        }
+      ],
+      "evidence_refs": [
+        "cloud/src/index.ts",
+        "cloud/src/access.ts",
+        "cloud/src/mcp.ts",
+        "cloud/package.json",
+        "src/cmd/reach/remote_e2e_test.go:3-7",
+        "docs/changes/change-20261119-mcp-events/architecture-plan.json"
+      ]
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "g-profile",
+      "question": "Release evidence gap, caller/mcp-wire: supplied G-Profile establishes query preservation for captured discover/initialize/tools/list/events/list/subscribe creation and 62 refreshes, but did not capture unsubscribe. Under separately granted hosted authority capture unsubscribe query, response and deletion using the accepted profile. If query is lost, ChatGPT acceptance remains blocked; return registration options to requester rather than infer User-Agent or select automatic fallback. Local URL tests cannot settle real-client behavior.",
+      "owner": "caller",
+      "blocks": [
+        "mcp-wire"
+      ]
+    },
+    {
+      "id": "g-capacity",
+      "question": "Caller/broker-delivery must qualify the bounded workload and storage/alarm/Worker limits of the existing single-node DO, and finite node outbox/read scheduling under subscriber count, stop rate, offline duration and webhook latency. No load evidence or production concurrency target was supplied. Measure batch size, cleanup/deadline completion and backlog against the selected runtime; determine private finite resource limits and reject new admissions explicitly rather than silently dropping accepted live-grant records. Holds: proceed inside measured limits with deterministic operation-count checks. Does not hold: report the specific overload outcome and proposed capacity boundary to requester; no new queue/service or normative performance SLA is inferred. Tests at small fixture load cannot establish arbitrary-scale or arbitrarily-long-disconnection guarantees.",
+      "owner": "caller",
+      "blocks": [
+        "broker-delivery"
+      ]
+    },
+    {
+      "id": "g-discover-chatgpt",
+      "question": "Unconfirmed technical premise, caller/mcp-wire: does the implemented 2026-07-28 adapter accept real ChatGPT server/discover with top-level capabilities.events and complete the lifecycle through unknown receipt and output read? Supplied SDK 1.32.2 400 and older-initialize fallback do not answer this. Local raw-HTTP contract tests discriminate adapter shape/routing; separately authorized hosted observation discriminates actual client integration. Rejection withholds ChatGPT release acceptance; any changed registration/profile arrangement belongs to user, not implementation discretion.",
+      "owner": "caller",
+      "blocks": [
+        "mcp-wire"
+      ]
+    }
+  ]
+}

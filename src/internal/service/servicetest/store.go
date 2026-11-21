@@ -23,6 +23,8 @@ type Store struct {
 	operations map[[2]string]*core.Operation // client ID, operation ID
 	audit      []core.AuditRecord
 	auditAt    map[string]time.Time // workspace ID -> time of its latest audit record
+	turns      map[[2]string]turnRecord
+	stops      []core.TurnStop
 	jobs       map[string]*core.Job
 }
 
@@ -77,6 +79,9 @@ func (s *Store) Finish(clientID, operationID, state string, result any, errCode,
 	op, ok := s.operations[[2]string{clientID, operationID}]
 	if ok && op.State == core.StateRunning {
 		op.State, op.Result, op.ErrorCode, op.ErrorMessage, op.UpdatedAt = state, raw, errCode, errMessage, s.now()
+		if v, ok := s.turns[[2]string{clientID, operationID}]; ok && !v.armed && state == core.StateFailed {
+			delete(s.turns, [2]string{clientID, operationID})
+		}
 	}
 	s.mu.Unlock()
 	return s.GetOperation(clientID, operationID)
@@ -172,4 +177,118 @@ func (s *Store) GetJob(clientID, id string) (*core.Job, error) {
 		c.ExitCode = &code
 	}
 	return &c, nil
+}
+
+func (s *Store) BeginTurn(t core.Turn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turns == nil {
+		s.turns = map[[2]string]turnRecord{}
+	}
+	k := [2]string{t.ClientID, t.OperationID}
+	if _, ok := s.turns[k]; ok {
+		return fmt.Errorf("turn exists")
+	}
+	s.turns[k] = turnRecord{turn: t}
+	return nil
+}
+func (s *Store) ArmTurn(t core.Turn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := [2]string{t.ClientID, t.OperationID}
+	if v, ok := s.turns[k]; ok && v.turn == t {
+		v.armed = true
+		s.turns[k] = v
+		return nil
+	}
+	return fmt.Errorf("pending turn not found")
+}
+func (s *Store) ArmedTurns() ([]core.Turn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []core.Turn
+	for _, v := range s.turns {
+		if v.armed {
+			out = append(out, v.turn)
+		}
+	}
+	return out, nil
+}
+func (s *Store) CloseTurn(t core.Turn, stop core.TurnStop) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := [2]string{t.ClientID, t.OperationID}
+	if v, ok := s.turns[k]; ok && v.turn == t && v.armed {
+		for _, e := range s.stops {
+			if e.EventID == stop.EventID {
+				return fmt.Errorf("event exists")
+			}
+		}
+		delete(s.turns, k)
+		s.stops = append(s.stops, stop)
+	}
+	return nil
+}
+func (s *Store) DisarmTurn(t core.Turn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := [2]string{t.ClientID, t.OperationID}
+	if v, ok := s.turns[k]; ok && v.turn == t && v.armed {
+		delete(s.turns, k)
+	}
+	return nil
+}
+func (s *Store) PendingTurnStops() ([]core.TurnStop, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.stops), nil
+}
+func (s *Store) DeleteTurnStop(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stops = slices.DeleteFunc(s.stops, func(e core.TurnStop) bool { return e.EventID == id })
+	return nil
+}
+
+type turnRecord struct {
+	turn  core.Turn
+	armed bool
+}
+
+func (s *Store) PendingTurns() ([]core.Turn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []core.Turn
+	for _, v := range s.turns {
+		if !v.armed {
+			out = append(out, v.turn)
+		}
+	}
+	return out, nil
+}
+func (s *Store) ClosePendingTurn(t core.Turn, stop core.TurnStop) error {
+	return s.reconcilePendingTurn(t, stop, false)
+}
+func (s *Store) ArmPendingTurn(t core.Turn, stop core.TurnStop) error {
+	return s.reconcilePendingTurn(t, stop, true)
+}
+func (s *Store) reconcilePendingTurn(t core.Turn, stop core.TurnStop, arm bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := [2]string{t.ClientID, t.OperationID}
+	if v, ok := s.turns[k]; ok && v.turn == t && !v.armed {
+		for _, e := range s.stops {
+			if e.EventID == stop.EventID {
+				return fmt.Errorf("duplicate event ID")
+			}
+		}
+		if arm {
+			v.armed = true
+			s.turns[k] = v
+		} else {
+			delete(s.turns, k)
+		}
+		s.stops = append(s.stops, stop)
+	}
+	return nil
 }

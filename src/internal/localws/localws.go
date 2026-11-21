@@ -55,6 +55,7 @@ type Agents interface {
 	// unknown session.
 	Status(id string) (*core.AgentStatus, error)
 	Prompt(id, text string) error
+	PromptObserved(id, text string, stopped func(func() string) error) error
 	Stop(id string) error
 }
 
@@ -217,6 +218,17 @@ func (b *Workspaces) Prompt(ctx context.Context, id, text string) ([]string, err
 		return nil, core.ErrNotFound
 	}
 	if err := b.agents.Prompt(id, text); err != nil {
+		return nil, err
+	}
+	return []string{"turn_started"}, nil
+}
+
+// PromptObserved delivers a prompt and reports its runtime stop fact.
+func (b *Workspaces) PromptObserved(ctx context.Context, id, text string, stopped func(func() string) error) ([]string, error) {
+	if _, ok := b.session(id); !ok {
+		return nil, core.ErrNotFound
+	}
+	if err := b.agents.PromptObserved(id, text, stopped); err != nil {
 		return nil, err
 	}
 	return []string{"turn_started"}, nil
