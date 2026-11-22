@@ -135,7 +135,7 @@ const nodeTools: { name: string; description: string; input: Shape; readOnly: bo
 ];
 
 export async function mcp(request: Request, env: Env, nodes: Nodes, principal: Principal): Promise<Response> {
-  const profile: Profile = new URL(request.url).searchParams.get("events") === "chatgpt" ? "chatgpt" : "standard";
+  const profile: Profile = new URL(request.url).searchParams.get("profile") === "chatgpt" ? "chatgpt" : "standard";
   if (request.method === "POST") {
     let message: any;
     try { message = await request.clone().json(); } catch { message = null; }

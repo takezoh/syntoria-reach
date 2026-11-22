@@ -193,13 +193,13 @@ The new codes are marked provisional by the source.
 sends `notifications/events/terminated`, poll returns an error on the next
 poll, webhook sends a signed `terminated` envelope.
 
-## ChatGPT (`/mcp?events=chatgpt`)
+## ChatGPT (`/mcp?profile=chatgpt`)
 
 - Advertise top-level `capabilities.events = {}` in the `initialize` result
   (the example uses protocol version `2025-03-26`) or in the `server/discover`
   result of protocol `2026-07-28` (`resultType: "complete"`,
   `supportedVersions: ["2026-07-28"]`). The page names no query parameter;
-  the `?events=chatgpt` profile URL is this project's registration choice.
+  the `?profile=chatgpt` profile URL is this project's registration choice.
 - Implement `events/list`, `events/subscribe`, `events/unsubscribe` on the
   same authenticated endpoint as the tools. Webhook delivery only: polling,
   streaming and the `gap` and `terminated` control notifications are not

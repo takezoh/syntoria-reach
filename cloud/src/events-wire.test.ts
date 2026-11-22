@@ -77,7 +77,7 @@ export function unknownOutcome() { return failure('result_unknown','unknown'); }
     async function access(jwt?:string, issuer='https://issuer.invalid') {
       const headers:Record<string,string> = {'content-type':'application/json'};
       if (jwt) headers['Cf-Access-Jwt-Assertion'] = jwt;
-      return gateway.fetch(new Request('https://gateway.invalid/mcp?events=chatgpt',{method:'POST',headers,body:JSON.stringify({jsonrpc:'2.0',id:1,method:'events/subscribe',params})}),{...settings,ACCESS_TEAM_DOMAIN:issuer});
+      return gateway.fetch(new Request('https://gateway.invalid/mcp?profile=chatgpt',{method:'POST',headers,body:JSON.stringify({jsonrpc:'2.0',id:1,method:'events/subscribe',params})}),{...settings,ACCESS_TEAM_DOMAIN:issuer});
     }
     const before = calls.length;
     assert.equal((await access()).status,401);
@@ -93,7 +93,7 @@ export function unknownOutcome() { return failure('result_unknown','unknown'); }
 
   const env = {broker:broker()};
   async function http(method:string, params:unknown, profile: 'standard'|'chatgpt', revision:string) {
-    const req = new Request('https://gateway.invalid/mcp'+(profile === 'chatgpt' ? '?events=chatgpt' : ''), {method:'POST',headers:{'content-type':'application/json','accept':'application/json, text/event-stream','mcp-protocol-version':revision,...(profile === 'standard' && (params as any)?.name ? {'mcp-name':(params as any).name} : {})},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+    const req = new Request('https://gateway.invalid/mcp'+(profile === 'chatgpt' ? '?profile=chatgpt' : ''), {method:'POST',headers:{'content-type':'application/json','accept':'application/json, text/event-stream','mcp-protocol-version':revision,...(profile === 'standard' && (params as any)?.name ? {'mcp-name':(params as any).name} : {})},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
     const response = await mcp(req,env,nodes,principal);
     assert.equal(response.status,200);
     return response.json() as Promise<any>;

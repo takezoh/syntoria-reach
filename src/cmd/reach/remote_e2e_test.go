@@ -677,7 +677,7 @@ const eventName = "agent.session_state_changed"
 func (c *mcpClient) eventsE2E(d *daemon, session string, workspace any, oldNames []string) {
 	t := c.t
 	modern := &mcpClient{t: t, url: c.url, token: c.token, version: "2026-07-28", name: eventName}
-	chat := &mcpClient{t: t, url: c.url + "?events=chatgpt", token: c.token, version: "2026-07-28"}
+	chat := &mcpClient{t: t, url: c.url + "?profile=chatgpt", token: c.token, version: "2026-07-28"}
 	for _, client := range []*mcpClient{modern, chat} {
 		discover := client.rpc("server/discover", map[string]any{})
 		caps := discover["capabilities"].(map[string]any)
@@ -1065,7 +1065,7 @@ func (c *mcpClient) webhookE2E(d *daemon, workspace any, r *webhookReceiver, gat
 	t := c.t
 	session := result(c.mustTool("start_agent_session", map[string]any{"node": "desk", "operation_id": "webhook-session", "workspace": workspace, "agent": "claude"}).(map[string]any))["session_id"].(string)
 	standard := &mcpClient{t: t, url: c.url, token: c.token, version: "2026-07-28", name: eventName}
-	chat := &mcpClient{t: t, url: c.url + "?events=chatgpt", token: c.token, version: "2026-07-28"}
+	chat := &mcpClient{t: t, url: c.url + "?profile=chatgpt", token: c.token, version: "2026-07-28"}
 	if chat.rpc("server/discover", map[string]any{})["capabilities"].(map[string]any)["events"] == nil {
 		t.Fatal("missing chat events")
 	}
